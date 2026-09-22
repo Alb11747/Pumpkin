@@ -34,6 +34,35 @@ pub mod anvil;
 pub mod linear;
 pub mod pump;
 
+/// Root tags Pumpkin rewrites from its in-memory state.
+/// Other chunk metadata rides through a load/save cycle untouched, including
+/// the original Bukkit values used as a fallback for Pumpkin custom data.
+const MODELLED_ROOT_TAGS: &[&str] = &[
+    "DataVersion",
+    "xPos",
+    "yPos",
+    "zPos",
+    "Status",
+    "Heightmaps",
+    "sections",
+    "block_entities",
+    "block_ticks",
+    "fluid_ticks",
+    "isLightOn",
+    "InhabitedTime",
+    "PumpkinCustomData",
+];
+
+fn preserved_root_tags(root_tag: &NbtCompound) -> NbtCompound {
+    let mut preserved = NbtCompound::new();
+    for (name, tag) in &root_tag.child_tags {
+        if !MODELLED_ROOT_TAGS.contains(&&**name) {
+            preserved.put(name, tag.clone());
+        }
+    }
+    preserved
+}
+
 impl SingleChunkDataSerializer for ChunkData {
     #[inline]
     fn from_bytes(bytes: &Bytes, pos: Vector2<i32>) -> Result<Self, ChunkReadingError> {
@@ -444,6 +473,7 @@ impl ChunkData {
             blending_data: None,
             inhabited_time: AtomicU64::new(root_tag.get_long("InhabitedTime").unwrap_or(0) as u64),
             custom_data: std::sync::Mutex::new(custom_data),
+            preserved_tags: std::sync::Mutex::new(preserved_root_tags(&root_tag)),
         })
     }
 
@@ -492,6 +522,21 @@ impl ChunkData {
         let min_section_y = (self.section.min_y >> 4) as i8;
 
         let mut root_compound = NbtCompound::new();
+
+        // First, so that every tag this server does model overwrites whatever
+        // the chunk arrived with. Going the other way round would let a stale
+        // value survive any name missing from `MODELLED_ROOT_TAGS`, which is a
+        // worse failure than the dropped tags this exists to prevent.
+        {
+            let preserved = self
+                .preserved_tags
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for (name, tag) in &preserved.child_tags {
+                root_compound.put(name, tag.clone());
+            }
+        }
+
         root_compound.put_int("DataVersion", WORLD_DATA_VERSION);
         root_compound.put_int("xPos", self.x);
         root_compound.put_int("zPos", self.z);
@@ -644,7 +689,9 @@ impl ChunkData {
             .custom_data
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !custom_data.is_empty() {
+        // An empty Pumpkin tag prevents the legacy Bukkit fallback from
+        // restoring custom data that Pumpkin has explicitly removed.
+        if !custom_data.is_empty() || root_compound.has("BukkitValues") {
             root_compound.put_compound("PumpkinCustomData", custom_data.clone());
         }
 
@@ -1189,6 +1236,181 @@ mod tests {
             pumpkin_data::biome::Biome::from_name("the_void")
                 .unwrap()
                 .id
+        );
+    }
+
+    /// A vanilla chunk carries tags this server has no field for. Dropping them
+    /// on save destroys map data: `structures` is what makes a village a
+    /// village to every structure-aware feature, and the generation-phase tags
+    /// decide what still has to happen to a chunk that is not finished yet.
+    #[test]
+    fn saving_keeps_the_top_level_tags_this_server_never_reads() {
+        use crate::chunk::ChunkData;
+        use pumpkin_util::math::vector2::Vector2;
+
+        let mut nbt = test_chunk(vec![test_section(-4, "minecraft:stone", true)]);
+
+        let mut structures = NbtCompound::new();
+        let mut start = NbtCompound::new();
+        start.put_string("id", "minecraft:village".to_string());
+        start.put_int("ChunkX", 0);
+        start.put_int("ChunkZ", 0);
+        let mut child = NbtCompound::new();
+        child.put("BB", NbtTag::IntArray(vec![0, 64, 0, 15, 80, 15]));
+        child.put_string("id", "minecraft:jigsaw".to_string());
+        start.put_list("Children", vec![NbtTag::Compound(child)]);
+        let mut starts = NbtCompound::new();
+        starts.put_compound("minecraft:village", start);
+        structures.put_compound("starts", starts);
+        let mut references = NbtCompound::new();
+        references.put(
+            "minecraft:village",
+            NbtTag::LongArray(vec![0, 4_294_967_297]),
+        );
+        structures.put_compound("References", references);
+        nbt.root_tag.put("structures", NbtTag::Compound(structures));
+        nbt.root_tag.put(
+            "PostProcessing",
+            NbtTag::List(vec![NbtTag::List(vec![NbtTag::Short(17)])]),
+        );
+        nbt.root_tag
+            .put("carving_mask", NbtTag::LongArray(vec![1, i64::MIN, -1]));
+        nbt.root_tag.put_long("LastUpdate", 1_287_805);
+        let mut blending_data = NbtCompound::new();
+        blending_data.put_int("min_section", -4);
+        blending_data.put_int("max_section", 20);
+        nbt.root_tag.put_compound("blending_data", blending_data);
+        let mut plugin_data = NbtCompound::new();
+        plugin_data.put("payload", NbtTag::ByteArray(vec![0, -1, 42].into()));
+        nbt.root_tag.put_compound("example:metadata", plugin_data);
+
+        let written = nbt.root_tag.clone();
+        let chunk = ChunkData::from_bytes(&nbt.write(), Vector2::new(0, 0)).expect("chunk parses");
+        let saved = chunk.to_bytes().expect("chunk serializes");
+
+        let mut cursor = std::io::Cursor::new(saved.as_ref());
+        let mut reader = pumpkin_nbt::deserializer::NbtReadHelperJava::new(&mut cursor);
+        let reloaded = pumpkin_nbt::Nbt::read(&mut reader).expect("saved chunk parses");
+
+        for key in [
+            "structures",
+            "PostProcessing",
+            "carving_mask",
+            "LastUpdate",
+            "blending_data",
+            "example:metadata",
+        ] {
+            assert_eq!(
+                reloaded.root_tag.get(key),
+                written.get(key),
+                "{key} did not survive the save"
+            );
+        }
+    }
+
+    #[test]
+    fn saving_keeps_bukkit_values_without_restoring_removed_custom_data() {
+        let mut nbt = test_chunk(vec![test_section(-4, "minecraft:stone", true)]);
+        let mut namespace = NbtCompound::new();
+        namespace.put_int("owner", 42);
+        let mut bukkit_values = NbtCompound::new();
+        bukkit_values.put_compound("example", namespace);
+        nbt.root_tag
+            .put_compound("BukkitValues", bukkit_values.clone());
+
+        let chunk = ChunkData::from_bytes(&nbt.write(), Vector2::new(0, 0)).expect("chunk parses");
+        assert_eq!(
+            chunk.get_custom_data("example", "owner"),
+            Some(NbtTag::Int(42))
+        );
+        chunk.remove_custom_data("example", "owner");
+
+        let saved = chunk.to_bytes().expect("chunk serializes");
+        let mut cursor = std::io::Cursor::new(saved.as_ref());
+        let mut reader = pumpkin_nbt::deserializer::NbtReadHelperJava::new(&mut cursor);
+        let reloaded = pumpkin_nbt::Nbt::read(&mut reader).expect("saved chunk parses");
+        assert_eq!(
+            reloaded.root_tag.get_compound("BukkitValues"),
+            Some(&bukkit_values)
+        );
+        assert_eq!(
+            reloaded.root_tag.get_compound("PumpkinCustomData"),
+            Some(&NbtCompound::new())
+        );
+        let chunk = ChunkData::from_bytes(&saved, Vector2::new(0, 0)).expect("chunk reloads");
+        assert_eq!(chunk.get_custom_data("example", "owner"), None);
+    }
+
+    #[test]
+    fn saving_uses_edited_managed_data_alongside_original_bukkit_values() {
+        let mut nbt = test_chunk(vec![test_section(-4, "minecraft:stone", true)]);
+        let mut namespace = NbtCompound::new();
+        namespace.put_int("owner", 7);
+        let mut custom_data = NbtCompound::new();
+        custom_data.put_compound("example", namespace);
+        nbt.root_tag.put_compound("PumpkinCustomData", custom_data);
+        let mut bukkit_values = NbtCompound::new();
+        bukkit_values.put_string("example:legacy", "original".to_string());
+        nbt.root_tag
+            .put_compound("BukkitValues", bukkit_values.clone());
+        nbt.root_tag.put_long("InhabitedTime", 123);
+
+        let mut chunk =
+            ChunkData::from_bytes(&nbt.write(), Vector2::new(0, 0)).expect("chunk parses");
+        chunk.set_custom_data("example", "owner", NbtTag::Int(8));
+        chunk.inhabited_time.store(456, Ordering::Relaxed);
+        chunk.status = ChunkStatus::Light;
+        chunk.set_block_absolute_y(0, -64, 0, Block::DIRT.default_state.id);
+
+        let saved = chunk.to_bytes().expect("chunk serializes");
+        let mut cursor = std::io::Cursor::new(saved.as_ref());
+        let mut reader = pumpkin_nbt::deserializer::NbtReadHelperJava::new(&mut cursor);
+        let reloaded = pumpkin_nbt::Nbt::read(&mut reader).expect("saved chunk parses");
+        assert_eq!(
+            reloaded.root_tag.get_compound("BukkitValues"),
+            Some(&bukkit_values)
+        );
+        assert_eq!(reloaded.root_tag.get_long("InhabitedTime"), Some(456));
+        assert_eq!(
+            reloaded.root_tag.get_string("Status"),
+            Some("minecraft:light")
+        );
+        let chunk = ChunkData::from_bytes(&saved, Vector2::new(0, 0)).expect("chunk reloads");
+        assert_eq!(
+            chunk.get_custom_data("example", "owner"),
+            Some(NbtTag::Int(8))
+        );
+        assert_eq!(
+            chunk.section.get_block_absolute_y(0, -64, 0),
+            Some(Block::DIRT.default_state.id)
+        );
+    }
+
+    /// `MODELLED_ROOT_TAGS` can fall behind the writer. When it does, the name
+    /// lands in the preserved bag as well, and the value the server computed
+    /// still has to be the one that reaches disk — a stale tag winning would be
+    /// a worse bug than the dropped tags this preservation exists to prevent.
+    #[test]
+    fn a_preserved_tag_never_shadows_one_this_server_owns() {
+        use crate::chunk::ChunkData;
+        use pumpkin_util::math::vector2::Vector2;
+
+        let nbt = test_chunk(vec![test_section(-4, "minecraft:stone", true)]);
+        let chunk = ChunkData::from_bytes(&nbt.write(), Vector2::new(0, 0)).expect("chunk parses");
+        chunk
+            .preserved_tags
+            .lock()
+            .unwrap()
+            .put_int("DataVersion", 1);
+
+        let saved = chunk.to_bytes().expect("chunk serializes");
+        let mut cursor = std::io::Cursor::new(saved.as_ref());
+        let mut reader = pumpkin_nbt::deserializer::NbtReadHelperJava::new(&mut cursor);
+        let reloaded = pumpkin_nbt::Nbt::read(&mut reader).expect("saved chunk parses");
+
+        assert_eq!(
+            reloaded.root_tag.get_int("DataVersion"),
+            Some(WORLD_DATA_VERSION)
         );
     }
 }
