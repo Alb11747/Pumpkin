@@ -1069,17 +1069,20 @@ mod tests {
     use pumpkin_config::world::LevelConfig;
     use tempfile::TempDir;
 
-    fn region_with_unknown_registry_entry() -> Vec<u8> {
+    fn region_with_palette_entry(data_version: Option<i32>, block_name: &str) -> Vec<u8> {
         use pumpkin_nbt::{Nbt, compound::NbtCompound, tag::NbtTag};
         const SECTOR_SIZE: usize = 4096;
         let mut entry = NbtCompound::new();
-        entry.put_string("Name", "minecraft:removed_block".to_string());
+        entry.put_string("Name", block_name.to_owned());
         let mut blocks = NbtCompound::new();
         blocks.put("palette", NbtTag::List(vec![NbtTag::Compound(entry)]));
         let mut section = NbtCompound::new();
         section.put_int("Y", -4);
         section.put_compound("block_states", blocks);
         let mut root = NbtCompound::new();
+        if let Some(version) = data_version {
+            root.put_int("DataVersion", version);
+        }
         root.put_int("xPos", 0);
         root.put_int("zPos", 0);
         root.put_int("yPos", -4);
@@ -1101,8 +1104,23 @@ mod tests {
         for (original, expected_cause) in [
             (b"existing damaged region".to_vec(), "Failed reading region"),
             (
-                region_with_unknown_registry_entry(),
+                region_with_palette_entry(
+                    Some(crate::chunk::format::anvil::WORLD_DATA_VERSION),
+                    "minecraft:removed_block",
+                ),
                 "minecraft:removed_block",
+            ),
+            (
+                region_with_palette_entry(Some(3578), "minecraft:stone"),
+                "DataVersion 3578",
+            ),
+            (
+                region_with_palette_entry(Some(3465), "minecraft:stone"),
+                "DataVersion 3465",
+            ),
+            (
+                region_with_palette_entry(None, "minecraft:stone"),
+                "DataVersion missing",
             ),
         ] {
             let directory = TempDir::new().unwrap();

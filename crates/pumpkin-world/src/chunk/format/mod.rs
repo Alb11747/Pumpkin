@@ -33,6 +33,22 @@ pub mod anvil;
 pub mod linear;
 pub mod pump;
 
+/// These record readers do not run a `DataFixer`, even when level metadata is readable.
+pub(crate) fn require_current_data_version(root: &NbtCompound) -> Result<i32, String> {
+    use pumpkin_nbt::tag::NbtTag;
+
+    let found = match root.get("DataVersion") {
+        Some(NbtTag::Int(version)) if *version == WORLD_DATA_VERSION => return Ok(*version),
+        Some(NbtTag::Int(version)) => version.to_string(),
+        Some(tag) => format!("NBT type {}", tag.get_type_id()),
+        None => "missing".to_owned(),
+    };
+    Err(format!(
+        "Unsupported record DataVersion {found}; expected TAG_Int {WORLD_DATA_VERSION}. Import a copy upgraded by the official {} server with --forceUpgrade --recreateRegionFiles",
+        crate::CURRENT_MC_VERSION,
+    ))
+}
+
 /// Root tags Pumpkin rewrites from its in-memory state.
 /// Other chunk metadata rides through a load/save cycle untouched, including
 /// the original Bukkit values used as a fallback for Pumpkin custom data.
@@ -266,6 +282,8 @@ impl ChunkData {
         .map_err(|e| ChunkParsingError::ErrorDeserializingChunk(e.to_string()))?;
 
         let root_tag = nbt.root_tag;
+        require_current_data_version(&root_tag)
+            .map_err(ChunkParsingError::ErrorDeserializingChunk)?;
 
         let x_pos = root_tag.get_int("xPos").ok_or_else(|| {
             ChunkParsingError::ErrorDeserializingChunk("Missing xPos".to_string())
@@ -826,6 +844,8 @@ impl ChunkEntityData {
         }
         .map_err(|e| ChunkParsingError::ErrorDeserializingChunk(e.to_string()))?;
 
+        require_current_data_version(&nbt.root_tag)
+            .map_err(ChunkParsingError::ErrorDeserializingChunk)?;
         let invalid =
             |message: &str| ChunkParsingError::ErrorDeserializingChunk(message.to_owned());
         let pos_array = if let Some(position_tag) = nbt.get("Position") {
@@ -1088,6 +1108,62 @@ mod tests {
         assert_complete_documents::<ChunkEntityData>(entity_chunk_root(Vector2::new(0, 0)));
     }
 
+    fn assert_current_data_version_required<T: SingleChunkDataSerializer>(root: &NbtCompound) {
+        let invalid_versions = [
+            None,
+            Some(NbtTag::Int(3465)),
+            Some(NbtTag::Int(3578)),
+            Some(NbtTag::Int(4435)),
+            Some(NbtTag::Int(4903)),
+            Some(NbtTag::Int(WORLD_DATA_VERSION - 1)),
+            Some(NbtTag::Int(WORLD_DATA_VERSION + 1)),
+            Some(NbtTag::Long(i64::from(WORLD_DATA_VERSION))),
+            Some(NbtTag::String(WORLD_DATA_VERSION.to_string().into())),
+        ];
+        for named in [true, false] {
+            let encode = |root: NbtCompound| {
+                let nbt = pumpkin_nbt::Nbt::from(root);
+                if named {
+                    nbt.try_write_preserving().unwrap()
+                } else {
+                    nbt.try_write_unnamed_preserving().unwrap()
+                }
+            };
+            let current = T::from_bytes(&encode(root.clone()), Vector2::new(0, 0))
+                .expect("current schema must load");
+            assert_eq!(
+                decode_preserving(&current.to_bytes().unwrap())
+                    .root_tag
+                    .get_int("DataVersion"),
+                Some(WORLD_DATA_VERSION)
+            );
+            for version in &invalid_versions {
+                let mut invalid = root.clone();
+                invalid.child_tags.remove("DataVersion");
+                if let Some(version) = version {
+                    invalid.put("DataVersion", version.clone());
+                }
+                let Err(error) = T::from_bytes(&encode(invalid), Vector2::new(0, 0)) else {
+                    panic!("unsupported schema must not become a writable chunk");
+                };
+                let error = error.to_string();
+                assert!(error.contains("DataVersion"), "{error}");
+                assert!(error.contains(&format!("TAG_Int {WORLD_DATA_VERSION}")));
+                assert!(error.contains("--forceUpgrade --recreateRegionFiles"));
+            }
+        }
+    }
+
+    #[test]
+    fn terrain_and_entity_admission_requires_current_int_data_version() {
+        assert_current_data_version_required::<ChunkData>(
+            &test_chunk(vec![test_section(-4, "minecraft:stone", true)]).root_tag,
+        );
+        assert_current_data_version_required::<ChunkEntityData>(&entity_chunk_root(Vector2::new(
+            0, 0,
+        )));
+    }
+
     #[test]
     fn entity_chunk_position_is_exact_and_modern_position_wins_over_aliases() {
         let position = Vector2::new(-7, 12);
@@ -1342,7 +1418,7 @@ mod tests {
 
     fn test_chunk(sections: Vec<NbtCompound>) -> pumpkin_nbt::Nbt {
         let mut root = NbtCompound::new();
-        root.put_int("DataVersion", 4903);
+        root.put_int("DataVersion", WORLD_DATA_VERSION);
         root.put_int("xPos", 0);
         root.put_int("zPos", 0);
         root.put_string("Status", "minecraft:full".to_string());

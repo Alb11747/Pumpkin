@@ -1,4 +1,4 @@
-use crate::chunk::format::anvil::WORLD_DATA_VERSION;
+use crate::chunk::format::{anvil::WORLD_DATA_VERSION, require_current_data_version};
 use pumpkin_nbt::{Nbt, NbtCompound, tag::NbtTag};
 use rustc_hash::FxHashMap;
 use std::io::{Cursor, Read, Write};
@@ -253,11 +253,7 @@ impl PoiRegion {
         let root = Nbt::read_complete(&mut reader)
             .map_err(invalid_poi)?
             .root_tag;
-        let data_version = match root.get("DataVersion") {
-            None => DATA_VERSION,
-            Some(NbtTag::Int(value)) => *value,
-            Some(_) => return Err(invalid_poi("DataVersion must be an integer")),
-        };
+        let data_version = require_current_data_version(&root).map_err(invalid_poi)?;
         let section_tags = root
             .get_compound("Sections")
             .ok_or_else(|| invalid_poi("missing or invalid Sections compound"))?;
@@ -786,6 +782,52 @@ mod tests {
         bytes[HEADER_SIZE + 4] = COMPRESSION_ZLIB;
         bytes[HEADER_SIZE + 5..HEADER_SIZE + 5 + compressed.len()].copy_from_slice(&compressed);
         bytes
+    }
+
+    #[test]
+    fn poi_admission_requires_current_int_data_version_without_rewriting() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("r.0.0.mca");
+        let current = region_bytes(fixture_root());
+        std::fs::write(&path, &current).unwrap();
+        let region = PoiRegion::load(&path).expect("current schema must load");
+        assert_eq!(region.chunks[&0].data_version, DATA_VERSION);
+        assert_eq!(std::fs::read(&path).unwrap(), current);
+
+        for version in [
+            None,
+            Some(NbtTag::Int(3465)),
+            Some(NbtTag::Int(3578)),
+            Some(NbtTag::Int(4435)),
+            Some(NbtTag::Int(4903)),
+            Some(NbtTag::Int(DATA_VERSION - 1)),
+            Some(NbtTag::Int(DATA_VERSION + 1)),
+            Some(NbtTag::Long(i64::from(DATA_VERSION))),
+            Some(NbtTag::String(DATA_VERSION.to_string().into())),
+        ] {
+            let mut root = fixture_root();
+            root.child_tags.remove("DataVersion");
+            if let Some(version) = version {
+                root.put("DataVersion", version);
+            }
+            let original = region_bytes(root);
+            std::fs::write(&path, &original).unwrap();
+            let Err(error) = PoiRegion::load(&path) else {
+                panic!("unsupported schema must not become a writable POI region");
+            };
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("TAG_Int {DATA_VERSION}"))
+            );
+            assert!(
+                error
+                    .to_string()
+                    .contains("--forceUpgrade --recreateRegionFiles")
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+        }
     }
 
     #[test]
