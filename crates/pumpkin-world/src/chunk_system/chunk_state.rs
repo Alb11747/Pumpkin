@@ -290,6 +290,7 @@ impl Chunk {
                 inhabited_time: AtomicU64::new(0),
                 custom_data: Mutex::new(NbtCompound::new()),
                 preserved_tags: Mutex::new(NbtCompound::new()),
+                structure_spawns: Mutex::default(),
             })),
         ) {
             Self::Proto(proto) => proto,
@@ -297,6 +298,9 @@ impl Chunk {
         };
 
         let proto_chunk = *proto_chunk_box;
+        let structure_spawns = proto_chunk.structure_spawn_starts();
+        let structure_spawn_data =
+            crate::chunk::structure_spawns::generated_spawn_data(&structure_spawns);
 
         let sections = Self::build_level_sections(&proto_chunk, dimension);
         let heightmaps = Self::build_level_heightmaps(&proto_chunk, dimension.min_y);
@@ -336,8 +340,11 @@ impl Chunk {
             status: proto_chunk.stage.into(),
             blending_data: proto_chunk.blending_data,
             inhabited_time: AtomicU64::new(0),
-            custom_data: Mutex::new(NbtCompound::new()),
+            custom_data: Mutex::new(structure_spawn_data),
             preserved_tags: Mutex::new(NbtCompound::new()),
+            structure_spawns: Mutex::new(
+                crate::chunk::structure_spawns::StructureSpawnState::Ready(structure_spawns),
+            ),
         };
 
         *self = Self::Level(Arc::new(chunk));

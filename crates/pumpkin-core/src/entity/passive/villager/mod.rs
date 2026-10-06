@@ -50,6 +50,7 @@ use crate::world::World;
 use crate::world::villager_poi::profession_for_block;
 
 pub mod data;
+mod nbt;
 pub use data::{
     BREEDING_FOOD_THRESHOLD, GossipType, VillagerData, VillagerProfession, VillagerType,
     get_food_points,
@@ -356,6 +357,7 @@ pub struct VillagerEntity {
     pub job_site_pending: AtomicBool,
     pub home_pos: std::sync::Mutex<Option<BlockPos>>,
     pub self_weak: std::sync::Mutex<Option<Weak<Self>>>,
+    imported_nbt: std::sync::Mutex<NbtCompound>,
 }
 
 impl VillagerEntity {
@@ -396,6 +398,11 @@ impl VillagerEntity {
     #[allow(clippy::too_many_lines)]
     pub fn new(entity: Entity) -> Arc<Self> {
         let mob_entity = MobEntity::new(entity);
+        *mob_entity
+            .brain
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            nbt::make_brain(&crate::entity::ai::brain::memory::PackedMemories::empty());
         let villager_data = VillagerData::new(VillagerType::Plains, VillagerProfession::None, 1);
         let inventory = std::sync::Mutex::new((0..8).map(|_| ItemStack::EMPTY.clone()).collect());
 
@@ -425,6 +432,7 @@ impl VillagerEntity {
             job_site_pending: AtomicBool::new(false),
             home_pos: std::sync::Mutex::new(None),
             self_weak: std::sync::Mutex::new(None),
+            imported_nbt: std::sync::Mutex::new(NbtCompound::new()),
         };
         let mob_arc = Arc::new(villager);
         *mob_arc
@@ -589,6 +597,11 @@ impl VillagerEntity {
         self.get_entity().send_bedrock_actor_data(&bedrock_metadata);
 
         if old_profession != data.profession {
+            self.imported_nbt
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .child_tags
+                .remove("Offers");
             self.offers
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1148,6 +1161,12 @@ impl VillagerEntity {
         };
 
         if let Some(current_site) = self.get_job_site()
+            && world
+                .level
+                .is_chunk_loaded(&pumpkin_util::math::vector2::Vector2::new(
+                    current_site.0.x >> 4,
+                    current_site.0.z >> 4,
+                ))
             && current_site
                 .to_centered_f64()
                 .squared_distance_to_vec(&self.get_entity().pos.load())
@@ -1871,21 +1890,78 @@ impl VillagerEntity {
 }
 
 impl Mob for VillagerEntity {
+    fn mob_nbt_aliases(&self) -> &'static [(&'static str, &'static str)] {
+        &[("BedX", "HomeX"), ("BedY", "HomeY"), ("BedZ", "HomeZ")]
+    }
+
+    fn make_brain(
+        &self,
+        packed: &crate::entity::ai::brain::memory::PackedMemories,
+    ) -> crate::entity::ai::brain::Brain {
+        nbt::make_brain(packed)
+    }
+
     #[expect(clippy::too_many_lines)]
     fn mob_write_nbt(&self, nbt: &mut NbtCompound) {
+        use crate::entity::ai::brain::memory::types;
+
+        let imported = self
+            .imported_nbt
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         {
             let data = self
                 .villager_data
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let mut villager_data_nbt = NbtCompound::new();
-            villager_data_nbt.put_int("Type", data.r#type.0);
-            villager_data_nbt.put_int("Profession", data.profession.0);
-            villager_data_nbt.put_int("Level", data.level.0);
+            let mut villager_data_nbt = imported
+                .get_compound("VillagerData")
+                .cloned()
+                .unwrap_or_default();
+            data.write_nbt(&mut villager_data_nbt);
             nbt.put_compound("VillagerData", villager_data_nbt);
         };
 
-        nbt.put_int("FoodLevel", self.food_level.load(Ordering::Relaxed));
+        nbt.put_byte("FoodLevel", self.food_level.load(Ordering::Relaxed) as i8);
+        nbt.put_bool("VillagerDataFinalized", true);
+        let mut brain = self
+            .mob_entity
+            .brain
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let world = self.get_entity().world.load();
+        let dimension =
+            pumpkin_data::dimension::Dimension::from_name(world.dimension.minecraft_name);
+        if let Some(dimension) = dimension {
+            nbt::sync_poi_memory(&mut brain, types::HOME, self.get_home(), dimension);
+            let job_site = self.get_job_site();
+            let pending = self.job_site_pending.load(Ordering::Relaxed);
+            nbt::sync_poi_memory(
+                &mut brain,
+                types::POTENTIAL_JOB_SITE,
+                job_site.filter(|_| pending),
+                dimension,
+            );
+            nbt::sync_poi_memory(
+                &mut brain,
+                types::JOB_SITE,
+                job_site.filter(|_| !pending),
+                dimension,
+            );
+        }
+        let last_worked = self.last_worked_at_poi.load(Ordering::Relaxed);
+        if last_worked > 0 {
+            brain.set(types::LAST_WORKED_AT_POI, last_worked);
+        }
+        nbt.put_compound(
+            "Brain",
+            nbt::write_brain(
+                imported.get_compound("Brain").cloned().unwrap_or_default(),
+                &brain,
+            ),
+        );
+        drop(brain);
         nbt.put_int("Xp", self.xp.load(Ordering::Relaxed));
         nbt.put_long(
             "LastRestock",
@@ -1927,41 +2003,14 @@ impl Mob for VillagerEntity {
             .offers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !offers.is_empty() {
-            let mut recipes = Vec::new();
-            for offer in offers.iter() {
-                let mut recipe = NbtCompound::new();
-                let mut buy = NbtCompound::new();
-                let mut sell = NbtCompound::new();
-
-                let item_stack: &ItemStack = offer.base_cost_a.0.as_ref();
-                item_stack.write_item_stack(&mut buy);
-                recipe.put_compound("buy", buy);
-
-                let item_stack: &ItemStack = offer.output.0.as_ref();
-                item_stack.write_item_stack(&mut sell);
-                recipe.put_compound("sell", sell);
-
-                if let Some(cost_b) = &offer.cost_b {
-                    let mut buy_b = NbtCompound::new();
-                    let item_stack: &ItemStack = cost_b.0.as_ref();
-                    item_stack.write_item_stack(&mut buy_b);
-                    recipe.put_compound("buyB", buy_b);
-                }
-
-                recipe.put_int("uses", offer.uses);
-                recipe.put_int("maxUses", offer.max_uses);
-                recipe.put_bool("rewardExp", offer.reward_exp);
-                recipe.put_int("xp", offer.xp);
-                recipe.put_float("priceMultiplier", offer.price_multiplier);
-                recipe.put_int("specialPrice", offer.special_price);
-                recipe.put_int("demand", offer.demand);
-
-                recipes.push(NbtTag::Compound(recipe));
-            }
-            let mut offers_compound = NbtCompound::new();
-            offers_compound.put("Recipes", NbtTag::List(recipes));
-            nbt.put_compound("Offers", offers_compound);
+        if !offers.is_empty() || imported.get_compound("Offers").is_some() {
+            nbt.put_compound(
+                "Offers",
+                nbt::write_offers(
+                    &offers,
+                    imported.get_compound("Offers").cloned().unwrap_or_default(),
+                ),
+            );
         }
 
         let inventory = self
@@ -1970,7 +2019,7 @@ impl Mob for VillagerEntity {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !inventory.is_empty() {
             let mut inventory_list = Vec::new();
-            for item in inventory.iter() {
+            for item in inventory.iter().filter(|item| !item.is_empty()) {
                 let mut item_compound = NbtCompound::new();
                 item.write_item_stack(&mut item_compound);
                 inventory_list.push(NbtTag::Compound(item_compound));
@@ -1982,43 +2031,35 @@ impl Mob for VillagerEntity {
             .gossips
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !gossips.is_empty() {
-            let mut gossip_list = Vec::new();
-            for (uuid, entries) in gossips.iter() {
-                for (gossip_type, val) in entries {
-                    let mut gossip_nbt = NbtCompound::new();
-                    let (u1, u2) = uuid.as_u64_pair();
-                    let uuid_array =
-                        vec![(u1 >> 32) as i32, u1 as i32, (u2 >> 32) as i32, u2 as i32];
-                    gossip_nbt.put("Target", NbtTag::IntArray(uuid_array));
-                    gossip_nbt.put_string("Type", gossip_type.name().to_string());
-                    gossip_nbt.put_int("Value", *val);
-                    gossip_list.push(NbtTag::Compound(gossip_nbt));
-                }
-            }
-            nbt.put("Gossips", NbtTag::List(gossip_list));
-        }
+        let gossip_list = nbt::write_gossips(&gossips, imported.get_list("Gossips"));
+        nbt.put_list("Gossips", gossip_list);
     }
 
     #[allow(clippy::too_many_lines)]
     fn mob_read_nbt(&self, nbt: &NbtCompound) {
-        if let Some(villager_data_nbt) = nbt.get_compound("VillagerData") {
-            let mut data = self
-                .villager_data
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(t) = villager_data_nbt.get_int("Type") {
-                data.r#type = VarInt(t);
-            }
-            if let Some(p) = villager_data_nbt.get_int("Profession") {
-                data.profession = VarInt(p);
-            }
-            if let Some(l) = villager_data_nbt.get_int("Level") {
-                data.level = VarInt(l);
+        let mut imported = NbtCompound::new();
+        for key in ["VillagerData", "Offers", "Brain", "Gossips"] {
+            if let Some(value) = nbt.get(key) {
+                imported.put(key, value.clone());
             }
         }
+        *self
+            .imported_nbt
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = imported;
+        if let Some(villager_data_nbt) = nbt.get_compound("VillagerData") {
+            *self
+                .villager_data
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                VillagerData::from_nbt(villager_data_nbt);
+        }
 
-        if let Some(food) = nbt.get_int("FoodLevel") {
+        if let Some(food) = nbt
+            .get_byte("FoodLevel")
+            .map(i32::from)
+            .or_else(|| nbt.get_int("FoodLevel"))
+        {
             self.food_level.store(food, Ordering::Relaxed);
         }
         if let Some(xp) = nbt.get_int("Xp") {
@@ -2072,6 +2113,53 @@ impl Mob for VillagerEntity {
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         }
 
+        {
+            use crate::entity::ai::brain::memory::types;
+            let brain = self
+                .mob_entity
+                .brain
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let world = self.get_entity().world.load();
+            let dimension =
+                pumpkin_data::dimension::Dimension::from_name(world.dimension.minecraft_name);
+            let job = brain
+                .get(types::JOB_SITE)
+                .filter(|pos| Some(pos.dimension.id) == dimension.map(|dimension| dimension.id));
+            let potential = brain
+                .get(types::POTENTIAL_JOB_SITE)
+                .filter(|pos| Some(pos.dimension.id) == dimension.map(|dimension| dimension.id));
+            if let Some(pos) = job.or(potential) {
+                *self
+                    .job_site
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(pos.pos);
+                self.job_site_pending
+                    .store(job.is_none(), Ordering::Relaxed);
+            }
+            if let Some(pos) = brain
+                .get(types::HOME)
+                .filter(|pos| Some(pos.dimension.id) == dimension.map(|dimension| dimension.id))
+            {
+                *self
+                    .home_pos
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(pos.pos);
+            }
+            if let Some(last_worked) = brain.get(types::LAST_WORKED_AT_POI) {
+                self.last_worked_at_poi
+                    .store(*last_worked, Ordering::Relaxed);
+            }
+        }
+        if let Some(last_share) = nbt.get_long("LastGossipShare") {
+            self.last_gossip_share_time
+                .store(last_share, Ordering::Relaxed);
+        }
+        if let Some(last_worked) = nbt.get_long("LastWorkedAtPoi") {
+            self.last_worked_at_poi
+                .store(last_worked, Ordering::Relaxed);
+        }
+
         if let Some(offers_compound) = nbt.get_compound("Offers")
             && let Some(recipes) = offers_compound.get_list("Recipes")
         {
@@ -2080,46 +2168,11 @@ impl Mob for VillagerEntity {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             offers.clear();
-            for tag in recipes {
-                if let Some(recipe) = tag.extract_compound() {
-                    let buy = recipe
-                        .get_compound("buy")
-                        .and_then(ItemStack::read_item_stack);
-                    let buy_b = recipe
-                        .get_compound("buyB")
-                        .and_then(ItemStack::read_item_stack);
-                    let sell_item = recipe
-                        .get_compound("sell")
-                        .and_then(ItemStack::read_item_stack);
-
-                    if let (Some(buy), Some(sell_item)) = (buy, sell_item)
-                        && !buy.is_empty()
-                        && !sell_item.is_empty()
-                        && buy_b.as_ref().is_none_or(|stack| !stack.is_empty())
-                    {
-                        let uses = recipe.get_int("uses").unwrap_or(0);
-                        let max_uses = recipe.get_int("maxUses").unwrap_or(12);
-                        let reward_exp = recipe.get_bool("rewardExp").unwrap_or(true);
-                        let xp = recipe.get_int("xp").unwrap_or(2);
-                        let price_multiplier = recipe.get_float("priceMultiplier").unwrap_or(0.05);
-                        let special_price = recipe.get_int("specialPrice").unwrap_or(0);
-                        let demand = recipe.get_int("demand").unwrap_or(0);
-
-                        offers.push(pumpkin_protocol::java::client::play::MerchantOffer {
-                            base_cost_a: buy.into(),
-                            output: sell_item.into(),
-                            cost_b: buy_b.map(Into::into),
-                            reward_exp,
-                            uses,
-                            max_uses,
-                            xp,
-                            special_price,
-                            price_multiplier,
-                            demand,
-                        });
-                    }
-                }
-            }
+            offers.extend(
+                recipes
+                    .iter()
+                    .filter_map(|tag| tag.extract_compound().and_then(nbt::read_offer)),
+            );
         }
 
         // Inventory
@@ -2129,12 +2182,13 @@ impl Mob for VillagerEntity {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             inventory.clear();
-            for tag in inventory_list {
-                if let Some(item_compound) = tag.extract_compound()
-                    && let Some(stack) = ItemStack::read_item_stack(item_compound)
-                {
-                    inventory.push(stack);
-                }
+            inventory.resize_with(8, || ItemStack::EMPTY.clone());
+            for (slot, stack) in inventory.iter_mut().zip(
+                inventory_list
+                    .iter()
+                    .filter_map(|tag| tag.extract_compound().and_then(ItemStack::read_item_stack)),
+            ) {
+                *slot = stack;
             }
         }
 
@@ -2144,32 +2198,7 @@ impl Mob for VillagerEntity {
                 .gossips
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            gossips.clear();
-            for tag in gossip_list {
-                if let Some(gossip_nbt) = tag.extract_compound() {
-                    let uuid = gossip_nbt.get_int_array("Target").map(|uuid_array| {
-                        Uuid::from_u128(
-                            (uuid_array[0] as u128) << 96
-                                | (uuid_array[1] as u128) << 64
-                                | (uuid_array[2] as u128) << 32
-                                | (uuid_array[3] as u128),
-                        )
-                    });
-                    let gossip_type = gossip_nbt
-                        .get_string("Type")
-                        .and_then(GossipType::from_name)
-                        .or_else(|| {
-                            gossip_nbt
-                                .get_int("Type")
-                                .and_then(GossipType::from_legacy_id)
-                        });
-                    if let (Some(uuid), Some(gossip_type), Some(val)) =
-                        (uuid, gossip_type, gossip_nbt.get_int("Value"))
-                    {
-                        gossips.entry(uuid).or_default().insert(gossip_type, val);
-                    }
-                }
-            }
+            *gossips = nbt::read_gossips(gossip_list);
         }
     }
 
@@ -2377,6 +2406,100 @@ mod tests {
     use pumpkin_util::version::JavaMinecraftVersion;
 
     use super::*;
+
+    #[tokio::test]
+    async fn vanilla_villager_import_keeps_profession_offers_pois_and_restock_state() {
+        use crate::block::registry::BlockRegistry;
+        use crate::entity::NBTStorage;
+        use arc_swap::ArcSwap;
+        use pumpkin_config::world::LevelConfig;
+        use pumpkin_data::dimension::Dimension;
+        use pumpkin_util::world_seed::Seed;
+        use pumpkin_world::{level::Level, world_info::LevelData};
+        let directory = tempfile::tempdir().unwrap();
+        let dimension = Dimension::THE_END;
+        let level = Level::from_root_folder(
+            &LevelConfig::default(),
+            directory.path().to_path_buf(),
+            0,
+            dimension.clone(),
+        )
+        .unwrap();
+        let world = Arc::new(
+            World::load(
+                level,
+                Arc::new(ArcSwap::from_pointee(LevelData::default(Seed(0)))),
+                dimension,
+                Arc::new(BlockRegistry::default()),
+                Weak::new(),
+            )
+            .unwrap(),
+        );
+        let villager = VillagerEntity::new(Entity::new(
+            world.clone(),
+            Vector3::default(),
+            &EntityType::VILLAGER,
+        ));
+        let mut fixture = NbtCompound::new();
+        let mut data = NbtCompound::new();
+        data.put_string("type", "minecraft:taiga".to_owned());
+        data.put_string("profession", "minecraft:librarian".to_owned());
+        data.put_int("level", 4);
+        fixture.put_compound("VillagerData", data);
+        fixture.put_int("Xp", 170);
+        fixture.put_long("LastRestock", 40_000);
+        fixture.put_int("RestocksToday", 2);
+        fixture.put_byte("FoodLevel", 8);
+        let mut recipe = NbtCompound::new();
+        let mut buy = NbtCompound::new();
+        ItemStack::new(9, &Item::EMERALD).write_item_stack(&mut buy);
+        let mut sell = NbtCompound::new();
+        ItemStack::new(1, &Item::BOOKSHELF).write_item_stack(&mut sell);
+        recipe.put_compound("buy", buy);
+        recipe.put_compound("sell", sell);
+        recipe.put_int("uses", 12);
+        recipe.put_int("maxUses", 12);
+        let mut offers = NbtCompound::new();
+        offers.put_list("Recipes", vec![NbtTag::Compound(recipe)]);
+        fixture.put_compound("Offers", offers);
+        let mut value = NbtCompound::new();
+        value.put_string("dimension", "minecraft:the_end".to_owned());
+        value.put("pos", NbtTag::IntArray(vec![2, 64, 2]));
+        let mut memory = NbtCompound::new();
+        memory.put_compound("value", value);
+        let mut memories = NbtCompound::new();
+        memories.put_compound("minecraft:job_site", memory);
+        let mut brain = NbtCompound::new();
+        brain.put_compound("memories", memories);
+        fixture.put_compound("Brain", brain);
+        NBTStorage::read_nbt_non_mut(villager.as_ref(), &fixture);
+        assert_eq!(
+            *villager.villager_data.lock().unwrap(),
+            VillagerData::new(VillagerType::Taiga, VillagerProfession::Librarian, 4)
+        );
+        assert_eq!(villager.get_job_site(), Some(BlockPos::new(2, 64, 2)));
+        assert!(!villager.job_site_pending.load(Ordering::Relaxed));
+        villager.update_job_site(&world);
+        assert_eq!(villager.offers.lock().unwrap().len(), 1);
+        let mut saved = NbtCompound::new();
+        NBTStorage::write_nbt(villager.as_ref(), &mut saved);
+        assert_eq!(saved.get_int("Xp"), Some(170));
+        assert_eq!(saved.get_long("LastRestock"), Some(40_000));
+        assert_eq!(saved.get_int("RestocksToday"), Some(2));
+        assert_eq!(saved.get_byte("FoodLevel"), Some(8));
+        assert_eq!(
+            saved
+                .get_compound("Offers")
+                .unwrap()
+                .get_list("Recipes")
+                .unwrap()[0]
+                .extract_compound()
+                .unwrap()
+                .get_int("uses"),
+            Some(12)
+        );
+        world.level.shutdown().await;
+    }
 
     #[test]
     fn villager_data_metadata_uses_the_villager_tracker_slot() {

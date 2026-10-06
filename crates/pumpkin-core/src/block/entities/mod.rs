@@ -70,6 +70,16 @@ pub use pumpkin_inventory::PropertyDelegate;
 //TODO: We need a mark_dirty for chests
 pub trait BlockEntity: Any + Send + Sync {
     fn write_nbt(&self, nbt: &mut NbtCompound);
+    /// Alternate input names superseded by modeled canonical fields.
+    fn nbt_aliases(&self) -> &'static [(&'static str, &'static str)] {
+        &[]
+    }
+
+    /// Retained fields to remove when their previously modeled owner is cleared.
+    fn nbt_dependencies(&self) -> &'static [(&'static str, &'static str)] {
+        &[]
+    }
+
     fn from_nbt(nbt: &NbtCompound, position: BlockPos) -> Self
     where
         Self: Sized;

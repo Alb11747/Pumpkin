@@ -1406,6 +1406,10 @@ impl BlockEntity for TrialSpawnerBlockEntity {
         }
     }
 
+    fn nbt_aliases(&self) -> &'static [(&'static str, &'static str)] {
+        &[("key", "normal_config"), ("config", "normal_config")]
+    }
+
     fn write_nbt(&self, nbt: &mut NbtCompound) {
         if let Ok(spawner) = self.trial_spawner.lock() {
             spawner.store(nbt);

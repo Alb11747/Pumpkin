@@ -501,8 +501,13 @@ impl BlockBehaviour for SignBlock {
             is_facing_front_text(args.world, args.position, args.block, args.player);
         let text = sign_entity.get_text(is_front_text);
 
-        let executed_click_command =
-            execute_click_commands_if_present(args.world, args.player, args.position, text);
+        let executed_click_command = execute_click_commands_if_present(
+            args.world,
+            args.player,
+            args.position,
+            text,
+            sign_entity.allow_op_features(),
+        );
 
         if sign_entity.is_waxed() {
             let is_hanging = args.block.name.contains("hanging");
@@ -525,7 +530,7 @@ impl BlockBehaviour for SignBlock {
             args.world,
             args.position,
         ) && args.player.may_build()
-            && has_editable_text(text)
+            && has_editable_text(text, args.player.is_text_filtering_enabled())
         {
             open_text_edit(
                 args.player,
@@ -599,7 +604,13 @@ impl BlockBehaviour for SignBlock {
             };
 
             if result == BlockActionResult::Success {
-                execute_click_commands_if_present(args.world, args.player, args.position, text);
+                execute_click_commands_if_present(
+                    args.world,
+                    args.player,
+                    args.position,
+                    text,
+                    sign_entity.allow_op_features(),
+                );
                 if pumpkin_item.as_any().is::<GlowingInkSacItem>() {
                     args.player.trigger_advancement(
                         crate::entity::player::advancement::trigger::AdvancementTrigger::GlowedSign,
@@ -650,33 +661,18 @@ fn other_player_is_editing_sign(
 }
 
 /// Checks whether all messages on the given sign text face are plain text or empty.
-fn has_editable_text(text: &Text) -> bool {
-    let messages = text
-        .messages
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    messages.iter().all(|msg| is_plain_or_empty_text(msg))
+fn has_editable_text(text: &Text, should_filter: bool) -> bool {
+    let messages = text.get_components(should_filter);
+    messages.iter().all(is_plain_or_empty_text)
 }
 
-fn is_plain_or_empty_text(text: &str) -> bool {
-    if text.is_empty() {
-        return true;
-    }
-    if !text.starts_with('{') {
-        return true;
-    }
-    match serde_json::from_str::<TextComponent>(text) {
-        Ok(component) => {
-            component.0.style.click_event.is_none()
-                && component.0.style.hover_event.is_none()
-                && component.0.extra.is_empty()
-                && matches!(
-                    *component.0.content,
-                    pumpkin_util::text::TextContent::Text { .. }
-                )
-        }
-        Err(_) => true,
-    }
+fn is_plain_or_empty_text(component: &TextComponent) -> bool {
+    // Empty components also have literal contents; style and children do not
+    // change vanilla SignText.hasEditableText's root-content check.
+    matches!(
+        *component.0.content,
+        pumpkin_util::text::TextContent::Text { .. }
+    )
 }
 
 /// Executes any `run_command` click events defined in the sign's text messages.
@@ -685,24 +681,21 @@ fn execute_click_commands_if_present(
     player: &Arc<Player>,
     position: &BlockPos,
     text: &Text,
+    allow_op_features: bool,
 ) -> bool {
     let Some(server) = world.server.upgrade() else {
         return false;
     };
 
-    let messages = text
-        .messages
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let messages = text.get_components(player.is_text_filtering_enabled());
 
     let mut has_run_command = false;
-    for msg in messages.iter() {
-        if msg.is_empty() || !msg.starts_with('{') {
-            continue;
-        }
-        if let Ok(component) = serde_json::from_str::<TextComponent>(msg)
-            && let Some(ClickEvent::RunCommand { command }) = &component.0.style.click_event
-        {
+    for component in &messages {
+        if let Some(ClickEvent::RunCommand { command }) = &component.0.style.click_event {
+            has_run_command = true;
+            if !allow_op_features {
+                continue;
+            }
             let source = CommandSource::new(
                 CommandSender::Dummy,
                 world.clone(),
@@ -716,8 +709,14 @@ fn execute_click_commands_if_present(
             let command_str = command.strip_prefix('/').unwrap_or(command);
             let dispatcher = server.command_dispatcher.load();
             dispatcher.handle_command(&source, command_str);
-            has_run_command = true;
         }
+    }
+    if has_run_command && !allow_op_features {
+        player.send_system_message_raw(
+            &TextComponent::translate("sign.click_actions_disabled", Vec::new())
+                .color_named(pumpkin_util::text::color::NamedColor::Red),
+            true,
+        );
     }
     has_run_command
 }
@@ -800,6 +799,76 @@ fn get_yaw_from_rotation_16(rotation: u8) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn imported_sign_interactions_use_components_and_the_selected_filtered_face() {
+        use pumpkin_nbt::{NbtCompound, tag::NbtTag};
+
+        let literal_json =
+            r#"{"text":"literal","click_event":{"action":"run_command","command":"say wrong"}}"#;
+        let mut translated = NbtCompound::new();
+        translated.put_string("translate", "block.minecraft.chest".to_string());
+        let mut command = NbtCompound::new();
+        command.put_string("action", "run_command".to_string());
+        command.put_string("command", "say actual".to_string());
+        let mut clickable = NbtCompound::new();
+        clickable.put_string("text", "Run".to_string());
+        clickable.put_compound("click_event", command);
+        clickable.put_list("extra", vec!["child".into()]);
+        let mut text = NbtCompound::new();
+        text.put_list(
+            "messages",
+            vec![
+                literal_json.into(),
+                NbtTag::Compound(translated),
+                NbtTag::Compound(clickable),
+                "".into(),
+            ],
+        );
+        text.put_list(
+            "filtered_messages",
+            vec![
+                literal_json.into(),
+                "filtered".into(),
+                "safe".into(),
+                "".into(),
+            ],
+        );
+        let sign = Text::from(NbtTag::Compound(text));
+        assert!(!has_editable_text(&sign, false));
+        assert!(has_editable_text(&sign, true));
+        assert!(sign.has_any_click_commands(false));
+        assert!(!sign.has_any_click_commands(true));
+        let components = sign.get_components(false);
+        assert_eq!(components[0], TextComponent::text(literal_json));
+        assert!(components[0].0.style.click_event.is_none());
+        assert!(is_plain_or_empty_text(&components[2]));
+        assert!(matches!(
+            components[2].0.style.click_event.as_ref(),
+            Some(ClickEvent::RunCommand { command }) if command == "say actual"
+        ));
+
+        // Player-authored JSON-looking text has the same literal semantics.
+        let authored = Text::from_messages([
+            Box::from(literal_json),
+            Box::from(""),
+            Box::from(""),
+            Box::from(""),
+        ]);
+        assert!(has_editable_text(&authored, false));
+        assert!(!authored.has_any_click_commands(false));
+
+        // A filtering player edits the style of the line they actually saw,
+        // rather than inheriting the hidden unfiltered command's style.
+        sign.set_message_with_filter(2, Box::from(literal_json), None, true);
+        assert!(!sign.has_any_click_commands(false));
+        assert!(!sign.has_any_click_commands(true));
+        assert_eq!(
+            sign.get_components(false)[2],
+            TextComponent::text(literal_json)
+        );
+        assert_eq!(sign.get_components(false)[2], sign.get_components(true)[2]);
+    }
 
     fn placement(block: &Block, waterlogged: bool) -> SignPlacement {
         SignPlacement {

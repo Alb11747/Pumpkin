@@ -11,6 +11,7 @@ use pumpkin_util::math::vector2::Vector2;
 use ruzstd::decoding::StreamingDecoder;
 use ruzstd::encoding::{CompressionLevel, compress_to_vec};
 use serde::{Deserialize, Serialize};
+use tokio::io::AsyncWriteExt;
 
 pub struct PumpFile<D> {
     pub data: PumpData,
@@ -67,7 +68,12 @@ where
         })
         .await
         .map_err(|_| std::io::Error::other("pump serialization task failed"))?;
-        tokio::fs::write(backend, bytes).await
+        let temporary = backend.with_extension("tmp");
+        let mut file = tokio::fs::File::create(&temporary).await?;
+        file.write_all(&bytes).await?;
+        file.sync_all().await?;
+        drop(file);
+        tokio::fs::rename(temporary, backend).await
     }
 
     fn read(r: Bytes) -> Result<Self, ChunkReadingError> {
@@ -206,6 +212,9 @@ mod tests {
             true
         }
         fn mark_dirty(&self, _: bool) {}
+        fn take_dirty(&self) -> bool {
+            self.is_dirty()
+        }
     }
 
     impl SingleChunkDataSerializer for MockChunk {

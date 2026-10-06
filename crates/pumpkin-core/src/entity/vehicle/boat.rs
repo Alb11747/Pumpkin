@@ -8,8 +8,10 @@ use crate::entity::{Entity, EntityBase, living::LivingEntity};
 use crate::server::Server;
 
 use pumpkin_data::damage::DamageType;
+use pumpkin_data::item::Item;
 use pumpkin_data::item_stack::ItemStack;
 use pumpkin_protocol::java::client::play::Metadata;
+use pumpkin_util::GameMode;
 
 use pumpkin_util::math::vector3::Vector3;
 
@@ -51,6 +53,46 @@ impl BoatEntity {
 }
 
 impl EntityBase for BoatEntity {
+    fn passenger_position(&self, passenger: &dyn EntityBase) -> Vector3<f64> {
+        let entity = &self.vehicle.entity;
+        let passengers = entity
+            .passengers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut offset = if entity.entity_type.resource_name.contains("chest") {
+            0.15f32
+        } else {
+            0.0
+        };
+        if passengers.len() > 1 {
+            offset = if passengers.first().is_some_and(|first| {
+                first.get_entity().entity_id == passenger.get_entity().entity_id
+            }) {
+                0.2
+            } else {
+                -0.6
+            };
+            if passenger
+                .get_mob()
+                .is_some_and(|mob| mob.as_animal().is_some())
+            {
+                offset += 0.2;
+            }
+        }
+        let height = if entity.entity_type.resource_name.ends_with("raft") {
+            entity.height() * 0.888_888_9
+        } else {
+            entity.height() / 3.0
+        };
+        let yaw = entity.yaw.load().to_radians();
+        entity.pos.load()
+            + Vector3::new(
+                f64::from(-yaw.sin() * offset),
+                f64::from(height),
+                f64::from(yaw.cos() * offset),
+            )
+    }
+
     fn get_entity(&self) -> &Entity {
         &self.vehicle.entity
     }
@@ -91,7 +133,32 @@ impl EntityBase for BoatEntity {
         source: Option<&dyn EntityBase>,
         _cause: Option<&dyn EntityBase>,
     ) -> bool {
-        self.vehicle.damage_with_context(amount, source)
+        let creative = source
+            .and_then(EntityBase::get_player)
+            .is_some_and(|player| player.gamemode.load() == GameMode::Creative);
+        let was_alive = self.vehicle.entity.is_alive();
+        let damaged = self.vehicle.damage_with_context(amount, source);
+        if was_alive
+            && self.vehicle.entity.is_removed()
+            && !creative
+            && self
+                .vehicle
+                .entity
+                .world
+                .load()
+                .level_info
+                .load()
+                .game_rules
+                .entity_drops
+        {
+            // Boat entity and item registry keys are identical, including rafts/chest boats.
+            if let Some(item) =
+                Item::from_registry_key(self.vehicle.entity.entity_type.resource_name)
+            {
+                self.vehicle.drop_item(item);
+            }
+        }
+        damaged
     }
 
     fn interact(&self, player: &Arc<Player>, _item_stack: &mut ItemStack) -> bool {

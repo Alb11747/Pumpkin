@@ -446,6 +446,8 @@ impl<S: SingleChunkDataSerializer + 'static> ChunkSerializer for LinearV2File<S>
         }
         writer.write_all(&SIGNATURE).await?;
         writer.flush().await?;
+        writer.get_ref().sync_all().await?;
+        drop(writer);
 
         // Atomic rename so a crash during write cannot produce a torn file.
         tokio::fs::rename(temp_path, path).await?;

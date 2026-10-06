@@ -96,7 +96,33 @@ impl GossipType {
 
 #[cfg(test)]
 mod tests {
-    use super::GossipType;
+    use super::{GossipType, VillagerData, VillagerProfession, VillagerType};
+
+    #[test]
+    fn modern_villager_data_keeps_registry_identity_and_accepts_legacy_saves() {
+        let mut nbt = pumpkin_nbt::compound::NbtCompound::new();
+        nbt.put_string("type", "minecraft:taiga".to_owned());
+        nbt.put_string("profession", "minecraft:librarian".to_owned());
+        nbt.put_int("level", 5);
+        nbt.put_int("future_field", 42);
+        let data = VillagerData::from_nbt(&nbt);
+        assert_eq!(
+            data,
+            VillagerData::new(VillagerType::Taiga, VillagerProfession::Librarian, 5)
+        );
+        data.write_nbt(&mut nbt);
+        assert_eq!(nbt.get_string("profession"), Some("minecraft:librarian"));
+        assert_eq!(nbt.get_int("level"), Some(5));
+        assert_eq!(nbt.get_int("future_field"), Some(42));
+        let mut legacy = pumpkin_nbt::compound::NbtCompound::new();
+        legacy.put_int("Type", VillagerType::Desert as i32);
+        legacy.put_int("Profession", VillagerProfession::Farmer as i32);
+        legacy.put_int("Level", 0);
+        assert_eq!(
+            VillagerData::from_nbt(&legacy),
+            VillagerData::new(VillagerType::Desert, VillagerProfession::Farmer, 1)
+        );
+    }
 
     #[test]
     fn gossip_types_use_vanilla_names_and_values() {
@@ -140,6 +166,54 @@ impl pumpkin_protocol::java::client::play::MetadataSerializer for VillagerData {
 }
 
 impl VillagerData {
+    #[must_use]
+    pub fn from_nbt(nbt: &pumpkin_nbt::compound::NbtCompound) -> Self {
+        let r#type = nbt
+            .get_string("type")
+            .and_then(VillagerType::from_name)
+            .or_else(|| nbt.get_int("Type").and_then(VillagerType::from_i32))
+            .unwrap_or(VillagerType::Plains);
+        let profession = nbt
+            .get_string("profession")
+            .and_then(VillagerProfession::from_name)
+            .or_else(|| {
+                nbt.get_int("Profession")
+                    .and_then(VillagerProfession::from_i32)
+            })
+            .unwrap_or(VillagerProfession::None);
+        Self::new(
+            r#type,
+            profession,
+            nbt.get_int("level")
+                .or_else(|| nbt.get_int("Level"))
+                .unwrap_or(1)
+                .max(1),
+        )
+    }
+
+    pub fn write_nbt(&self, nbt: &mut pumpkin_nbt::compound::NbtCompound) {
+        let retained = Self::from_nbt(nbt);
+        let unknown_type = nbt
+            .get_string("type")
+            .is_some_and(|name| VillagerType::from_name(name).is_none());
+        let unknown_profession = nbt
+            .get_string("profession")
+            .is_some_and(|name| VillagerProfession::from_name(name).is_none());
+        for legacy in ["Type", "Profession", "Level"] {
+            nbt.child_tags.remove(legacy);
+        }
+        if !unknown_type || self.r#type != retained.r#type {
+            nbt.put_string("type", format!("minecraft:{}", self.type_enum().to_name()));
+        }
+        if !unknown_profession || self.profession != retained.profession {
+            nbt.put_string(
+                "profession",
+                format!("minecraft:{}", self.profession_enum().to_name()),
+            );
+        }
+        nbt.put_int("level", self.level.0);
+    }
+
     #[must_use]
     pub const fn new(r#type: VillagerType, profession: VillagerProfession, level: i32) -> Self {
         Self {

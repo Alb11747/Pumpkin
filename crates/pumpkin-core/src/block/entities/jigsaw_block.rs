@@ -94,7 +94,7 @@ impl JigsawBlockEntity {
 
         let structure = {
             let mut context = StructureGeneratorContext {
-                seed: world.level_info.load().world_gen_settings.seed,
+                seed: world.level.seed.0 as i64,
                 chunk_x: position.chunk_position().x,
                 chunk_z: position.chunk_position().y,
                 random: RandomGenerator::Xoroshiro(Xoroshiro::from_seed(rand::rng().next_u64())),

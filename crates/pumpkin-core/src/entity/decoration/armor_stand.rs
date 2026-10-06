@@ -273,11 +273,7 @@ impl EntityBase for ArmorStandEntity {
             self.disabled_slots.store(disabled_slots, Ordering::Relaxed);
         }
 
-        if let Some(no_base_plate) = nbt.get_bool("NoBasePlate") {
-            if !no_base_plate {
-                flags |= ArmorStandFlags::HideBasePlate as u8;
-            }
-        } else {
+        if nbt.get_bool("NoBasePlate").unwrap_or(false) {
             flags |= ArmorStandFlags::HideBasePlate as u8;
         }
 
@@ -424,4 +420,48 @@ pub enum ArmorStandFlags {
     HideBasePlate = 8,
     /// Marker Flag
     Marker = 16,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pumpkin_data::entity::EntityType;
+
+    #[tokio::test]
+    async fn no_base_plate_preserves_both_states_and_defaults_to_visible_on_load() {
+        let directory = tempfile::tempdir().unwrap();
+        let world = crate::entity::vehicle::tests::test_world(directory.path());
+        for no_base_plate in [None, Some(false), Some(true)] {
+            let mut raw = NbtCompound::new();
+            if let Some(no_base_plate) = no_base_plate {
+                raw.put_bool("NoBasePlate", no_base_plate);
+            }
+            raw.put_bool("Small", true);
+            raw.put_bool("ShowArms", true);
+            raw.put_bool("Marker", true);
+            for _ in 0..2 {
+                let stand = ArmorStandEntity::new(Entity::new(
+                    world.clone(),
+                    Vector3::new(0.5, 64.0, 0.5),
+                    &EntityType::ARMOR_STAND,
+                ));
+                stand.read_nbt_non_mut(&raw);
+                assert_eq!(
+                    stand.should_show_base_plate(),
+                    !no_base_plate.unwrap_or(false)
+                );
+                assert!(stand.is_small());
+                assert!(stand.should_show_arms());
+                assert!(stand.is_marker());
+                let mut saved = NbtCompound::new();
+                stand.write_nbt(&mut saved);
+                assert_eq!(
+                    saved.get_bool("NoBasePlate"),
+                    Some(no_base_plate.unwrap_or(false))
+                );
+                raw = saved;
+            }
+        }
+        world.level.shutdown().await;
+    }
 }

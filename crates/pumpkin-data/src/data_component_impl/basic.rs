@@ -529,14 +529,46 @@ impl DataComponentImpl for BannerPatternsImpl {
     default_impl!(BannerPatterns);
 }
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
-pub struct PotDecorationsImpl;
+#[derive(Clone, Debug, PartialEq)]
+pub struct PotDecorationsImpl {
+    /// Keep side item-template components and unknown fields intact on disk.
+    pub decorations: Option<NbtCompound>,
+}
 impl PotDecorationsImpl {
-    pub const fn read_data(_data: &NbtTag) -> Option<Self> {
-        Some(Self)
+    pub const EMPTY: Self = Self { decorations: None };
+    pub const SIDES: [&'static str; 4] = ["back", "left", "right", "front"];
+
+    pub fn read_data(data: &NbtTag) -> Option<Self> {
+        let decorations = match data {
+            NbtTag::Compound(compound) => compound.clone(),
+            NbtTag::List(items) => {
+                // PotDecorationsComponentUnflatteningFix's four-side order and brick defaults.
+                let mut compound = NbtCompound::new();
+                for (index, name) in Self::SIDES.iter().enumerate() {
+                    let item = match items.get(index) {
+                        None => "minecraft:brick",
+                        Some(item) => item.extract_string()?,
+                    };
+                    if item.is_empty() {
+                        return None;
+                    }
+                    let mut side = NbtCompound::new();
+                    side.put_string("id", item.to_owned());
+                    compound.put_compound(name, side);
+                }
+                compound
+            }
+            _ => return None,
+        };
+        Some(Self {
+            decorations: Some(decorations),
+        })
     }
 }
 impl DataComponentImpl for PotDecorationsImpl {
+    fn write_data(&self) -> NbtTag {
+        NbtTag::Compound(self.decorations.clone().unwrap_or_default())
+    }
     default_impl!(PotDecorations);
 }
 

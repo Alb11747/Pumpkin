@@ -401,14 +401,34 @@ impl Mob for EndermanEntity {
 
     fn mob_write_nbt(&self, nbt: &mut NbtCompound) {
         if let Some(block_state) = self.carried_block.load() {
-            nbt.put_int("carriedBlockState", block_state.as_u16() as i32);
+            nbt.put_compound(
+                "carriedBlockState",
+                pumpkin_world::generation::structure::template::PaletteEntry::from_block_state(
+                    block_state,
+                )
+                .to_nbt_compound(),
+            );
+        } else {
+            nbt.child_tags.remove("carriedBlockState");
         }
     }
 
     fn mob_read_nbt(&self, nbt: &NbtCompound) {
-        if let Some(block_state) = nbt.get_int("carriedBlockState") {
-            self.set_carried_block(BlockStateId::new(block_state as u16));
+        use pumpkin_world::generation::structure::template::{BlockStateResolver, PaletteEntry};
+        let carried = nbt
+            .get_compound("carriedBlockState")
+            .and_then(|compound| PaletteEntry::from_nbt_compound(compound).ok())
+            .and_then(|entry| BlockStateResolver::resolve_simple(&entry))
+            .map(|state| state.id)
+            .or_else(|| {
+                nbt.get_int("carriedBlockState")
+                    .and_then(|id| u16::try_from(id).ok())
+                    .and_then(BlockStateId::new)
+            });
+        if nbt.get("carriedBlockState").is_some() && carried.is_none() {
+            tracing::warn!("Cannot decode enderman carried block state");
         }
+        self.set_carried_block(carried.filter(|state| *state != BlockStateId::AIR));
     }
 
     fn get_mob_entity(&self) -> &MobEntity {

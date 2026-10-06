@@ -12,7 +12,6 @@ use pumpkin_data::tag::{self, Taggable};
 use pumpkin_data::tracked_data;
 use pumpkin_data::world::WorldEvent;
 use pumpkin_nbt::compound::NbtCompound;
-use pumpkin_protocol::codec::var_int::VarInt;
 use pumpkin_protocol::java::client::play::Metadata;
 use pumpkin_util::math::position::BlockPos;
 use pumpkin_util::version::JavaMinecraftVersion;
@@ -326,10 +325,14 @@ impl Mob for ZombieVillagerEntity {
         self.mob_entity.mob_write_nbt(nbt);
 
         let data = self.get_villager_data();
-        let mut villager_data_nbt = NbtCompound::new();
-        villager_data_nbt.put_int("Type", data.r#type.0);
-        villager_data_nbt.put_int("Profession", data.profession.0);
-        villager_data_nbt.put_int("Level", data.level.0);
+        let mut villager_data_nbt = self
+            .villager_nbt
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_compound("VillagerData")
+            .cloned()
+            .unwrap_or_default();
+        data.write_nbt(&mut villager_data_nbt);
         nbt.put_compound("VillagerData", villager_data_nbt);
         nbt.put_int("Xp", self.villager_xp.load(Ordering::Relaxed));
 
@@ -364,17 +367,7 @@ impl Mob for ZombieVillagerEntity {
         self.mob_entity.mob_read_nbt(nbt);
 
         if let Some(villager_data_nbt) = nbt.get_compound("VillagerData") {
-            let mut data = self.get_villager_data();
-            if let Some(r#type) = villager_data_nbt.get_int("Type") {
-                data.r#type = VarInt(r#type);
-            }
-            if let Some(profession) = villager_data_nbt.get_int("Profession") {
-                data.profession = VarInt(profession);
-            }
-            if let Some(level) = villager_data_nbt.get_int("Level") {
-                data.level = VarInt(level);
-            }
-            self.set_villager_data(data);
+            self.set_villager_data(VillagerData::from_nbt(villager_data_nbt));
         }
 
         if let Some(xp) = nbt.get_int("Xp") {
@@ -382,6 +375,9 @@ impl Mob for ZombieVillagerEntity {
         }
 
         let mut carried = NbtCompound::new();
+        if let Some(data) = nbt.get_compound("VillagerData") {
+            carried.put_compound("VillagerData", data.clone());
+        }
         if let Some(offers) = nbt.get_compound("Offers") {
             carried.put_compound("Offers", offers.clone());
         }

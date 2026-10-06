@@ -37,6 +37,10 @@ impl BlockEntity for SkullBlockEntity {
         }
     }
 
+    fn nbt_aliases(&self) -> &'static [(&'static str, &'static str)] {
+        &[("CustomName", "custom_name")]
+    }
+
     fn write_nbt(&self, nbt: &mut NbtCompound) {
         if let Ok(sound) = self.note_block_sound.lock()
             && let Some(sound) = sound.as_ref()

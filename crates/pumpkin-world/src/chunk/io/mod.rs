@@ -43,6 +43,8 @@ impl<D: Send, E: error::Error> LoadedData<D, E> {
 
 pub trait Dirtiable {
     fn is_dirty(&self) -> bool;
+    /// Atomically claims the changes that this save will serialize.
+    fn take_dirty(&self) -> bool;
     fn mark_dirty(&self, flag: bool);
 }
 

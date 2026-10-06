@@ -452,9 +452,9 @@ impl MobEntity {
         if let Some(left_handed) = nbt.get_bool("LeftHanded") {
             self.set_left_handed(left_handed);
         }
-        if let Some(can_pick_up_loot) = nbt.get_bool("CanPickUpLoot") {
-            self.set_can_pick_up_loot(can_pick_up_loot);
-        }
+        // Loading uses Vanilla's false default, including mobs whose fresh
+        // spawn constructor enables pickup.
+        self.set_can_pick_up_loot(nbt.get_bool("CanPickUpLoot").unwrap_or(false));
         if let Some(persistence_required) = nbt.get_bool("PersistenceRequired") {
             self.persistence_required
                 .store(persistence_required, Relaxed);
@@ -784,6 +784,10 @@ impl MobEntity {
 }
 
 pub trait Mob: EntityBase + Send + Sync {
+    fn mob_nbt_aliases(&self) -> &'static [(&'static str, &'static str)] {
+        &[]
+    }
+
     fn get_random(&self) -> rand::rngs::ThreadRng {
         rand::rng()
     }
@@ -1320,6 +1324,10 @@ pub trait Mob: EntityBase + Send + Sync {
     }
 }
 impl<T: Mob + Send + 'static> EntityBase for T {
+    fn nbt_aliases(&self) -> &'static [(&'static str, &'static str)] {
+        self.mob_nbt_aliases()
+    }
+
     fn get_mob(&self) -> Option<&dyn Mob> {
         Some(self)
     }
@@ -1357,6 +1365,12 @@ impl<T: Mob + Send + 'static> EntityBase for T {
             self.get_mob_entity()
                 .set_can_pick_up_loot(rand::random::<f32>() < pickup_chance);
         }
+    }
+
+    fn init_data_tracker_on_load(&self) {
+        // Vanilla EntityType loading does not call Mob.finalizeSpawn. Restore
+        // metadata without generating equipment or rerolling CanPickUpLoot.
+        self.mob_init_data_tracker();
     }
 
     fn set_variant_name(&self, name: &str) {

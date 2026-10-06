@@ -72,6 +72,16 @@ enum MinecartKind {
 }
 
 impl MinecartEntity {
+    fn activate_rideable(&self) {
+        self.vehicle.entity.eject_passengers();
+        if self.vehicle.get_hurt_time() == 0 {
+            self.vehicle.set_hurt_dir(-self.vehicle.get_hurt_dir());
+            self.vehicle.set_hurt_time(10);
+            self.vehicle.set_damage(50.0);
+            self.vehicle.send_wobble_metadata();
+        }
+    }
+
     pub fn new(entity: Entity) -> Self {
         let kind = match entity.entity_type.id {
             id if id == EntityType::MINECART.id => MinecartKind::Rideable(RideableMinecart),
@@ -101,16 +111,29 @@ impl MinecartEntity {
 
     const fn drop_item(&self) -> Option<&'static Item> {
         match &self.kind {
+            MinecartKind::Rideable(_) => Some(&Item::MINECART),
             MinecartKind::Chest(_) => Some(&Item::CHEST_MINECART),
             MinecartKind::Furnace(_) => Some(&Item::FURNACE_MINECART),
             MinecartKind::Hopper(_) => Some(&Item::HOPPER_MINECART),
             MinecartKind::Tnt(_) => Some(&Item::TNT_MINECART),
-            _ => None,
+            MinecartKind::Other => None,
         }
     }
 }
 
 impl EntityBase for MinecartEntity {
+    fn passenger_position(&self, passenger: &dyn EntityBase) -> Vector3<f64> {
+        let passenger_type = passenger.get_entity().entity_type;
+        if passenger_type == &EntityType::VILLAGER
+            || passenger_type == &EntityType::WANDERING_TRADER
+        {
+            // AbstractMinecart.LOWERED_PASSENGER_ATTACHMENT.
+            self.vehicle.entity.pos.load()
+        } else {
+            self.vehicle.entity.passenger_attachment_position(passenger)
+        }
+    }
+
     fn write_custom_nbt(&self, nbt: &mut NbtCompound) {
         match &self.kind {
             MinecartKind::Chest(minecart) => minecart.write_nbt(nbt),
@@ -230,27 +253,7 @@ impl EntityBase for MinecartEntity {
                             minecart.prime(&self.vehicle.entity, 80);
                         }
                         MinecartKind::Rideable(_) => {
-                            if let Ok(passengers) = self.vehicle.entity.passengers.try_lock() {
-                                let p_ids: Vec<i32> = passengers
-                                    .iter()
-                                    .map(|p| p.get_entity().entity_id)
-                                    .collect();
-                                if !p_ids.is_empty() {
-                                    let world = self.vehicle.entity.world.load();
-                                    let vid = self.vehicle.entity.entity_id;
-                                    if let Some(v) = world.get_entity_by_id(vid) {
-                                        for pid in p_ids {
-                                            v.get_entity().remove_passenger_sync(pid);
-                                        }
-                                    }
-                                }
-                            }
-                            if self.vehicle.get_hurt_time() == 0 {
-                                self.vehicle.set_hurt_dir(-self.vehicle.get_hurt_dir());
-                                self.vehicle.set_hurt_time(10);
-                                self.vehicle.set_damage(50.0);
-                                self.vehicle.send_wobble_metadata();
-                            }
+                            self.activate_rideable();
                         }
                         _ => {}
                     }
@@ -438,14 +441,6 @@ impl EntityBase for MinecartEntity {
                     velocity.x.mul_add(velocity.x, velocity.z * velocity.z),
                 );
                 return;
-            }
-
-            let new_pos = self.vehicle.entity.pos.load();
-
-            if let Ok(passengers) = self.vehicle.entity.passengers.try_lock() {
-                for passenger in passengers.iter() {
-                    passenger.get_entity().set_pos(new_pos);
-                }
             }
 
             #[allow(clippy::useless_let_if_seq)]
@@ -747,7 +742,7 @@ impl EntityBase for MinecartEntity {
                     world.scatter_inventory(&position, &inventory);
                 }
                 if let Some(item) = self.drop_item() {
-                    world.drop_stack(&position, ItemStack::new(1, item));
+                    self.vehicle.drop_item(item);
                 }
             }
         }
@@ -829,5 +824,52 @@ impl EntityBase for MinecartEntity {
 
     fn cast_any(&self) -> &dyn std::any::Any {
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn powered_activator_ejects_without_relocking_passenger_mutex() {
+        let directory = tempfile::tempdir().unwrap();
+        let world = crate::entity::vehicle::tests::test_world(directory.path());
+        let cart = Arc::new(MinecartEntity::new(Entity::new(
+            world.clone(),
+            Vector3::new(0.5, 64.0, 0.5),
+            &EntityType::MINECART,
+        )));
+        let passenger = crate::entity::mob::endermite::EndermiteEntity::new(Entity::new(
+            world.clone(),
+            Vector3::new(0.5, 64.1875, 0.5),
+            &EntityType::ENDERMITE,
+        ));
+        cart.vehicle
+            .entity
+            .add_passenger(cart.clone(), passenger.clone());
+        let (finished, result) = std::sync::mpsc::channel();
+        let thread_cart = cart.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let worker = std::thread::spawn(move || {
+            let _guard = runtime.enter();
+            thread_cart.activate_rideable();
+            finished.send(()).unwrap();
+        });
+        result
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("powered activator must not deadlock");
+        worker.join().unwrap();
+        assert!(!cart.vehicle.entity.has_passengers());
+        assert!(!passenger.get_entity().has_vehicle());
+        assert_eq!(
+            passenger
+                .get_entity()
+                .riding_cooldown
+                .load(Ordering::Relaxed),
+            60
+        );
+        assert_eq!(cart.vehicle.get_hurt_time(), 10);
+        world.level.shutdown().await;
     }
 }

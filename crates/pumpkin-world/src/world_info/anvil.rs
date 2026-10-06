@@ -146,16 +146,17 @@ fn stored_world_seed(level_folder: &Path, data: &NbtCompound) -> Option<i64> {
         .map(|settings| settings.seed)
         .or_else(|| {
             data.get_compound(WORLD_GEN_SETTINGS_TAG)
-                .and_then(|settings| settings.get_long("seed"))
+                .and_then(super::data_files::world_gen_settings_seed)
         })
 }
 
-fn put_world_gen_settings_seed(data: &mut NbtCompound, seed: i64) {
-    let mut world_gen_settings = data
+fn put_world_gen_settings(data: &mut NbtCompound, settings: &super::WorldGenSettings) {
+    let world_gen_settings = data
         .get_compound(WORLD_GEN_SETTINGS_TAG)
         .cloned()
         .unwrap_or_default();
-    world_gen_settings.put_long("seed", seed);
+    let world_gen_settings =
+        super::data_files::update_world_gen_settings_nbt(settings, world_gen_settings);
     data.put_compound(WORLD_GEN_SETTINGS_TAG, world_gen_settings);
 }
 
@@ -340,7 +341,7 @@ fn level_data_to_nbt(info: &LevelData, data: &mut NbtCompound) {
     data.put_compound("Version", world_version_to_nbt(&info.world_version));
     data.put_int("version", info.level_version);
     data.put_int("map_id", info.map_id);
-    put_world_gen_settings_seed(data, info.world_gen_settings.seed);
+    put_world_gen_settings(data, &info.world_gen_settings);
 }
 
 fn stamp_current_version(level_data: &mut LevelData) {
@@ -385,7 +386,7 @@ impl WorldInfoReader for AnvilLevelInfo {
 
         let mut level_data = level_data_from_nbt(data, seed);
 
-        if let Some(wgs) = read_world_gen_settings(level_folder) {
+        if let Some(wgs) = super::data_files::read_world_gen_settings_checked(level_folder)? {
             level_data.world_gen_settings = wgs;
         }
 
@@ -736,6 +737,44 @@ mod test {
         assert_eq!(
             level_data.world_gen_settings.seed,
             -2_016_744_919_588_476_706
+        );
+    }
+
+    #[test]
+    fn imported_level_dat_retains_its_full_generator_settings() {
+        let directory = TempDir::new().unwrap();
+        let mut root = converted_level_dat(Some(123));
+        let settings = WorldGenSettings::from_preset_name("large_biomes", Seed(123)).unwrap();
+        let tag = crate::world_info::data_files::json_to_nbt_tag(
+            &serde_json::to_value(&settings).unwrap(),
+        );
+        let mut data = root.get_compound("Data").unwrap().clone();
+        data.put("WorldGenSettings", tag);
+        root.put_compound("Data", data);
+        write_level_dat(directory.path(), root);
+        let loaded = AnvilLevelInfo.read_world_info(directory.path()).unwrap();
+        assert_eq!(loaded.world_gen_settings, settings);
+        let mut loaded = loaded;
+        let settings = WorldGenSettings::from_preset_name("amplified", Seed(777)).unwrap();
+        loaded.world_gen_settings = settings.clone();
+        AnvilLevelInfo
+            .write_world_info(&loaded, directory.path())
+            .unwrap();
+        assert_eq!(
+            AnvilLevelInfo
+                .read_world_info(directory.path())
+                .unwrap()
+                .world_gen_settings,
+            settings
+        );
+        fs::remove_file(minecraft_data_dir(directory.path()).join("world_gen_settings.dat"))
+            .unwrap();
+        assert_eq!(
+            AnvilLevelInfo
+                .read_world_info(directory.path())
+                .unwrap()
+                .world_gen_settings,
+            settings
         );
     }
 

@@ -139,6 +139,8 @@ pub trait TamableAnimal: Animal {
     }
 
     fn write_tamable_nbt(&self, nbt: &mut NbtCompound) {
+        // The legacy ownerless tame state is readable and must also follow changes.
+        nbt.put_bool("IsTame", self.is_tame());
         if let Some(owner) = self.get_owner() {
             nbt.put_uuid("Owner", owner);
         }

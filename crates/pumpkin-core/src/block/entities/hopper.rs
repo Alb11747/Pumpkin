@@ -183,7 +183,7 @@ impl HopperBlockEntity {
             let mut success = if self.is_empty() {
                 false
             } else {
-                self.eject_items(world)
+                self.eject_items(state.facing, world)
             };
             if !self.inventory_full() {
                 success |= self.suck_in_items(world);
@@ -368,10 +368,13 @@ impl HopperBlockEntity {
         Some(extraction.one_item)
     }
 
-    fn eject_items(&self, world: &Arc<World>) -> bool {
+    fn eject_items(&self, facing: FacingHopper, world: &Arc<World>) -> bool {
         // TODO getEntityContainer
 
-        if let Some(entity) = world.get_block_entity(&self.position.offset(to_offset(&self.facing)))
+        // Imported block entities have no facing in NBT. Use the state snapshot that also
+        // gates this transfer on ENABLED, rather than the constructor's default facing.
+        let target_pos = self.position.offset(to_offset(&facing));
+        if let Some(entity) = world.get_block_entity(&target_pos)
             && let Some(container) = entity.get_inventory()
         {
             // TODO check WorldlyContainer
@@ -386,7 +389,6 @@ impl HopperBlockEntity {
             if is_full {
                 return false;
             }
-            let target_pos = self.position.offset(to_offset(&self.facing));
             for slot in 0..Self::INVENTORY_SIZE {
                 let item = self.get_stack(slot);
                 if item.is_empty() {

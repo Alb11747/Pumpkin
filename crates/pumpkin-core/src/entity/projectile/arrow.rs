@@ -413,7 +413,8 @@ impl EntityBase for ArrowEntity {
         nbt.put_bool("crit", self.is_critical.load(Ordering::Relaxed));
         nbt.put_double("damage", self.get_base_damage());
         nbt.put_bool("inGround", self.in_ground.load(Ordering::Relaxed));
-        nbt.put_int("life", self.life.load(Ordering::Relaxed) as i32);
+        // Vanilla stores this counter as a short even though it ticks in an int.
+        nbt.put_short("life", self.life.load(Ordering::Relaxed) as i16);
         nbt.put_byte("shake", self.shake_time.load(Ordering::Relaxed) as i8);
         nbt.put_byte(
             "PierceLevel",

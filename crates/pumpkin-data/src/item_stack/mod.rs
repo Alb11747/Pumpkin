@@ -945,7 +945,12 @@ impl ItemStack {
                 if !removed && snapshot.is_none() || id.is_none() {
                     tracing::warn!(item = full_id, component = %name, "Preserving unsupported item component; gameplay behavior is unavailable");
                 }
-                if snapshot.as_ref() != Some(data) {
+                // A legacy pot list has a complete lossless 26.3 replacement; retaining the
+                // old raw list would write a pre-4996 schema under the current data version.
+                let upgraded_pot = id == Some(DataComponent::PotDecorations)
+                    && matches!(data, NbtTag::List(_))
+                    && snapshot.is_some();
+                if snapshot.as_ref() != Some(data) && !upgraded_pot {
                     item_stack.preserved_components.push(PreservedComponent {
                         name: name.clone(),
                         data: data.clone(),

@@ -102,7 +102,13 @@ fn to_wasm_sign_text(text: &InternalText) -> SignText {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
-            .map(str::into_string)
+            // WIT exposes literal lines, not the runtime's component JSON.
+            .map(|message| {
+                serde_json::from_str::<pumpkin_util::text::TextComponent>(&message).map_or_else(
+                    |_| message.into_string(),
+                    pumpkin_util::text::TextComponent::get_text,
+                )
+            })
             .to_vec(),
         color: to_wasm_dye_color(text.get_color()),
         has_glowing_text: text.has_glowing_text.load(Ordering::Relaxed),
@@ -127,6 +133,34 @@ fn from_wasm_sign_text(text: SignText) -> InternalText {
         );
         nbt
     }))
+}
+
+#[cfg(test)]
+mod sign_text_tests {
+    use super::{DyeColor, SignText, from_wasm_sign_text, to_wasm_sign_text};
+
+    #[test]
+    fn literal_sign_lines_survive_wasm_get_and_set() {
+        let expected = vec![
+            "Historical sign".to_owned(),
+            r#"{"text":"literal JSON","click_event":{"action":"run_command","command":"say test"}}"#.to_owned(),
+            String::new(),
+            "Fourth line".to_owned(),
+        ];
+        let mut text = from_wasm_sign_text(SignText {
+            messages: expected.clone(),
+            color: DyeColor::Blue,
+            has_glowing_text: true,
+        });
+        for _ in 0..2 {
+            assert!(!text.has_any_click_commands(false));
+            let transferred = to_wasm_sign_text(&text);
+            assert_eq!(transferred.messages, expected);
+            assert!(matches!(transferred.color, DyeColor::Blue));
+            assert!(transferred.has_glowing_text);
+            text = from_wasm_sign_text(transferred);
+        }
+    }
 }
 
 impl HostBlockEntity for PluginHostState {

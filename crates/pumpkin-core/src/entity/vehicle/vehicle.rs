@@ -5,6 +5,7 @@ use crate::entity::Entity;
 use pumpkin_protocol::java::client::play::Metadata;
 
 use crate::entity::EntityBase;
+use pumpkin_data::{data_component_impl::CustomNameImpl, item::Item, item_stack::ItemStack};
 use pumpkin_protocol::codec::var_int::VarInt;
 use pumpkin_util::GameMode;
 
@@ -16,6 +17,17 @@ pub struct VehicleEntity {
 }
 
 impl VehicleEntity {
+    pub fn drop_item(&self, item: &'static Item) {
+        let mut stack = ItemStack::new(1, item);
+        if let Some(name) = self.entity.custom_name.load().as_ref().clone() {
+            stack.set_data_component(CustomNameImpl { name });
+        }
+        self.entity
+            .world
+            .load()
+            .drop_stack(&self.entity.block_pos.load(), stack);
+    }
+
     pub const fn new(entity: Entity) -> Self {
         Self {
             entity,
@@ -183,6 +195,7 @@ impl VehicleEntity {
             }
         }
 
+        self.entity.eject_passengers();
         self.entity.remove();
     }
 
@@ -229,6 +242,7 @@ impl VehicleEntity {
             }
 
             if is_creative {
+                self.entity.eject_passengers();
                 self.entity.remove();
             } else {
                 self.kill_and_drop_self();

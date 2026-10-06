@@ -20,6 +20,62 @@ fn saved(stack: &ItemStack) -> NbtCompound {
     encoded_round_trip(&compound)
 }
 
+#[test]
+fn pot_decorations_keep_modern_side_components_and_upgrade_legacy_lists() {
+    use crate::data_component_impl::PotDecorationsImpl;
+    let mut side = NbtCompound::new();
+    side.put_string("id", "minecraft:angler_pottery_sherd".into());
+    let mut custom = NbtCompound::new();
+    custom.put_long("marker", 17);
+    let mut components = NbtCompound::new();
+    components.put_compound("example:side_data", custom);
+    side.put_compound("components", components);
+    side.put_string("example:unknown", "retained".into());
+    let mut decorations = NbtCompound::new();
+    decorations.put_compound("back", side);
+    decorations.put_int("example:future", 5);
+    let mut components = NbtCompound::new();
+    components.put_compound("minecraft:pot_decorations", decorations.clone());
+    let mut item = NbtCompound::new();
+    item.put_string("id", "minecraft:decorated_pot".into());
+    item.put_int("count", 1);
+    item.put_compound("components", components);
+    let stack = ItemStack::read_item_stack(&encoded_round_trip(&item)).unwrap();
+    assert_eq!(
+        stack
+            .get_data_component::<PotDecorationsImpl>()
+            .unwrap()
+            .write_data(),
+        NbtTag::Compound(decorations)
+    );
+    assert_eq!(saved(&stack), item);
+    let mut components = NbtCompound::new();
+    components.put_list(
+        "minecraft:pot_decorations",
+        vec![NbtTag::String("minecraft:angler_pottery_sherd".into())],
+    );
+    item.put_compound("components", components);
+    let stack = ItemStack::read_item_stack(&item).unwrap();
+    let upgraded = saved(&stack);
+    let sides = upgraded
+        .get_compound("components")
+        .unwrap()
+        .get_compound("minecraft:pot_decorations")
+        .unwrap();
+    assert_eq!(
+        sides.get_compound("back").unwrap().get_string("id"),
+        Some("minecraft:angler_pottery_sherd")
+    );
+    assert_eq!(
+        sides.get_compound("front").unwrap().get_string("id"),
+        Some("minecraft:brick")
+    );
+    assert_eq!(
+        saved(&ItemStack::read_item_stack(&upgraded).unwrap()),
+        upgraded
+    );
+}
+
 // ItemStack.MAP_CODEC and DataComponentPatch.PatchKey in vanilla 26.2/26.3 use
 // these id/count/components fields and ! removal keys. The extension payload is
 // synthetic: its different NBT types must survive an unavailable component codec.

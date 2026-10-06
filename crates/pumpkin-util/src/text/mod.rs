@@ -52,16 +52,16 @@ impl<'de> Deserialize<'de> for TextComponent {
             }
 
             fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
-                let mut bases = Vec::new();
+                // ComponentSerialization.createFromList copies the first component;
+                // following siblings inherit its style rather than an empty parent's.
+                let mut first = seq
+                    .next_element::<TextComponent>()?
+                    .ok_or_else(|| A::Error::custom("text component array must not be empty"))?
+                    .0;
                 while let Some(element) = seq.next_element::<TextComponent>()? {
-                    bases.push(element.0);
+                    first.extra.push(element.0);
                 }
-
-                Ok(TextComponentBase {
-                    content: Box::new(TextContent::Text { text: "".into() }),
-                    style: Box::default(),
-                    extra: bases,
-                })
+                Ok(first)
             }
 
             fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
@@ -81,6 +81,18 @@ impl Serialize for TextComponent {
     }
 }
 
+fn deserialize_component_list<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<TextComponentBase>, D::Error> {
+    // Child components accept the same string, compound and array forms as roots.
+    Vec::<TextComponent>::deserialize(deserializer).map(|components| {
+        components
+            .into_iter()
+            .map(|component| component.0)
+            .collect()
+    })
+}
+
 /// The base structure for a text component containing content, style, and children.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "camelCase")]
@@ -92,7 +104,11 @@ pub struct TextComponentBase {
     #[serde(flatten)]
     pub style: Box<Style>,
     /// Child text components that are appended after this component's content.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_component_list"
+    )]
     pub extra: Vec<Self>,
 }
 
@@ -907,12 +923,40 @@ fn nbt_compound_to_json(compound: &pumpkin_nbt::NbtCompound) -> serde_json::Valu
         ) && let pumpkin_nbt::tag::NbtTag::Byte(value) = v
         {
             serde_json::Value::Bool(*value != 0)
+        } else if matches!(k.as_ref(), "extra" | "with")
+            || (k.as_ref() == "value" && compound.get_string("action") == Some("show_text"))
+            || (k.as_ref() == "name" && compound.get_string("action") == Some("show_entity"))
+        {
+            nbt_component_to_json(v)
         } else {
             nbt_tag_to_json(v)
         };
         map.insert(k.to_string(), value);
     }
     serde_json::Value::Object(map)
+}
+
+// Disk readers retain ListTag's empty-name wrappers. Interpret exactly one
+// wrapper per list element at the component boundary, leaving the raw tree intact.
+fn nbt_component_to_json(tag: &pumpkin_nbt::tag::NbtTag) -> serde_json::Value {
+    if let pumpkin_nbt::tag::NbtTag::List(list) = tag {
+        serde_json::Value::Array(
+            list.iter()
+                .map(|element| {
+                    let element = if let pumpkin_nbt::tag::NbtTag::Compound(compound) = element
+                        && compound.child_tags.len() == 1
+                    {
+                        compound.get("").unwrap_or(element)
+                    } else {
+                        element
+                    };
+                    nbt_component_to_json(element)
+                })
+                .collect(),
+        )
+    } else {
+        nbt_tag_to_json(tag)
+    }
 }
 
 fn nbt_tag_to_json(tag: &pumpkin_nbt::tag::NbtTag) -> serde_json::Value {
@@ -1336,7 +1380,7 @@ impl TextComponent {
 
     /// Parses an NBT text component without replacing malformed data with empty text.
     pub fn try_from_nbt(tag: &pumpkin_nbt::tag::NbtTag) -> Result<Self, serde_json::Error> {
-        serde_json::from_value(nbt_tag_to_json(tag))
+        serde_json::from_value(nbt_component_to_json(tag))
     }
 
     /// Creates a new text component with plain text content.
@@ -2035,7 +2079,11 @@ pub enum TextContent {
         #[serde(skip, default)]
         bedrock_translate: Option<Cow<'static, str>>,
         /// Substitution parameters for the translation.
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        #[serde(
+            default,
+            skip_serializing_if = "Vec::is_empty",
+            deserialize_with = "deserialize_component_list"
+        )]
         with: Vec<TextComponentBase>,
     },
     /// Displays the name of one or more entities found by a selector.
@@ -2086,6 +2134,78 @@ mod test {
     };
     use crate::version::JavaMinecraftVersion;
     use std::borrow::Cow;
+
+    #[test]
+    fn disk_components_decode_mixed_lists_without_changing_raw_wrappers() {
+        use pumpkin_nbt::{Nbt, NbtCompound, deserializer::NbtReadHelperJava, tag::NbtTag};
+        use std::io::Cursor;
+
+        let version = JavaMinecraftVersion::V_26_3;
+        #[allow(deprecated)]
+        let component = TextComponent::translate(
+            "chat.type.text",
+            [
+                TextComponent::text("plain argument"),
+                TextComponent::text("styled argument").bold(),
+            ],
+        )
+        .add_child(TextComponent::text("plain sibling"))
+        .add_child(TextComponent::text("styled sibling").bold());
+        let mut root = NbtCompound::new();
+        root.put("CustomName", component.to_nbt_tag_for_version(&version));
+        let bytes = Nbt::from(root).try_write_preserving().unwrap();
+        let mut reader = NbtReadHelperJava::new_preserving(Cursor::new(bytes.as_ref()));
+        let raw = Nbt::read_complete(&mut reader).unwrap();
+        let name = raw.get("CustomName").unwrap();
+        let compound = name.extract_compound().unwrap();
+        for key in ["extra", "with"] {
+            let list = compound.get_list(key).unwrap();
+            assert_eq!(list.len(), 2);
+            assert!(list[0].extract_compound().unwrap().get_string("").is_some());
+            assert_eq!(
+                list[1].extract_compound().unwrap().get_bool("bold"),
+                Some(true)
+            );
+        }
+        assert_eq!(TextComponent::try_from_nbt(name).unwrap(), component);
+        let expected_raw = raw.clone();
+        let rewritten = raw.try_write_preserving().unwrap();
+        let mut reader = NbtReadHelperJava::new_preserving(Cursor::new(rewritten.as_ref()));
+        assert_eq!(Nbt::read_complete(&mut reader).unwrap(), expected_raw);
+
+        // Array-form root components use the same list codec, including nesting.
+        let array = NbtTag::List(vec![
+            TextComponent::text("styled root")
+                .bold()
+                .to_nbt_tag_for_version(&version),
+            NbtTag::String("inherited sibling".into()),
+        ]);
+        let expected = TextComponent::text("styled root")
+            .bold()
+            .add_child(TextComponent::text("inherited sibling"));
+        assert_eq!(TextComponent::try_from_nbt(&array).unwrap(), expected);
+        assert!(TextComponent::try_from_nbt(&NbtTag::List(vec![])).is_err());
+        let mut root = NbtCompound::new();
+        root.put("CustomName", array);
+        let bytes = Nbt::from(root).try_write_preserving().unwrap();
+        let mut reader = NbtReadHelperJava::new_preserving(Cursor::new(bytes.as_ref()));
+        let raw = Nbt::read_complete(&mut reader).unwrap();
+        assert_eq!(
+            TextComponent::try_from_nbt(raw.get("CustomName").unwrap()).unwrap(),
+            expected
+        );
+
+        // An escaped empty-name compound is not a second wrapper at this depth.
+        let mut inner = NbtCompound::new();
+        inner.put_string("", "opaque".into());
+        let mut outer = NbtCompound::new();
+        outer.put_compound("", inner);
+        let escaped = NbtTag::List(vec![NbtTag::Compound(outer)]);
+        assert_eq!(
+            super::nbt_component_to_json(&escaped),
+            serde_json::json!([{"": "opaque"}])
+        );
+    }
 
     #[test]
     fn serialize_text_component() {

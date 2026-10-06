@@ -10,6 +10,7 @@ use pumpkin_data::biome::Spawner;
 use pumpkin_data::chunk::Biome;
 use pumpkin_data::dimension::Dimension;
 use pumpkin_data::entity::{EntityType, MobCategory, SpawnLocation};
+use pumpkin_data::structures::SpawnEntry;
 use pumpkin_data::tag::Block::MINECRAFT_PREVENT_MOB_SPAWNING_INSIDE;
 use pumpkin_data::tag::Fluid::{MINECRAFT_LAVA, MINECRAFT_WATER};
 use pumpkin_data::tag::Taggable;
@@ -22,6 +23,7 @@ use pumpkin_util::math::vector2::Vector2;
 use pumpkin_util::math::vector3::Vector3;
 use pumpkin_util::random::xoroshiro128::Xoroshiro;
 use pumpkin_util::random::{RandomImpl, get_seed};
+use pumpkin_world::chunk::structure_spawns::{StructureSpawnState, spawn_override};
 use pumpkin_world::chunk::{ChunkData, ChunkHeightmapType};
 use pumpkin_world::generation::proto_chunk::GenerationCache;
 use rand::seq::IndexedRandom;
@@ -32,6 +34,27 @@ use std::sync::atomic::{AtomicI32, Ordering::Relaxed};
 use uuid::Uuid;
 
 const MAGIC_NUMBER: i32 = 17 * 17;
+
+/// LevelReader.canSeeSkyFromBelowWater ignores attenuation from liquid blocks.
+#[must_use]
+pub fn can_see_sky_from_below_water(world: &World, pos: &BlockPos) -> bool {
+    if pos.0.y >= world.sea_level {
+        return world.can_see_sky(pos);
+    }
+    let mut above = BlockPos::new(pos.0.x, world.sea_level, pos.0.z);
+    if !world.can_see_sky(&above) {
+        return false;
+    }
+    above = above.down();
+    while above.0.y > pos.0.y {
+        let state = world.get_block_state(&above);
+        if state.opacity > 0 && !state.is_liquid() {
+            return false;
+        }
+        above = above.down();
+    }
+    true
+}
 
 pub struct MobCounts([AtomicI32; 8]);
 
@@ -514,6 +537,9 @@ pub fn spawn_for_chunk(
     is_thundering: bool,
 ) -> Vec<Arc<dyn EntityBase>> {
     let mut entities = Vec::new();
+    if !world.level.prepare_structure_spawns(chunk) {
+        return entities;
+    }
     for category in spawn_list {
         if spawn_state.can_spawn_for_category_local(world, category, chunk_pos) {
             let random_pos = get_random_pos_within(world.min_y, &chunk_pos, chunk);
@@ -569,7 +595,10 @@ pub fn spawn_mobs_for_chunk_generation(
     let zo = chunk_z << 4;
 
     while rand::random::<f32>() < biome.creature_spawn_probability {
-        let Some(spawner_data) = creatures.choose(&mut rand::rng()) else {
+        let Some(spawner_data) = creatures
+            .choose_weighted(&mut rand::rng(), |e| e.weight)
+            .ok()
+        else {
             continue;
         };
 
@@ -738,7 +767,7 @@ pub fn spawn_category_for_position(
     for _ in 0..3 {
         let mut x = pos.0.x;
         let mut z = pos.0.z;
-        let mut current_spawner: Option<&'static Spawner> = None;
+        let mut current_spawner: Option<Spawner> = None;
         let mut max = (rng().random::<f32>() * 4.0).ceil() as i32;
         let mut group_size = 0;
         let mut group_data = None;
@@ -804,7 +833,7 @@ pub fn spawn_category_for_position(
                     &check_pos,
                     category,
                     entity_type,
-                    spawner.r#type,
+                    &spawner,
                     player_distance_sq,
                     is_thundering,
                 ) && spawn_state.can_spawn(entity_type, &check_pos, world)
@@ -898,29 +927,108 @@ pub fn is_right_distance_to_player_and_spawn_point(
 pub fn can_spawn_mob_at(
     world: &World,
     category: &'static MobCategory,
-    spawner_type: &'static str,
+    spawner: &Spawner,
     pos: &BlockPos,
 ) -> bool {
-    let biome = world.level.get_rough_biome(pos);
-    let spawners = match category.id {
-        id if id == MobCategory::MONSTER.id => biome.spawners.monster,
-        id if id == MobCategory::CREATURE.id => biome.spawners.creature,
-        id if id == MobCategory::AMBIENT.id => biome.spawners.ambient,
-        id if id == MobCategory::AXOLOTLS.id => biome.spawners.axolotls,
-        id if id == MobCategory::UNDERGROUND_WATER_CREATURE.id => {
-            biome.spawners.underground_water_creature
+    mobs_at(world, category, pos).contains(spawner)
+}
+
+enum SpawnList {
+    Biome(&'static [Spawner]),
+    Structure(&'static [SpawnEntry]),
+    Unavailable,
+}
+
+impl SpawnList {
+    fn contains(&self, spawner: &Spawner) -> bool {
+        let name = spawner
+            .r#type
+            .strip_prefix("minecraft:")
+            .unwrap_or(spawner.r#type);
+        match self {
+            Self::Biome(entries) => entries.iter().any(|e| {
+                e.r#type.strip_prefix("minecraft:").unwrap_or(e.r#type) == name
+                    && e.min_count == spawner.min_count
+                    && e.max_count == spawner.max_count
+            }),
+            Self::Structure(entries) => entries.iter().any(|e| {
+                e.entity_type
+                    .strip_prefix("minecraft:")
+                    .unwrap_or(e.entity_type)
+                    == name
+                    && e.min_count as i32 == spawner.min_count
+                    && e.max_count as i32 == spawner.max_count
+            }),
+            Self::Unavailable => false,
         }
-        id if id == MobCategory::WATER_CREATURE.id => biome.spawners.water_creature,
-        id if id == MobCategory::WATER_AMBIENT.id => biome.spawners.water_ambient,
-        id if id == MobCategory::MISC.id => biome.spawners.misc,
-        _ => biome.spawners.misc,
+    }
+
+    fn random(&self) -> Option<Spawner> {
+        match self {
+            Self::Biome(entries) => entries
+                .choose_weighted(&mut rng(), |e| e.weight)
+                .ok()
+                .copied(),
+            Self::Structure(entries) => {
+                entries
+                    .choose_weighted(&mut rng(), |e| e.weight)
+                    .ok()
+                    .map(|e| Spawner {
+                        r#type: e.entity_type,
+                        min_count: e.min_count as i32,
+                        max_count: e.max_count as i32,
+                        weight: e.weight,
+                    })
+            }
+            Self::Unavailable => None,
+        }
+    }
+}
+
+fn mobs_at(world: &World, category: &MobCategory, pos: &BlockPos) -> SpawnList {
+    let category_name = match category.id {
+        id if id == MobCategory::MONSTER.id => "monster",
+        id if id == MobCategory::CREATURE.id => "creature",
+        id if id == MobCategory::AMBIENT.id => "ambient",
+        id if id == MobCategory::AXOLOTLS.id => "axolotls",
+        id if id == MobCategory::UNDERGROUND_WATER_CREATURE.id => "underground_water_creature",
+        id if id == MobCategory::WATER_CREATURE.id => "water_creature",
+        id if id == MobCategory::WATER_AMBIENT.id => "water_ambient",
+        _ => "misc",
     };
-    let target = spawner_type
-        .strip_prefix("minecraft:")
-        .unwrap_or(spawner_type);
-    spawners.iter().any(|s| {
-        let name = s.r#type.strip_prefix("minecraft:").unwrap_or(s.r#type);
-        name == target
+    let (chunk_pos, _) = pos.chunk_and_chunk_relative_position();
+    let loaded = world.level.read_chunk_sync(&chunk_pos, Clone::clone);
+    let Some(chunk) = loaded else {
+        return SpawnList::Unavailable;
+    };
+    if !world.level.prepare_structure_spawns(&chunk) {
+        return SpawnList::Unavailable;
+    }
+    let state = chunk
+        .structure_spawns
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let StructureSpawnState::Ready(starts) = &*state
+        && let Some(entries) = spawn_override(
+            starts,
+            category_name,
+            pos,
+            category == &MobCategory::MONSTER
+                && world.get_block(&pos.down()) == &Block::NETHER_BRICKS,
+        )
+    {
+        return SpawnList::Structure(entries);
+    }
+    let biome = world.level.get_rough_biome(pos);
+    SpawnList::Biome(match category_name {
+        "monster" => biome.spawners.monster,
+        "creature" => biome.spawners.creature,
+        "ambient" => biome.spawners.ambient,
+        "axolotls" => biome.spawners.axolotls,
+        "underground_water_creature" => biome.spawners.underground_water_creature,
+        "water_creature" => biome.spawners.water_creature,
+        "water_ambient" => biome.spawners.water_ambient,
+        _ => biome.spawners.misc,
     })
 }
 
@@ -929,7 +1037,7 @@ pub fn get_random_spawn_mob_at(
     world: &Arc<World>,
     category: &'static MobCategory,
     block_pos: &BlockPos,
-) -> Option<&'static Spawner> {
+) -> Option<Spawner> {
     let biome = world.level.get_rough_biome(block_pos);
     if category == &MobCategory::WATER_AMBIENT
         && biome.has_tag(&MINECRAFT_REDUCE_WATER_AMBIENT_SPAWNS)
@@ -937,20 +1045,7 @@ pub fn get_random_spawn_mob_at(
     {
         None
     } else {
-        match category.id {
-            id if id == MobCategory::MONSTER.id => biome.spawners.monster,
-            id if id == MobCategory::CREATURE.id => biome.spawners.creature,
-            id if id == MobCategory::AMBIENT.id => biome.spawners.ambient,
-            id if id == MobCategory::AXOLOTLS.id => biome.spawners.axolotls,
-            id if id == MobCategory::UNDERGROUND_WATER_CREATURE.id => {
-                biome.spawners.underground_water_creature
-            }
-            id if id == MobCategory::WATER_CREATURE.id => biome.spawners.water_creature,
-            id if id == MobCategory::WATER_AMBIENT.id => biome.spawners.water_ambient,
-            id if id == MobCategory::MISC.id => biome.spawners.misc,
-            _ => biome.spawners.misc,
-        }
-        .choose(&mut rng())
+        mobs_at(world, category, block_pos).random()
     }
 }
 
@@ -960,7 +1055,7 @@ pub fn is_valid_spawn_position_for_type(
     block_pos: &BlockPos,
     category: &'static MobCategory,
     entity_type: &'static EntityType,
-    spawner_type: &'static str,
+    spawner: &Spawner,
     distance: f64,
     is_thundering: bool,
 ) -> bool {
@@ -974,7 +1069,7 @@ pub fn is_valid_spawn_position_for_type(
     {
         return false;
     }
-    if !entity_type.summonable || !can_spawn_mob_at(world, category, spawner_type, block_pos) {
+    if !entity_type.summonable || !can_spawn_mob_at(world, category, spawner, block_pos) {
         return false;
     }
     if !is_spawn_position_ok(world, block_pos, entity_type) {

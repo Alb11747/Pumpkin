@@ -172,6 +172,10 @@ impl EntityBase for FireballEntity {
         self.thrown.owner_id
     }
 
+    fn nbt_aliases(&self) -> &'static [(&'static str, &'static str)] {
+        &[("power", "acceleration_power")]
+    }
+
     fn write_custom_nbt(&self, nbt: &mut NbtCompound) {
         nbt.put_double("acceleration_power", self.get_acceleration_power());
         nbt.put_float("ExplosionPower", self.get_explosion_power());

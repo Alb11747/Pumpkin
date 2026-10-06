@@ -187,6 +187,31 @@ impl ProtoChunk {
         self.structure_starts.contains_key(&key)
     }
 
+    pub(crate) fn structure_spawn_starts(
+        &self,
+    ) -> Vec<crate::chunk::structure_spawns::StructureSpawnStart> {
+        self.structure_starts
+            .iter()
+            .filter_map(|(&key, instance)| {
+                if Structure::get(&key).spawn_overrides.is_empty() {
+                    return None;
+                }
+                let collector = match instance {
+                    StructureInstance::Start(start) => &start.collector,
+                    StructureInstance::Reference(collector) => collector,
+                };
+                let pieces = collector
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .pieces
+                    .iter()
+                    .map(|piece| piece.bounding_box())
+                    .collect();
+                crate::chunk::structure_spawns::StructureSpawnStart::from_pieces(key, pieces)
+            })
+            .collect()
+    }
+
     #[must_use]
     pub fn new(x: i32, z: i32, generator: &super::generator::WorldGenerator) -> Self {
         let dimension = generator.dimension();

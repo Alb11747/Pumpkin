@@ -131,6 +131,19 @@ impl dyn EntityBase + '_ {
     }
 }
 
+/// Vanilla Entity.rideTick and LivingEntity.rideTick: passengers still tick their
+/// AI and effects, but begin without momentum and finish at the vehicle attachment.
+pub(crate) fn ride_tick(passenger: &dyn EntityBase, tick: impl FnOnce()) {
+    passenger.get_entity().velocity.store(Vector3::default());
+    tick();
+    if let Some(vehicle) = passenger.get_entity().get_vehicle() {
+        vehicle.position_passenger(passenger);
+    }
+    if let Some(living) = passenger.get_living_entity() {
+        living.fall_distance.store(0.0);
+    }
+}
+
 pub trait EntityBase: Send + Sync + std::any::Any {
     fn write_nbt(&self, nbt: &mut NbtCompound) {
         self.get_entity().write_nbt(nbt);
@@ -138,6 +151,11 @@ pub trait EntityBase: Send + Sync + std::any::Any {
             living.write_living_nbt(nbt);
         }
         self.write_custom_nbt(nbt);
+    }
+
+    /// Alternate input names superseded by a modeled canonical output field.
+    fn nbt_aliases(&self) -> &'static [(&'static str, &'static str)] {
+        &[]
     }
 
     fn write_custom_nbt(&self, _nbt: &mut NbtCompound) {}
@@ -163,6 +181,49 @@ pub trait EntityBase: Send + Sync + std::any::Any {
             living.tick(caller, server);
         } else {
             self.get_entity().tick(caller, server);
+        }
+    }
+
+    fn passenger_position(&self, passenger: &dyn EntityBase) -> Vector3<f64> {
+        self.get_entity().passenger_attachment_position(passenger)
+    }
+
+    fn position_passenger(&self, passenger: &dyn EntityBase) {
+        if self.has_passenger(passenger) {
+            let passenger_entity = passenger.get_entity();
+            let vehicle_attachment =
+                passenger_entity.attachment_offset(passenger_entity.entity_type.vehicle_attachment);
+            passenger_entity.set_pos(self.passenger_position(passenger) - vehicle_attachment);
+        }
+    }
+
+    fn tick_passengers(&self, server: &Server) {
+        let entity = self.get_entity();
+        let passengers = entity
+            .passengers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        for passenger in passengers {
+            let passenger_entity = passenger.get_entity();
+            if passenger_entity.is_removed()
+                || passenger_entity
+                    .get_vehicle()
+                    .is_none_or(|vehicle| vehicle.get_entity().entity_id != entity.entity_id)
+            {
+                entity.remove_passenger_sync(passenger_entity.entity_id);
+                continue;
+            }
+            // Players have already ticked and keep their client-authoritative movement.
+            if passenger.get_player().is_none() {
+                passenger_entity.age.fetch_add(1, Relaxed);
+                ride_tick(passenger.as_ref(), || {
+                    passenger.tick(passenger.as_ref(), server);
+                });
+            } else {
+                self.position_passenger(passenger.as_ref());
+            }
+            passenger.tick_passengers(server);
         }
     }
 
@@ -210,6 +271,11 @@ pub trait EntityBase: Send + Sync + std::any::Any {
             entity.set_synced_data(tracked_data::ageable_mob::DATA_BABY_ID, true);
             entity.send_bedrock_actor_data(&bedrock_meta);
         }
+    }
+
+    /// Initializes metadata for an entity restored from storage.
+    fn init_data_tracker_on_load(&self) {
+        self.init_data_tracker();
     }
     fn set_variant_name(&self, _name: &str) {}
     fn set_sound_variant_name(&self, _name: &str) {}
@@ -969,6 +1035,8 @@ pub struct Entity {
     pub last_sent_velocity: AtomicCell<Vector3<f64>>,
     /// Persistent custom data container for plugins
     pub custom_data: std::sync::Mutex<NbtCompound>,
+    // Attached to the instance so opaque data follows dimension transfers.
+    pub(crate) preserved_nbt: std::sync::Mutex<Option<crate::data::preserved_nbt::PreservedNbt>>,
 }
 
 impl Entity {
@@ -1094,6 +1162,7 @@ impl Entity {
             last_sent_pos: AtomicCell::new(position),
             last_sent_velocity: AtomicCell::new(Vector3::default()),
             custom_data: std::sync::Mutex::new(NbtCompound::new()),
+            preserved_nbt: std::sync::Mutex::new(None),
         }
     }
 
@@ -3165,6 +3234,9 @@ impl Entity {
         pitch: Option<f32>,
         world: &World,
     ) {
+        if !self.dismount_before_teleport() {
+            return;
+        }
         // Update server-side position and bounding box
         self.set_pos(position);
         if let Some(yaw) = yaw {
@@ -3446,6 +3518,44 @@ impl Entity {
             .is_empty()
     }
 
+    fn attachment_offset(&self, offset: Vector3<f64>) -> Vector3<f64> {
+        let dimensions = self.entity_dimension.load();
+        // Zero-sized marker/display entities still have valid attachment defaults.
+        let width_scale = if self.entity_type.dimension[0] == 0.0 {
+            1.0
+        } else {
+            f64::from(dimensions.width / self.entity_type.dimension[0])
+        };
+        let height_scale = if self.entity_type == &EntityType::PLAYER {
+            // Avatar keeps its vehicle attachment when crouching; pose height isn't scale.
+            width_scale
+        } else if self.entity_type.dimension[1] == 0.0 {
+            1.0
+        } else {
+            f64::from(dimensions.height / self.entity_type.dimension[1])
+        };
+        let offset = offset.multiply(width_scale, height_scale, width_scale);
+        let yaw = self.yaw.load().to_radians();
+        let (sin, cos) = (f64::from(yaw.sin()), f64::from(yaw.cos()));
+        Vector3::new(
+            offset.x * cos - offset.z * sin,
+            offset.y,
+            offset.z * cos + offset.x * sin,
+        )
+    }
+
+    pub fn passenger_attachment_position(&self, passenger: &dyn EntityBase) -> Vector3<f64> {
+        let attachments = self.entity_type.passenger_attachments;
+        let index = self
+            .passengers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .position(|entry| entry.get_entity().entity_id == passenger.get_entity().entity_id)
+            .unwrap_or(0);
+        self.pos.load() + self.attachment_offset(attachments[index.min(attachments.len() - 1)])
+    }
+
     pub fn has_passenger(&self, id: i32) -> bool {
         self.passengers
             .lock()
@@ -3494,10 +3604,16 @@ impl Entity {
                 .plugin_manager
                 .fire_blocking(&server, &mut vehicle_enter);
         }
-        if mount_event.cancelled || vehicle_enter.cancelled {
+        if mount_event.cancelled
+            || vehicle_enter.cancelled
+            || self.world.load().uuid != passenger.get_entity().world.load().uuid
+        {
             return;
         }
 
+        if let Some(player) = passenger.get_player() {
+            player.prepare_vehicle_mount(vehicle.as_ref());
+        }
         let passenger_entity = passenger.get_entity();
         *passenger_entity
             .vehicle
@@ -3556,16 +3672,57 @@ impl Entity {
         self.remove_passenger_on_disconnect(passenger_id);
     }
 
+    pub fn eject_passengers(&self) {
+        // Dismounting takes this mutex again; release the snapshot guard first.
+        let passengers: Vec<i32> = self
+            .passengers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|passenger| passenger.get_entity().entity_id)
+            .collect();
+        for passenger in passengers {
+            self.remove_passenger(passenger);
+        }
+    }
+
     pub fn remove_passenger(&self, passenger_id: i32) {
         self.remove_passenger_internal(passenger_id, true);
     }
 
-    pub fn remove_passenger_before_teleport(&self, passenger_id: i32) {
-        self.remove_passenger_internal(passenger_id, false);
+    #[must_use]
+    pub fn remove_passenger_before_teleport(&self, passenger_id: i32) -> bool {
+        self.remove_passenger_internal(passenger_id, false)
+    }
+
+    /// Detaches without moving to the source vehicle's dismount position.
+    #[must_use]
+    pub(crate) fn dismount_before_teleport(&self) -> bool {
+        let Some(vehicle) = self.get_vehicle() else {
+            return true;
+        };
+        if !vehicle
+            .get_entity()
+            .remove_passenger_before_teleport(self.entity_id)
+        {
+            return false;
+        }
+        let mut current_vehicle = self
+            .vehicle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // An unloaded parent may already have discarded its passenger list.
+        if current_vehicle
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &vehicle))
+        {
+            *current_vehicle = None;
+        }
+        current_vehicle.is_none()
     }
 
     #[allow(clippy::too_many_lines)]
-    fn remove_passenger_internal(&self, passenger_id: i32, reposition: bool) {
+    fn remove_passenger_internal(&self, passenger_id: i32, reposition: bool) -> bool {
         let mut dismount_event =
             crate::plugin::api::events::entity::entity_dismount::EntityDismountEvent::new(
                 passenger_id,
@@ -3585,7 +3742,7 @@ impl Entity {
                 .fire_blocking(&server, &mut vehicle_exit);
         }
         if dismount_event.cancelled || vehicle_exit.cancelled {
-            return;
+            return false;
         }
 
         let (removed_passenger, passenger_ids) = {
@@ -3660,7 +3817,7 @@ impl Entity {
             }
 
             if !reposition {
-                return;
+                return true;
             }
 
             // Calculate dismount directions and offsets (vanilla DismountHelper)
@@ -3756,7 +3913,14 @@ impl Entity {
                 let mut found = None;
 
                 'search: for (pose, y_offsets) in poses_and_heights {
-                    let dims = Self::get_entity_dimensions(pose);
+                    let dims = if passenger.get_player().is_some() {
+                        Self::get_entity_dimensions(pose)
+                    } else {
+                        if pose != EntityPose::Standing {
+                            continue;
+                        }
+                        passenger_entity.entity_dimension.load()
+                    };
 
                     for y_offset in y_offsets {
                         for &(ox, oz) in &offsets {
@@ -3807,7 +3971,14 @@ impl Entity {
                     ];
 
                     for pose in poses {
-                        let dims = Self::get_entity_dimensions(pose);
+                        let dims = if passenger.get_player().is_some() {
+                            Self::get_entity_dimensions(pose)
+                        } else {
+                            if pose != EntityPose::Standing {
+                                continue;
+                            }
+                            passenger_entity.entity_dimension.load()
+                        };
                         let bbox = BoundingBox::new_from_pos(
                             self.pos.load().x,
                             vehicle_top,
@@ -3882,6 +4053,7 @@ impl Entity {
                 &CSetPassengers::new(VarInt(self.entity_id), &passenger_ids),
             );
         }
+        true
     }
 
     pub fn check_out_of_world(&self, dyn_self: &dyn EntityBase) {

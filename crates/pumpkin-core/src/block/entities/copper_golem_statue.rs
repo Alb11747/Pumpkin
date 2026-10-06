@@ -32,6 +32,10 @@ impl BlockEntity for CopperGolemStatueBlockEntity {
         }
     }
 
+    fn nbt_aliases(&self) -> &'static [(&'static str, &'static str)] {
+        &[("CustomName", "custom_name")]
+    }
+
     fn write_nbt(&self, nbt: &mut NbtCompound) {
         if let Ok(name) = self.custom_name.lock()
             && let Some(name) = name.as_ref()

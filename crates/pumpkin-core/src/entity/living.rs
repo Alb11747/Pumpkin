@@ -2061,8 +2061,20 @@ impl LivingEntity {
             let params = LootContextParameters {
                 killed_by_player: Some(has_player_kill),
                 this_entity: Some(self.entity.entity_type),
-                killer_entity: killer.map(|c| c.get_entity().entity_type),
+                // Damage-source predicates use this hit's attacker, not historical kill credit.
+                killer_entity: cause.or(source).map(|c| c.get_entity().entity_type),
                 direct_killer_entity: source.map(|s| s.get_entity().entity_type),
+                cube_size: (self.entity.entity_type == &EntityType::SLIME
+                    || self.entity.entity_type == &EntityType::MAGMA_CUBE)
+                    .then(|| self.entity.data.load(Relaxed)),
+                killer_frog_variant: cause
+                    .or(source)
+                    .and_then(|cause| {
+                        cause
+                            .cast_any()
+                            .downcast_ref::<crate::entity::passive::frog::FrogEntity>()
+                    })
+                    .map(crate::entity::passive::frog::FrogEntity::get_variant),
                 position: Some(self.entity.pos.load()),
                 world_time: world.level_info.load().day_time as u64,
                 damage_type: Some(damage_type),
@@ -2294,6 +2306,9 @@ impl LivingEntity {
         let resource_name = self.get_entity().entity_type.resource_name;
         let key = format!("minecraft:entities/{resource_name}");
         let world = self.entity.world.load();
+        if !world.level_info.load().game_rules.mob_drops {
+            return;
+        }
         if let Some(loot_table) = world.get_loot_table(&key) {
             let seed: i64 = rand::random();
             let pos = self.entity.block_pos.load();
@@ -2660,7 +2675,8 @@ impl LivingEntity {
         };
         // Persist current absorption amount
         nbt.put("AbsorptionAmount", NbtTag::Float(self.absorption.load()));
-        nbt.put("FallDistance", NbtTag::Float(fall_distance));
+        nbt.put_double("fall_distance", f64::from(fall_distance));
+        nbt.put_float("FallDistance", fall_distance);
         nbt.put_short("HurtTime", self.hurt_cooldown.load(Relaxed).max(0) as i16);
         nbt.put_short("DeathTime", i16::from(self.death_time.load(Relaxed)));
         nbt.put_bool("FallFlying", self.entity.is_fall_flying());
@@ -2736,8 +2752,8 @@ impl LivingEntity {
         // Load fall distance, but if this entity is currently marked dead ensure we don't restore
         // a lethal fall distance that would immediately re-kill on spawn.
         let fd = nbt
-            .get_float("FallDistance")
-            .or_else(|| nbt.get_float("fall_distance"))
+            .get_numeric_float("fall_distance")
+            .or_else(|| nbt.get_numeric_float("FallDistance"))
             .unwrap_or(0.0);
         if self.dead.load(Relaxed) {
             self.fall_distance.store(0.0);
@@ -3916,6 +3932,85 @@ pub(crate) const fn bypasses_armor_durability(damage_type: &DamageType) -> bool 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn mounted_endermite_stays_at_attachment_through_travel_and_remains_targetable() {
+        use crate::entity::{
+            ai::goal::{Goal, active_target::ActiveTargetGoal},
+            mob::{Mob, enderman::EndermanEntity, endermite::EndermiteEntity},
+            ride_tick,
+            vehicle::{minecart::MinecartEntity, tests::test_world},
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let world = test_world(directory.path());
+        let cart: Arc<dyn EntityBase> = Arc::new(MinecartEntity::new(Entity::new(
+            world.clone(),
+            Vector3::new(0.5, 64.0, 0.5),
+            &EntityType::MINECART,
+        )));
+        let mite = EndermiteEntity::new(Entity::new(
+            world.clone(),
+            Vector3::new(0.5, 64.1875, 0.5),
+            &EntityType::ENDERMITE,
+        ));
+        let living = &mite.mob_entity.living_entity;
+        mite.mob_entity.persistence_required.store(true, Relaxed);
+        mite.lifetime.store(45, Relaxed);
+        cart.get_entity().add_passenger(cart.clone(), mite.clone());
+        world.add_entity_silent(cart.clone());
+        world.add_entity_silent(mite.clone());
+        for tick in 0..80 {
+            if tick == 40 {
+                cart.get_entity().set_pos(Vector3::new(2.5, 65.0, 0.5));
+            }
+            living
+                .entity
+                .velocity
+                .store(Vector3::new(0.125, -0.8, 0.125));
+            living.movement_input.store(Vector3::new(1.0, 0.0, 1.0));
+            living.fall_distance.store(12.0);
+            ride_tick(mite.as_ref(), || {
+                assert_eq!(living.entity.velocity.load(), Vector3::default());
+                mite.mob_tick(mite.as_ref());
+                // Exercise real living-entity travel rather than only the lifetime hook.
+                living.tick_movement(mite.as_ref());
+            });
+            assert_eq!(
+                living.entity.pos.load(),
+                cart.get_entity().pos.load() + Vector3::new(0.0, 0.1875, 0.0)
+            );
+            assert_eq!(living.fall_distance.load(), 0.0);
+        }
+        assert_eq!(mite.lifetime.load(Relaxed), 45);
+        assert!(!living.entity.is_removed());
+        let enderman = EndermanEntity::new(Entity::new(
+            world.clone(),
+            Vector3::new(4.5, 65.0, 0.5),
+            &EntityType::ENDERMAN,
+        ));
+        let mut goal = ActiveTargetGoal::new(
+            &enderman.mob_entity,
+            &EntityType::ENDERMITE,
+            0,
+            true,
+            false,
+            None::<fn(&LivingEntity, &crate::world::World) -> bool>,
+        );
+        assert!(goal.can_start(enderman.as_ref()));
+        goal.start(enderman.as_ref());
+        assert_eq!(
+            enderman
+                .mob_entity
+                .get_target()
+                .unwrap()
+                .get_entity()
+                .entity_id,
+            living.entity.entity_id
+        );
+        cart.get_entity()
+            .remove_passenger_sync(living.entity.entity_id);
+        world.level.shutdown().await;
+    }
 
     // ── bypasses_armor_durability ─────────────────────────────────────
 

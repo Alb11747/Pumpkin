@@ -76,6 +76,10 @@ struct PredicateStruct {
     items: Option<serde_json::Value>,
     #[serde(default)]
     predicates: Option<serde_json::Value>,
+    #[serde(default)]
+    source_entity: Option<serde_json::Value>,
+    #[serde(default, rename = "minecraft:type_specific/cube_mob")]
+    cube_mob: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -120,6 +124,8 @@ struct ConditionStruct {
     term: Option<ConditionValue>,
     #[serde(default)]
     terms: Option<Vec<ConditionValue>>,
+    #[serde(default)]
+    entity: Option<String>,
 }
 
 fn resolve_condition(value: &ConditionValue) -> LootCondition {
@@ -183,6 +189,50 @@ fn parse_condition(cond: &ConditionStruct) -> LootCondition {
                 LootCondition::None
             }
         }
+        "minecraft:entity_properties" if cond.entity.as_deref() == Some("this") => {
+            let size = cond
+                .predicate
+                .as_ref()
+                .and_then(|pred| pred.cube_mob.as_ref())
+                .and_then(|cube| cube.get("size"));
+            size.map_or(LootCondition::None, |size| {
+                let (min, max) = if let Some(size) = size.as_i64() {
+                    (size as i32, size as i32)
+                } else {
+                    (
+                        size.get("min")
+                            .and_then(serde_json::Value::as_i64)
+                            .unwrap_or(i64::from(i32::MIN)) as i32,
+                        size.get("max")
+                            .and_then(serde_json::Value::as_i64)
+                            .unwrap_or(i64::from(i32::MAX)) as i32,
+                    )
+                };
+                LootCondition::CubeSize { min, max }
+            })
+        }
+        "minecraft:damage_source_properties" => {
+            let source = cond
+                .predicate
+                .as_ref()
+                .and_then(|pred| pred.source_entity.as_ref());
+            let entity_type = source
+                .and_then(|source| source.get("minecraft:entity_type"))
+                .and_then(serde_json::Value::as_str);
+            entity_type
+                .filter(|entity_type| *entity_type == "minecraft:frog")
+                .map_or(LootCondition::None, |entity_type| {
+                    let frog_variant = source
+                        .and_then(|source| source.get("minecraft:components"))
+                        .and_then(|components| components.get("minecraft:frog/variant"))
+                        .and_then(serde_json::Value::as_str);
+                    LootCondition::DamageSourceEntity {
+                        entity_type: Box::leak(entity_type.to_string().into_boxed_str()),
+                        frog_variant: frog_variant
+                            .map(|variant| &*Box::leak(variant.to_string().into_boxed_str())),
+                    }
+                })
+        }
         "minecraft:match_tool" => {
             if let Some(pred) = &cond.predicate {
                 if let Some(items_val) = &pred.items {
@@ -230,6 +280,10 @@ fn parse_condition(cond: &ConditionStruct) -> LootCondition {
                     LootCondition::SilkTouch => LootCondition::NoSilkTouch,
                     LootCondition::Shears => LootCondition::NoSilkTouchOrShears,
                     LootCondition::SilkTouchOrShears => LootCondition::NoSilkTouchOrShears,
+                    condition @ (LootCondition::DamageSourceEntity { .. }
+                    | LootCondition::CubeSize { .. }) => {
+                        LootCondition::Inverted(Box::leak(Box::new(condition)))
+                    }
                     _ => LootCondition::None,
                 }
             } else {
@@ -633,6 +687,21 @@ fn condition_to_tokens(cond: LootCondition) -> TokenStream {
         LootCondition::AllOf(list) => {
             let tokens: Vec<TokenStream> = list.iter().copied().map(condition_to_tokens).collect();
             quote! { LootCondition::AllOf(&[#(#tokens),*]) }
+        }
+        LootCondition::Inverted(condition) => {
+            let condition = condition_to_tokens(*condition);
+            quote! { LootCondition::Inverted(&#condition) }
+        }
+        LootCondition::CubeSize { min, max } => {
+            quote! { LootCondition::CubeSize { min: #min, max: #max } }
+        }
+        LootCondition::DamageSourceEntity {
+            entity_type,
+            frog_variant,
+        } => {
+            let frog_variant =
+                frog_variant.map_or_else(|| quote! { None }, |variant| quote! { Some(#variant) });
+            quote! { LootCondition::DamageSourceEntity { entity_type: #entity_type, frog_variant: #frog_variant } }
         }
     }
 }

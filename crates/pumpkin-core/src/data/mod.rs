@@ -6,6 +6,7 @@ use tracing::{debug, error, warn};
 const DATA_FOLDER: &str = "data/";
 
 pub mod op;
+pub(crate) mod preserved_nbt;
 
 pub mod advancement_data;
 pub mod banlist_serializer;

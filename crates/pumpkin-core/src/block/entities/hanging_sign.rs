@@ -13,6 +13,7 @@ pub struct HangingSignBlockEntity {
     pub front_text: Text,
     pub back_text: Text,
     pub is_waxed: AtomicBool,
+    pub allow_op_features: AtomicBool,
     position: BlockPos,
     pub currently_editing_player: Arc<Mutex<Option<uuid::Uuid>>>,
 }
@@ -46,6 +47,7 @@ impl BlockEntity for HangingSignBlockEntity {
             front_text,
             back_text,
             is_waxed: AtomicBool::new(is_waxed),
+            allow_op_features: AtomicBool::new(nbt.get_bool("allow_op_features").unwrap_or(false)),
             currently_editing_player: Arc::new(Mutex::new(None)),
         }
     }
@@ -54,13 +56,21 @@ impl BlockEntity for HangingSignBlockEntity {
         nbt.put("front_text", self.front_text.clone());
         nbt.put("back_text", self.back_text.clone());
         nbt.put_bool("is_waxed", self.is_waxed.load(Ordering::Relaxed));
+        nbt.put_bool(
+            "allow_op_features",
+            self.allow_op_features.load(Ordering::Relaxed),
+        );
     }
 
     fn chunk_data_nbt(&self) -> Option<NbtCompound> {
         let mut nbt = NbtCompound::new();
-        nbt.put("front_text", self.front_text.clone());
-        nbt.put("back_text", self.back_text.clone());
+        nbt.put("front_text", self.front_text.network_nbt());
+        nbt.put("back_text", self.back_text.network_nbt());
         nbt.put_bool("is_waxed", self.is_waxed.load(Ordering::Relaxed));
+        nbt.put_bool(
+            "allow_op_features",
+            self.allow_op_features.load(Ordering::Relaxed),
+        );
         Some(nbt)
     }
 
@@ -76,6 +86,7 @@ impl HangingSignBlockEntity {
         Self {
             position,
             is_waxed: AtomicBool::new(false),
+            allow_op_features: AtomicBool::new(false),
             front_text: if is_front {
                 Text::from_messages(messages.clone())
             } else {
@@ -94,6 +105,7 @@ impl HangingSignBlockEntity {
         Self {
             position,
             is_waxed: AtomicBool::new(false),
+            allow_op_features: AtomicBool::new(false),
             front_text: Text::default(),
             back_text: Text::default(),
             currently_editing_player: Arc::new(Mutex::new(None)),

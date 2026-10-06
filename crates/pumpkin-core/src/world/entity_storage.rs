@@ -86,8 +86,18 @@ pub(super) fn load_entity_tree(
     for (nbt, entity_type, uuid, parent) in records {
         let entity = from_type(entity_type, Vector3::default(), world, uuid);
         entity.read_nbt_non_mut(nbt);
-        entity.init_data_tracker();
+        entity.init_data_tracker_on_load();
+        let mut modeled = NbtCompound::new();
+        entity.write_nbt(&mut modeled);
+        let mut preserved = crate::data::preserved_nbt::PreservedNbt::new(nbt, &modeled);
+        preserved.discard(&["Passengers"]);
+        preserved.discard_aliases(&modeled, &[("BukkitValues", "PumpkinCustomData")]);
+        preserved.discard_aliases(&modeled, entity.nbt_aliases());
         let base = entity.get_entity();
+        *base
+            .preserved_nbt
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(preserved);
         base.last_sent_velocity.store(base.velocity.load());
         if let Some(parent) = parent {
             let vehicle = entities[parent].clone();
@@ -130,6 +140,125 @@ pub(super) fn entity_storage_chunk(entity: &Arc<dyn EntityBase>) -> Vector2<i32>
     root.get_entity().chunk_pos.load()
 }
 
+pub(super) struct LoadedPlayerVehicle {
+    pub vehicle: Arc<dyn EntityBase>,
+    pub admitted: Vec<Arc<dyn EntityBase>>,
+}
+
+pub(super) fn load_player_vehicle(
+    root: &NbtCompound,
+    world: &Arc<World>,
+) -> Result<LoadedPlayerVehicle, EntityLoadError> {
+    let attach = root.get_uuid("Attach").ok_or("invalid attachment UUID")?;
+    if let Some(vehicle) = world.get_entity_by_uuid(attach) {
+        if !supports_player_vehicle(&vehicle) {
+            return Err("unsupported attached vehicle".into());
+        }
+        return Ok(LoadedPlayerVehicle {
+            vehicle,
+            admitted: Vec::new(),
+        });
+    }
+    let entities = load_entity_tree(
+        root.get_compound("Entity")
+            .ok_or("missing vehicle snapshot")?,
+        world,
+    )?;
+    let result = (|| {
+        if entities
+            .iter()
+            .any(|entity| !supports_player_vehicle(entity))
+        {
+            return Err("unsupported player vehicle tree".into());
+        }
+        let vehicle = entities
+            .iter()
+            .find(|entity| entity.get_entity().entity_uuid == attach)
+            .cloned()
+            .ok_or("attachment is outside the saved vehicle tree")?;
+        if world.add_entity_tree_silent(&entities) {
+            Ok(LoadedPlayerVehicle {
+                vehicle,
+                admitted: entities.clone(),
+            })
+        } else {
+            Err(EntityLoadError::AlreadyLive)
+        }
+    })();
+    if result.is_err() {
+        // Unpublished trees still have strong parent/passenger links.
+        for entity in entities {
+            entity
+                .get_entity()
+                .vehicle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            entity
+                .get_entity()
+                .passengers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
+        }
+    }
+    result
+}
+
+pub fn supports_player_vehicle(entity: &Arc<dyn EntityBase>) -> bool {
+    // The factory's generic fallback preserves NBT but has no vehicle behaviour.
+    entity.get_player().is_none()
+        && entity.get_entity().entity_type.saveable
+        && !entity.cast_any().is::<crate::entity::Entity>()
+        && !entity
+            .cast_any()
+            .is::<crate::entity::living::LivingEntity>()
+        && !entity.get_entity().is_removed()
+}
+
+pub fn save_player_vehicle(vehicle: &Arc<dyn EntityBase>) -> Option<NbtCompound> {
+    let mut root = vehicle.clone();
+    let mut seen = FxHashSet::default();
+    loop {
+        if !seen.insert(root.get_entity().entity_uuid) || !supports_player_vehicle(&root) {
+            return None;
+        }
+        let Some(parent) = saved_vehicle(&root) else {
+            break;
+        };
+        root = parent;
+    }
+    // ServerPlayer.saveParentVehicle only owns trees with exactly one player.
+    let mut pending = vec![root.clone()];
+    let mut players = 0;
+    seen.clear();
+    while let Some(entity) = pending.pop() {
+        if !seen.insert(entity.get_entity().entity_uuid) {
+            return None;
+        }
+        if entity.get_player().is_some() {
+            players += 1;
+        }
+        pending.extend(
+            entity
+                .get_entity()
+                .passengers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .cloned(),
+        );
+    }
+    if players != 1 {
+        return None;
+    }
+    let snapshot = save_entity_tree(&root)?;
+    let mut wrapper = NbtCompound::new();
+    wrapper.put_uuid("Attach", vehicle.get_entity().entity_uuid);
+    wrapper.put_compound("Entity", snapshot);
+    Some(wrapper)
+}
+
 pub(super) fn save_entity_tree(entity: &Arc<dyn EntityBase>) -> Option<NbtCompound> {
     if entity.get_entity().is_removed()
         || saved_vehicle(entity).is_some()
@@ -158,6 +287,18 @@ fn save_as_passenger(
     }
     let mut nbt = NbtCompound::new();
     entity.write_nbt(&mut nbt);
+    if let Some(preserved) = base
+        .preserved_nbt
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_mut()
+    {
+        preserved.discard_aliases(&nbt, &[("BukkitValues", "PumpkinCustomData")]);
+        preserved.discard_aliases(&nbt, entity.nbt_aliases());
+        preserved.snapshot(&mut nbt);
+    }
+    // The live relationship tree is authoritative even after a dismount or death.
+    nbt.child_tags.remove("Passengers");
     if let Some(vehicle) = saved_vehicle(entity) {
         let position = base.pos.load();
         let vehicle_position = vehicle.get_entity().pos.load();
@@ -199,25 +340,32 @@ mod tests {
     use pumpkin_config::world::LevelConfig;
     use pumpkin_data::dimension::Dimension;
     use pumpkin_nbt::tag::NbtTag;
-    use pumpkin_util::world_seed::Seed;
-    use pumpkin_world::{level::Level, world_info::LevelData};
+    use pumpkin_util::{math::position::BlockPos, world_seed::Seed};
+    use pumpkin_world::{chunk::ChunkData, level::Level, world_info::LevelData};
     use std::sync::{Weak, atomic::Ordering};
 
     fn test_world(path: &std::path::Path) -> Arc<World> {
-        let dimension = Dimension::THE_END;
+        test_world_in_dimension(path, Dimension::THE_END)
+    }
+
+    fn test_world_in_dimension(path: &std::path::Path, dimension: Dimension) -> Arc<World> {
         let level = Level::from_root_folder(
             &LevelConfig::default(),
             path.to_path_buf(),
             0,
             dimension.clone(),
-        );
-        Arc::new(World::load(
-            level,
-            Arc::new(ArcSwap::from_pointee(LevelData::default(Seed(0)))),
-            dimension,
-            Arc::new(BlockRegistry::default()),
-            Weak::new(),
-        ))
+        )
+        .unwrap();
+        Arc::new(
+            World::load(
+                level,
+                Arc::new(ArcSwap::from_pointee(LevelData::default(Seed(0)))),
+                dimension,
+                Arc::new(BlockRegistry::default()),
+                Weak::new(),
+            )
+            .unwrap(),
+        )
     }
 
     // Vanilla Entity.saveWithoutId/EntityType.loadPassengersRecursive shape,
@@ -250,6 +398,353 @@ mod tests {
             NbtTag::List(vec![NbtTag::Compound(passenger)]),
         );
         root
+    }
+
+    #[tokio::test]
+    async fn loaded_mobs_preserve_equipment_counts_and_never_receive_spawn_equipment() {
+        let directory = tempfile::tempdir().unwrap();
+        let world = test_world(directory.path());
+        for (id, uuid) in [("piglin", 101), ("skeleton", 102)] {
+            let mut fixture = NbtCompound::new();
+            fixture.put_string("id", format!("minecraft:{id}"));
+            fixture.put_uuid("UUID", Uuid::from_u128(uuid));
+            fixture.put_list("Pos", vec![0.5.into(), 64.0.into(), 0.5.into()]);
+            fixture.put_bool("CanPickUpLoot", true);
+            let mut equipment = NbtCompound::new();
+            for (slot, item, count) in [
+                ("mainhand", "minecraft:gold_nugget", 27),
+                ("head", "minecraft:carved_pumpkin", 1),
+                ("feet", "minecraft:iron_boots", 1),
+            ] {
+                let mut stack = NbtCompound::new();
+                stack.put_string("id", item.to_string());
+                stack.put_int("count", count);
+                equipment.put_compound(slot, stack);
+            }
+            fixture.put_compound("equipment", equipment.clone());
+
+            for saved_equipment in [true, false] {
+                let mut raw = fixture.clone();
+                if !saved_equipment {
+                    raw.child_tags.remove("equipment");
+                    raw.child_tags.remove("CanPickUpLoot");
+                }
+                for _ in 0..2 {
+                    let loaded = load_entity_tree(&raw, &world).unwrap();
+                    let entity = &loaded[0];
+                    assert_eq!(
+                        entity
+                            .get_mob()
+                            .unwrap()
+                            .get_mob_entity()
+                            .can_pick_up_loot(),
+                        saved_equipment,
+                    );
+                    let saved = save_entity_tree(entity).unwrap();
+                    if saved_equipment {
+                        let saved_equipment = saved.get_compound("equipment").unwrap();
+                        assert_eq!(saved_equipment.child_tags.len(), equipment.child_tags.len());
+                        for (slot, expected) in &equipment.child_tags {
+                            let expected = expected.extract_compound().unwrap();
+                            let stack = saved_equipment.get_compound(slot).unwrap();
+                            assert_eq!(stack.get_string("id"), expected.get_string("id"));
+                            assert_eq!(stack.get_int("count"), expected.get_int("count"));
+                        }
+                    } else {
+                        assert!(
+                            entity
+                                .get_living_entity()
+                                .unwrap()
+                                .entity_equipment
+                                .lock()
+                                .unwrap()
+                                .is_empty()
+                        );
+                        assert!(saved.get("equipment").is_none());
+                        assert!(!saved.get_bool("CanPickUpLoot").unwrap_or(false));
+                    }
+                    raw = saved;
+                }
+            }
+        }
+
+        // The load hook must not remove equipment generation from actual spawns.
+        let skeleton = from_type(
+            &EntityType::SKELETON,
+            Vector3::new(0.5, 64.0, 0.5),
+            &world,
+            Uuid::from_u128(103),
+        );
+        skeleton.init_data_tracker();
+        let saved = save_entity_tree(&skeleton).unwrap();
+        assert_eq!(
+            saved
+                .get_compound("equipment")
+                .unwrap()
+                .get_compound("mainhand")
+                .unwrap()
+                .get_string("id"),
+            Some("minecraft:bow"),
+        );
+        world.level.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn player_vehicle_snapshot_loads_once_and_rejects_invalid_attachment_without_orphans() {
+        let directory = tempfile::tempdir().unwrap();
+        let world = test_world(directory.path());
+        let mut root = NbtCompound::new();
+        root.put_uuid("Attach", Uuid::from_u128(1));
+        root.put_compound("Entity", minecart_fixture());
+        let first = load_player_vehicle(&root, &world).unwrap();
+        assert_eq!(first.admitted.len(), 2);
+        first
+            .vehicle
+            .get_entity()
+            .set_pos(Vector3::new(320.0, 48.0, 2.0));
+        let second = load_player_vehicle(&root, &world).unwrap();
+        assert!(second.admitted.is_empty());
+        assert!(Arc::ptr_eq(&first.vehicle, &second.vehicle));
+        assert_eq!(
+            second.vehicle.get_entity().pos.load().x,
+            320.0,
+            "stale playerdata cannot overwrite a live vehicle"
+        );
+        assert_eq!(world.entities.load().len(), 2);
+        for entity in first.admitted {
+            world.remove_entity(entity.as_ref());
+        }
+        root.put_uuid("Attach", Uuid::from_u128(99));
+        assert!(matches!(
+            load_player_vehicle(&root, &world),
+            Err(EntityLoadError::Unsupported(_))
+        ));
+        assert!(world.entities.load().is_empty());
+        root.put_uuid("Attach", Uuid::from_u128(1));
+        let mut unsupported = minecart_fixture();
+        unsupported.put_string("id", "minecraft:mannequin".to_owned());
+        root.put_compound("Entity", unsupported);
+        let before = root.clone();
+        assert!(matches!(
+            load_player_vehicle(&root, &world),
+            Err(EntityLoadError::Unsupported(_))
+        ));
+        assert_eq!(root, before);
+        assert!(world.entities.load().is_empty());
+        world.level.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn competing_passenger_tree_admission_never_publishes_duplicate_or_partial_trees() {
+        let directory = tempfile::tempdir().unwrap();
+        let world = test_world(directory.path());
+        let first = load_entity_tree(&minecart_fixture(), &world).unwrap();
+        let second = load_entity_tree(&minecart_fixture(), &world).unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let handles: Vec<_> = [first, second]
+            .into_iter()
+            .map(|entities| {
+                let world = world.clone();
+                let barrier = barrier.clone();
+                tokio::task::spawn_blocking(move || {
+                    barrier.wait();
+                    world.add_entity_tree_silent(&entities)
+                })
+            })
+            .collect();
+        let mut admitted = 0;
+        for handle in handles {
+            admitted += usize::from(handle.await.unwrap());
+        }
+        assert_eq!(admitted, 1);
+        let entities = world.entities.load();
+        assert_eq!(entities.len(), 2);
+        assert_ne!(
+            entities[0].get_entity().entity_uuid,
+            entities[1].get_entity().entity_uuid
+        );
+        assert!(Arc::ptr_eq(
+            &entities[1].get_entity().get_vehicle().unwrap(),
+            &entities[0]
+        ));
+        world.level.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn passenger_mount_rejects_a_vehicle_left_in_another_world() {
+        let first_directory = tempfile::tempdir().unwrap();
+        let second_directory = tempfile::tempdir().unwrap();
+        let first_world = test_world(first_directory.path());
+        let second_world = test_world(second_directory.path());
+        let vehicle = from_type(
+            &EntityType::MINECART,
+            Vector3::default(),
+            &first_world,
+            Uuid::new_v4(),
+        );
+        let passenger = from_type(
+            &EntityType::ENDERMITE,
+            Vector3::default(),
+            &second_world,
+            Uuid::new_v4(),
+        );
+        vehicle
+            .get_entity()
+            .add_passenger(vehicle.clone(), passenger.clone());
+        assert!(!passenger.get_entity().has_vehicle());
+        assert!(!vehicle.get_entity().has_passengers());
+
+        passenger.get_entity().set_world(first_world.clone());
+        vehicle
+            .get_entity()
+            .add_passenger(vehicle.clone(), passenger.clone());
+        assert!(Arc::ptr_eq(
+            &passenger.get_entity().get_vehicle().unwrap(),
+            &vehicle
+        ));
+        assert!(
+            vehicle
+                .get_entity()
+                .has_passenger(passenger.get_entity().entity_id)
+        );
+        vehicle
+            .get_entity()
+            .remove_passenger_on_disconnect(passenger.get_entity().entity_id);
+        *passenger.get_entity().vehicle.lock().unwrap() = None;
+        first_world.level.shutdown().await;
+        second_world.level.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn modern_double_fall_distance_restores_and_overrides_legacy_alias() {
+        let directory = tempfile::tempdir().unwrap();
+        let world = test_world(directory.path());
+        let entity = from_type(
+            &EntityType::ENDERMITE,
+            Vector3::default(),
+            &world,
+            Uuid::new_v4(),
+        );
+        let mut nbt = NbtCompound::new();
+        nbt.put_double("fall_distance", 12.75);
+        nbt.put_float("FallDistance", 1.0);
+        entity.read_nbt_non_mut(&nbt);
+        let living = entity.get_living_entity().unwrap();
+        assert_eq!(living.fall_distance.load(), 12.75);
+        living.fall_distance.store(4.5);
+        let mut saved = NbtCompound::new();
+        entity.write_nbt(&mut saved);
+        assert_eq!(saved.get_double("fall_distance"), Some(4.5));
+        assert_eq!(saved.get_float("FallDistance"), Some(4.5));
+        world.level.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn live_entity_snapshots_keep_opaque_fields_and_do_not_revive_cleared_state() {
+        use pumpkin_nbt::{Nbt, deserializer::NbtReadHelperJava};
+        use pumpkin_util::{text::TextComponent, version::JavaMinecraftVersion};
+        use std::io::Cursor;
+
+        let directory = tempfile::tempdir().unwrap();
+        let world = test_world(&directory.path().join("source"));
+        let destination = test_world(&directory.path().join("destination"));
+        let name = TextComponent::text("Farm")
+            .add_child(TextComponent::text(" plain"))
+            .add_child(TextComponent::text(" styled").bold());
+        let mut fixture = minecart_fixture();
+        fixture.put(
+            "CustomName",
+            name.to_nbt_tag_for_version(&JavaMinecraftVersion::V_26_3),
+        );
+        fixture.put_list("Tags", vec![NbtTag::String("old-tag".into())]);
+        let mut plugin = NbtCompound::new();
+        plugin.put_int("opaque-plugin-key", 42);
+        fixture.put_compound("BukkitValues", plugin);
+        let mut opaque = NbtCompound::new();
+        opaque.put("precise", NbtTag::LongArray(vec![i64::MIN, i64::MAX]));
+        opaque.put_list("ordered", vec![NbtTag::Byte(3), NbtTag::Byte(1)]);
+        fixture.put_compound("UnmanagedVanillaData", opaque.clone());
+        let mut passenger = fixture.get_list("Passengers").unwrap()[0]
+            .extract_compound()
+            .unwrap()
+            .clone();
+        passenger.put_compound("UnmanagedPassengerData", opaque.clone());
+        fixture.put_list("Passengers", vec![NbtTag::Compound(passenger)]);
+        let wire = Nbt::from(fixture).try_write_preserving().unwrap();
+        let mut reader = NbtReadHelperJava::new_preserving(Cursor::new(wire.as_ref()));
+        let raw = Nbt::read_complete(&mut reader).unwrap();
+        let loaded = load_entity_tree(&raw, &world).unwrap();
+        assert_eq!(
+            loaded[0].get_entity().custom_name.load().as_ref(),
+            &Some(name.clone())
+        );
+        let saved = save_entity_tree(&loaded[0]).unwrap();
+        assert_eq!(saved.get_compound("UnmanagedVanillaData"), Some(&opaque));
+        let child = saved.get_list("Passengers").unwrap()[0]
+            .extract_compound()
+            .unwrap();
+        assert_eq!(child.get_compound("UnmanagedPassengerData"), Some(&opaque));
+        // Fresh snapshots must also be valid disk NBT when the name has mixed children.
+        assert!(Nbt::from(saved).try_write_preserving().is_ok());
+
+        let root = loaded[0].get_entity();
+        root.custom_name.store(Arc::new(None));
+        root.scoreboard_tags.lock().unwrap().clear();
+        root.custom_data.lock().unwrap().child_tags.clear();
+        root.remove_passenger_on_disconnect(loaded[1].get_entity().entity_id);
+        root.set_world(destination.clone());
+        root.set_pos(Vector3::new(100.0, 80.0, 200.0));
+        for _ in 0..2 {
+            let saved = save_entity_tree(&loaded[0]).unwrap();
+            for key in [
+                "CustomName",
+                "Tags",
+                "BukkitValues",
+                "PumpkinCustomData",
+                "Passengers",
+            ] {
+                assert!(saved.get(key).is_none(), "revived {key}");
+            }
+            assert_eq!(saved.get_compound("UnmanagedVanillaData"), Some(&opaque));
+            assert_eq!(
+                saved.get_list("Pos").unwrap()[0].extract_double(),
+                Some(100.0)
+            );
+        }
+        let passenger = save_entity_tree(&loaded[1]).unwrap();
+        assert_eq!(
+            passenger.get_compound("UnmanagedPassengerData"),
+            Some(&opaque)
+        );
+        world.level.shutdown().await;
+        destination.level.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn clearing_imported_ownerless_tame_state_is_saved() {
+        use crate::entity::passive::{tamable::TamableAnimal, wolf::WolfEntity};
+
+        let directory = tempfile::tempdir().unwrap();
+        let world = test_world(directory.path());
+        let mut fixture = minecart_fixture();
+        fixture.child_tags.remove("Passengers");
+        fixture.put_string("id", "minecraft:wolf".into());
+        fixture.put_bool("IsTame", true);
+        let loaded = load_entity_tree(&fixture, &world).unwrap();
+        let wolf = loaded[0].cast_any().downcast_ref::<WolfEntity>().unwrap();
+        assert!(wolf.is_tame());
+        wolf.set_tame(false);
+        let saved = save_entity_tree(&loaded[0]).unwrap();
+        assert_eq!(saved.get_bool("IsTame"), Some(false));
+        let reloaded = load_entity_tree(&saved, &world).unwrap();
+        assert!(
+            !reloaded[0]
+                .cast_any()
+                .downcast_ref::<WolfEntity>()
+                .unwrap()
+                .is_tame()
+        );
+        world.level.shutdown().await;
     }
 
     #[tokio::test]
@@ -410,7 +905,7 @@ mod tests {
         root_chunk.live.store(true, Ordering::Relaxed);
         let passenger_chunk = world.level.get_entity_chunk(passenger_pos).await;
         passenger_chunk.live.store(true, Ordering::Relaxed);
-        let loaded = world.load_entity_records(root_pos, vec![minecart_fixture()]);
+        let loaded = world.load_entity_records(root_pos, vec![minecart_fixture()], None);
         loaded[1]
             .get_entity()
             .set_pos(Vector3::new(335.0, 46.1875, 0.4246));
@@ -432,7 +927,7 @@ mod tests {
         );
         assert!(!loaded[1].get_entity().has_vehicle());
         root_chunk.live.store(true, Ordering::Relaxed);
-        let reloaded = world.load_entity_records(root_pos, records);
+        let reloaded = world.load_entity_records(root_pos, records, None);
         assert_eq!(reloaded.len(), 2);
         assert!(reloaded[1].get_entity().has_vehicle());
         world.remove_entities_in_chunks([root_pos]).await;
@@ -445,7 +940,7 @@ mod tests {
         let world = test_world(directory.path());
         let root_pos = Vector2::new(19, 0);
         let passenger_pos = Vector2::new(20, 0);
-        let loaded = world.load_entity_records(root_pos, vec![minecart_fixture()]);
+        let loaded = world.load_entity_records(root_pos, vec![minecart_fixture()], None);
         loaded[0]
             .get_entity()
             .remove_passenger_on_disconnect(loaded[1].get_entity().entity_id);
@@ -513,8 +1008,8 @@ mod tests {
         missing_uuid.child_tags.remove("UUID");
         let original = vec![unknown, malformed, missing_uuid];
         *chunk.data.lock().unwrap() = original.clone();
-        assert!(world.load_entity_chunk(&chunk).unwrap().is_empty());
-        assert!(world.load_entity_chunk(&chunk).is_none());
+        assert!(world.load_entity_chunk(&chunk, None).unwrap().is_empty());
+        assert!(world.load_entity_chunk(&chunk, None).is_none());
         assert!(world.entities.load().is_empty());
         for _ in 0..3 {
             world.save_entities_by_chunk(&[], [position]).await;
@@ -524,7 +1019,7 @@ mod tests {
         assert!(world.preserved_entity_records.get(&position).is_none());
         world.save_entities_by_chunk(&[], [position]).await;
         assert_eq!(*chunk.data.lock().unwrap(), original);
-        assert!(world.load_entity_chunk(&chunk).unwrap().is_empty());
+        assert!(world.load_entity_chunk(&chunk, None).unwrap().is_empty());
         world.save_entities_by_chunk(&[], [position]).await;
         assert_eq!(*chunk.data.lock().unwrap(), original);
         world.level.shutdown().await;
@@ -534,7 +1029,7 @@ mod tests {
     async fn removed_vehicle_does_not_hide_its_surviving_passenger() {
         let directory = tempfile::tempdir().unwrap();
         let world = test_world(directory.path());
-        let loaded = world.load_entity_records(Vector2::new(19, 0), vec![minecart_fixture()]);
+        let loaded = world.load_entity_records(Vector2::new(19, 0), vec![minecart_fixture()], None);
         loaded[0].get_entity().remove();
         assert!(save_entity_tree(&loaded[0]).is_none());
         assert!(save_entity_tree(&loaded[1]).is_some());
@@ -563,11 +1058,12 @@ mod tests {
         world.save_entities_by_chunk(&[], [position]).await;
         assert_eq!(chunk.data.lock().unwrap().len(), 1);
         for _ in 0..3 {
-            let loaded = world.load_entity_chunk(&chunk).unwrap();
+            let last_saved_snapshot = chunk.data.lock().unwrap().clone();
+            let loaded = world.load_entity_chunk(&chunk, None).unwrap();
             assert_eq!(loaded.len(), 2);
             assert_eq!(world.entities.load().len(), 2);
-            assert!(chunk.data.lock().unwrap().is_empty());
-            assert!(world.load_entity_chunk(&chunk).is_none());
+            assert_eq!(*chunk.data.lock().unwrap(), last_saved_snapshot);
+            assert!(world.load_entity_chunk(&chunk, None).is_none());
             for _ in 0..2 {
                 let entities = world.entities.load_full();
                 world.save_entities_by_chunk(&entities, [position]).await;
@@ -596,7 +1092,7 @@ mod tests {
         root_chunk.live.store(true, Ordering::Relaxed);
         let passenger_chunk = world.level.get_entity_chunk(passenger_position).await;
         passenger_chunk.live.store(true, Ordering::Relaxed);
-        let loaded = world.load_entity_records(root_position, vec![minecart_fixture()]);
+        let loaded = world.load_entity_records(root_position, vec![minecart_fixture()], None);
         loaded[0]
             .get_entity()
             .remove_passenger_on_disconnect(loaded[1].get_entity().entity_id);
@@ -617,7 +1113,7 @@ mod tests {
         unknown.put_string("id", "custom:unknown_vehicle".to_string());
         unknown.put_uuid("UUID", Uuid::from_u128(90));
         unknown.child_tags.remove("Passengers");
-        world.load_entity_records(passenger_position, vec![other, unknown.clone()]);
+        world.load_entity_records(passenger_position, vec![other, unknown.clone()], None);
         let entities = world.entities.load_full();
         world
             .save_entities_by_chunk(&entities, [root_position, passenger_position])
@@ -650,6 +1146,544 @@ mod tests {
         world.remove_entities_in_chunks([passenger_position]).await;
         world.level.shutdown().await;
     }
+    async fn loaded_removal_fixture(
+        world: &World,
+        live_pos: BlockPos,
+        dormant_pos: BlockPos,
+        retained_pos: BlockPos,
+    ) -> Arc<ChunkData> {
+        use crate::block::entities::{
+            BlockEntity, barrel::BarrelBlockEntity, furnace::FurnaceBlockEntity,
+        };
+        use pumpkin_data::{Block, item::Item, item_stack::ItemStack};
+        use pumpkin_inventory::Inventory;
+        use pumpkin_world::chunk::io::Dirtiable;
+
+        let position = live_pos.chunk_position();
+        let terrain = Arc::new(ChunkData::empty(0, 0));
+        let furnace = Arc::new(FurnaceBlockEntity::new(live_pos));
+        furnace.set_stack(0, ItemStack::new(7, &Item::IRON_ORE));
+        let dormant = Arc::new(BarrelBlockEntity::new(dormant_pos));
+        let retained = Arc::new(BarrelBlockEntity::new(retained_pos));
+        retained.set_stack(0, ItemStack::new(9, &Item::DIAMOND));
+        let fixtures: [(Arc<dyn BlockEntity>, _); 3] = [
+            (furnace, Block::FURNACE.default_state.id),
+            (dormant, Block::BARREL.default_state.id),
+            (retained, Block::BARREL.default_state.id),
+        ];
+        for (entity, state) in fixtures {
+            let block_pos = entity.get_position();
+            terrain.set_block_absolute_y(block_pos.0.x as usize, 64, 1, state);
+            let mut nbt = NbtCompound::new();
+            entity.write_internal(&mut nbt);
+            nbt.put_string("opaque", "retained only while this instance exists".into());
+            let mut custom = NbtCompound::new();
+            custom.put_int("marker", 1);
+            nbt.put_compound("PumpkinCustomData", custom);
+            terrain
+                .pending_block_entities
+                .lock()
+                .unwrap()
+                .insert(block_pos, nbt);
+        }
+        terrain.mark_dirty(true);
+        world
+            .level
+            .write_chunks(vec![(position, terrain.clone())])
+            .await
+            .unwrap();
+        world.level.loaded_chunks.insert(position, terrain.clone());
+        assert!(!terrain.is_dirty());
+        terrain
+    }
+
+    // A single blocking worker makes filesystem and serialization pauses controlled.
+    fn storage_race_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    async fn pause_blocking_worker() -> (std::sync::mpsc::Sender<()>, tokio::task::JoinHandle<()>) {
+        let (release, blocked) = std::sync::mpsc::channel::<()>();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let blocker = tokio::task::spawn_blocking(move || {
+            let _ = started.send(());
+            let _ = blocked.recv();
+        });
+        ready.await.unwrap();
+        (release, blocker)
+    }
+
+    async fn load_scheduled_terrain(world: &World, position: Vector2<i32>) -> Arc<ChunkData> {
+        use pumpkin_world::chunk_system::{ChunkLoading, StagedChunkEnum};
+
+        // Drive the actual scheduler with the center's resolved ticket level;
+        // no neighboring world generation is needed for this save regression.
+        let loaded = world
+            .level
+            .chunk_listener
+            .add_single_chunk_listener(position);
+        world.level.level_channel.set_level((
+            std::iter::once((position, (StagedChunkEnum::None, StagedChunkEnum::Full))).collect(),
+            std::iter::once((position, ChunkLoading::FULL_CHUNK_LEVEL)).collect(),
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(10), loaded)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+    }
+
+    async fn saved_barrel_terrain(
+        world: &World,
+        position: Vector2<i32>,
+        block_pos: BlockPos,
+    ) -> Arc<ChunkData> {
+        use crate::block::entities::{BlockEntity, barrel::BarrelBlockEntity};
+        use pumpkin_data::{Block, item::Item, item_stack::ItemStack};
+        use pumpkin_inventory::Inventory;
+        use pumpkin_world::chunk::io::Dirtiable;
+
+        let terrain = Arc::new(ChunkData::empty(0, 0));
+        terrain.light_populated.store(true, Ordering::Relaxed);
+        terrain.set_block_absolute_y(1, 64, 1, Block::BARREL.default_state.id);
+        let original = BarrelBlockEntity::new(block_pos);
+        original.set_stack(0, ItemStack::new(1, &Item::DIAMOND));
+        let mut nbt = NbtCompound::new();
+        original.write_internal(&mut nbt);
+        terrain
+            .pending_block_entities
+            .lock()
+            .unwrap()
+            .insert(block_pos, nbt);
+        terrain.mark_dirty(true);
+        world
+            .level
+            .write_chunks(vec![(position, terrain)])
+            .await
+            .unwrap();
+
+        load_scheduled_terrain(world, position).await
+    }
+
+    fn saved_barrel_count(chunk: &ChunkData, block_pos: BlockPos) -> u8 {
+        use crate::block::entities::{BlockEntity, barrel::BarrelBlockEntity};
+        use pumpkin_inventory::Inventory;
+
+        let nbt = chunk
+            .pending_block_entities
+            .lock()
+            .unwrap()
+            .get(&block_pos)
+            .unwrap()
+            .clone();
+        BarrelBlockEntity::from_nbt(&nbt, block_pos)
+            .get_stack(0)
+            .item_count
+    }
+
+    async fn pause_inventory_tick(
+        world: Arc<World>,
+        position: Vector2<i32>,
+        block_pos: BlockPos,
+    ) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+        use pumpkin_data::{item::Item, item_stack::ItemStack};
+
+        let (finish_tick, finishing) = std::sync::mpsc::channel::<()>();
+        let (tick_started, tick_ready) = tokio::sync::oneshot::channel();
+        let tick = std::thread::spawn(move || {
+            let _ticks = world.level.block_entity_tick_lock.lock().unwrap();
+            let entity = world
+                .block_entities
+                .get(&position)
+                .unwrap()
+                .get(&block_pos)
+                .unwrap()
+                .clone();
+            let _ = tick_started.send(());
+            let _ = finishing.recv();
+            entity
+                .get_inventory()
+                .unwrap()
+                .set_stack(0, ItemStack::new(64, &Item::DIAMOND));
+        });
+        tick_ready.await.unwrap();
+        (finish_tick, tick)
+    }
+
+    #[tokio::test]
+    async fn removed_live_and_dormant_block_entities_stay_removed_after_disk_reload() {
+        use pumpkin_util::math::position::BlockPos;
+        use pumpkin_world::chunk::io::{Dirtiable, FileIO, LoadedData};
+
+        let directory = tempfile::tempdir().unwrap();
+        let world = test_world_in_dimension(directory.path(), Dimension::OVERWORLD);
+        let position = Vector2::new(0, 0);
+        let live_pos = BlockPos::new(1, 64, 1);
+        let dormant_pos = BlockPos::new(2, 64, 1);
+        let retained_pos = BlockPos::new(3, 64, 1);
+        let terrain = loaded_removal_fixture(&world, live_pos, dormant_pos, retained_pos).await;
+        let live = world.get_block_entity(&live_pos).unwrap();
+        assert_eq!(live.get_inventory().unwrap().get_stack(0).item_count, 7);
+        assert!(world.preserved_block_entity_nbt.contains_key(&live_pos));
+        assert!(world.custom_block_entity_data.contains_key(&live_pos));
+
+        world.remove_block_entity(&live_pos);
+        world.remove_block_entity(&live_pos);
+        world.remove_block_entity(&dormant_pos);
+        assert!(world.get_block_entity(&live_pos).is_none());
+        assert!(world.get_block_entity(&dormant_pos).is_none());
+        assert!(!world.preserved_block_entity_nbt.contains_key(&live_pos));
+        assert!(!world.custom_block_entity_data.contains_key(&live_pos));
+        assert!(terrain.is_dirty());
+        assert_eq!(terrain.pending_block_entities.lock().unwrap().len(), 1);
+        world.save_block_entities(position);
+        world
+            .level
+            .write_chunks(vec![(position, terrain)])
+            .await
+            .unwrap();
+        world.level.shutdown().await;
+
+        // A fresh manager forces a disk read instead of satisfying it from the
+        // previous region serializer's cache.
+        let reloaded_world = test_world_in_dimension(directory.path(), Dimension::OVERWORLD);
+        let (send, mut receive) = tokio::sync::mpsc::channel(1);
+        reloaded_world
+            .level
+            .chunk_saver
+            .fetch_chunks(&reloaded_world.level.level_folder, &[position], send)
+            .await;
+        let Some(LoadedData::Loaded(terrain)) = receive.recv().await else {
+            panic!("saved terrain must reload successfully");
+        };
+        assert_eq!(terrain.pending_block_entities.lock().unwrap().len(), 1);
+        reloaded_world.level.loaded_chunks.insert(position, terrain);
+        assert!(reloaded_world.get_block_entity(&live_pos).is_none());
+        assert!(reloaded_world.get_block_entity(&dormant_pos).is_none());
+        let retained = reloaded_world.get_block_entity(&retained_pos).unwrap();
+        assert_eq!(
+            retained
+                .clone()
+                .get_inventory()
+                .unwrap()
+                .get_stack(0)
+                .item_count,
+            9
+        );
+        assert_eq!(
+            reloaded_world
+                .snapshot_block_entity_nbt(&retained)
+                .get_string("opaque"),
+            Some("retained only while this instance exists")
+        );
+        reloaded_world.level.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn cleared_legacy_villager_home_aliases_do_not_return_after_repeated_saves() {
+        use crate::entity::{ai::brain::memory::types, passive::villager::VillagerEntity};
+        use pumpkin_util::math::position::BlockPos;
+
+        let directory = tempfile::tempdir().unwrap();
+        let world = test_world(directory.path());
+        let mut fixture = minecart_fixture();
+        fixture.child_tags.remove("Passengers");
+        fixture.put_string("id", "minecraft:villager".into());
+        fixture.put_int("BedX", 301);
+        fixture.put_int("BedY", 65);
+        fixture.put_int("BedZ", 2);
+        fixture.put_string("opaque", "keep villager metadata".into());
+        let loaded = load_entity_tree(&fixture, &world).unwrap();
+        let villager = loaded[0]
+            .cast_any()
+            .downcast_ref::<VillagerEntity>()
+            .unwrap();
+        assert_eq!(villager.get_home(), Some(BlockPos::new(301, 65, 2)));
+        *villager.home_pos.lock().unwrap() = None;
+        villager
+            .mob_entity
+            .brain
+            .lock()
+            .unwrap()
+            .erase(types::HOME.id());
+        for _ in 0..2 {
+            let saved = save_entity_tree(&loaded[0]).unwrap();
+            for key in ["BedX", "BedY", "BedZ", "HomeX", "HomeY", "HomeZ"] {
+                assert!(saved.get(key).is_none(), "cleared home alias {key}");
+            }
+            assert!(
+                saved
+                    .get_compound("Brain")
+                    .unwrap()
+                    .get_compound("memories")
+                    .unwrap()
+                    .get("minecraft:home")
+                    .is_none()
+            );
+            assert_eq!(saved.get_string("opaque"), Some("keep villager metadata"));
+            let reloaded = load_entity_tree(&saved, &world).unwrap();
+            assert!(reloaded[0].get_mob().unwrap().get_home().is_none());
+        }
+        world.level.shutdown().await;
+    }
+
+    #[test]
+    fn container_snapshot_precedes_terrain_eviction_while_world_save_waits_for_disk() {
+        use pumpkin_data::{item::Item, item_stack::ItemStack};
+        use pumpkin_util::math::position::BlockPos;
+        use pumpkin_world::{chunk::io::Dirtiable, chunk_system::StagedChunkEnum};
+        use std::time::Duration;
+
+        // A single blocking worker lets the test pause real async file I/O,
+        // while the scheduler and Tokio workers continue processing unloads.
+        let runtime = storage_race_runtime();
+        runtime.block_on(async {
+            let directory = tempfile::tempdir().unwrap();
+            let world = test_world_in_dimension(directory.path(), Dimension::OVERWORLD);
+            world
+                .level
+                .world_portal
+                .store(Arc::new(Some(Arc::new(super::super::WorldPortal(
+                    world.clone(),
+                )))));
+            let position = Vector2::new(0, 0);
+            let block_pos = BlockPos::new(1, 64, 1);
+            let loaded = saved_barrel_terrain(&world, position, block_pos).await;
+            let container = world.get_block_entity(&block_pos).unwrap();
+            let inventory = container.clone().get_inventory().unwrap();
+            inventory.set_stack(0, ItemStack::new(32, &Item::DIAMOND));
+            let entity_chunk = world.level.get_entity_chunk(position).await;
+            entity_chunk.mark_dirty(true);
+
+            let (release, blocker) = pause_blocking_worker().await;
+            let mut saving = Box::pin(world.save());
+            assert!(futures::poll!(&mut saving).is_pending());
+            assert!(
+                world.entity_storage_lock.try_lock().is_err(),
+                "world save must be paused inside entity disk I/O"
+            );
+            let mut cleanup = Box::pin(world.remove_unwatched_entities_in_chunks([position]));
+            assert!(futures::poll!(&mut cleanup).is_pending());
+
+            // Model the tail of an already-cloned parallel block-entity batch.
+            // The production tick takes this fence before cloning any entities
+            // and releases it only after every hopper/furnace tick has joined.
+            let (finish_tick, tick) =
+                pause_inventory_tick(world.clone(), position, block_pos).await;
+
+            world.level.level_channel.set_level((
+                std::iter::once((position, (StagedChunkEnum::Full, StagedChunkEnum::None)))
+                    .collect(),
+                std::collections::HashMap::default(),
+            ));
+            assert!(
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while world.level.is_chunk_loaded(&position) {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .is_err(),
+                "terrain cannot be retired while an already-cloned block entity can still mutate"
+            );
+            drop(finish_tick);
+            tick.join().unwrap();
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while world.level.is_chunk_loaded(&position) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(!world.block_entities.contains_key(&position));
+            assert!(
+                world.get_block_entity(&block_pos).is_none(),
+                "an unloaded terrain entry cannot revive its retired live map"
+            );
+            // The canonical instance must already carry the live inventory,
+            // although both World::save and entity cleanup are still blocked.
+            assert_eq!(saved_barrel_count(&loaded, block_pos), 64);
+            drop(release);
+            blocker.await.unwrap();
+            saving.await;
+            cleanup.await;
+
+            // Reload through the scheduler, whose I/O barrier waits for the
+            // queued terrain commit before permitting the read.
+            let reloaded = load_scheduled_terrain(&world, position).await;
+            assert_eq!(saved_barrel_count(&reloaded, block_pos), 64);
+            let revived = world.get_block_entity(&block_pos).unwrap();
+            assert!(!Arc::ptr_eq(&container, &revived));
+            assert_eq!(revived.get_inventory().unwrap().get_stack(0).item_count, 64);
+            world.level.shutdown().await;
+            world.level.world_portal.store(Arc::new(None));
+        });
+    }
+
+    #[tokio::test]
+    async fn queued_watch_registration_after_disconnect_cannot_keep_chunks_alive() {
+        let directory = tempfile::tempdir().unwrap();
+        let world = test_world(directory.path());
+        let position = Vector2::new(19, 0);
+        let desired = std::sync::Mutex::new(std::iter::once(position).collect::<FxHashSet<_>>());
+        let saving = world.entity_storage_lock.lock().await;
+        let mut movement =
+            Box::pin(world.reconcile_entity_chunk_watches(1, || desired.lock().unwrap().clone()));
+        assert!(futures::poll!(&mut movement).is_pending());
+
+        // Disconnect removes world membership before awaiting watch release.
+        // Its current desired set is therefore empty when the queued task resumes.
+        desired.lock().unwrap().clear();
+        let mut disconnect = Box::pin(world.reconcile_entity_chunk_watches(1, FxHashSet::default));
+        assert!(futures::poll!(&mut disconnect).is_pending());
+        drop(saving);
+        let (movement, disconnect) = tokio::join!(movement, disconnect);
+        assert!(movement.0.is_empty());
+        assert!(disconnect.0.is_empty());
+        assert!(!world.player_entity_chunk_watches.contains_key(&1));
+        assert!(!world.level.is_chunk_watched(&position));
+        world.level.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn reordered_movements_and_world_transfer_balance_only_owned_watches() {
+        let old_directory = tempfile::tempdir().unwrap();
+        let new_directory = tempfile::tempdir().unwrap();
+        let old_world = test_world(old_directory.path());
+        let new_world = test_world(new_directory.path());
+        let a = Vector2::new(0, 0);
+        let b = Vector2::new(1, 0);
+        let c = Vector2::new(2, 0);
+        let d = Vector2::new(3, 0);
+        old_world
+            .reconcile_entity_chunk_watches(1, || [a, b].into_iter().collect())
+            .await;
+        old_world
+            .reconcile_entity_chunk_watches(2, || std::iter::once(b).collect())
+            .await;
+        let desired = std::sync::Mutex::new([b, c].into_iter().collect::<FxHashSet<_>>());
+        let first_movement =
+            old_world.reconcile_entity_chunk_watches(1, || desired.lock().unwrap().clone());
+        *desired.lock().unwrap() = [c, d].into_iter().collect();
+        // A later task executes first. The older task must observe the current
+        // section, not replay the earlier b/c transition or duplicate counters.
+        old_world
+            .reconcile_entity_chunk_watches(1, || desired.lock().unwrap().clone())
+            .await;
+        assert!(first_movement.await.0.is_empty());
+        assert!(!old_world.level.is_chunk_watched(&a));
+        assert!(old_world.level.is_chunk_watched(&b));
+        assert!(old_world.level.is_chunk_watched(&c));
+        assert!(old_world.level.is_chunk_watched(&d));
+
+        let saving = old_world.entity_storage_lock.lock().await;
+        let mut queued_old_world = Box::pin(
+            old_world.reconcile_entity_chunk_watches(1, || desired.lock().unwrap().clone()),
+        );
+        assert!(futures::poll!(&mut queued_old_world).is_pending());
+        // Transfer removes membership in the old world before publishing new
+        // watches. Both worlds use the same player ID but own separate references.
+        desired.lock().unwrap().clear();
+        new_world
+            .reconcile_entity_chunk_watches(1, || std::iter::once(a).collect())
+            .await;
+        let mut release_old =
+            Box::pin(old_world.reconcile_entity_chunk_watches(1, FxHashSet::default));
+        assert!(futures::poll!(&mut release_old).is_pending());
+        drop(saving);
+        tokio::join!(queued_old_world, release_old);
+        assert!(!old_world.level.is_chunk_watched(&c));
+        assert!(!old_world.level.is_chunk_watched(&d));
+        assert!(old_world.level.is_chunk_watched(&b));
+        assert!(new_world.level.is_chunk_watched(&a));
+        // Repeated cleanup cannot decrement the other player's only reference.
+        old_world
+            .reconcile_entity_chunk_watches(1, FxHashSet::default)
+            .await;
+        assert!(old_world.level.is_chunk_watched(&b));
+        old_world
+            .reconcile_entity_chunk_watches(2, FxHashSet::default)
+            .await;
+        new_world
+            .reconcile_entity_chunk_watches(1, FxHashSet::default)
+            .await;
+        assert!(!old_world.level.is_chunk_watched(&b));
+        assert!(!new_world.level.is_chunk_watched(&a));
+        assert!(old_world.player_entity_chunk_watches.is_empty());
+        assert!(new_world.player_entity_chunk_watches.is_empty());
+        old_world.level.shutdown().await;
+        new_world.level.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn queued_unwatched_cleanup_does_not_remove_rewatched_live_entities() {
+        let directory = tempfile::tempdir().unwrap();
+        let world = test_world(directory.path());
+        let position = Vector2::new(19, 0);
+        let chunk = world.level.get_entity_chunk(position).await;
+        chunk.data.lock().unwrap().push(minecart_fixture());
+        let loaded = world.load_entity_chunk(&chunk, None).unwrap();
+        assert_eq!(loaded.len(), 2);
+
+        // A revival owns the lifecycle lock while an old unload queues behind it.
+        let revival = world.entity_storage_lock.lock().await;
+        let mut cleanup = Box::pin(world.remove_unwatched_entities_in_chunks([position]));
+        assert!(futures::poll!(&mut cleanup).is_pending());
+        world.level.mark_chunks_as_newly_watched(&[position]).await;
+        drop(revival);
+        cleanup.await;
+        assert!(chunk.live.load(Ordering::Relaxed));
+        assert_eq!(world.entities.load().len(), 2);
+
+        world.level.mark_chunks_as_not_watched([position]).await;
+        world.remove_unwatched_entities_in_chunks([position]).await;
+        assert!(!chunk.live.load(Ordering::Relaxed));
+        assert!(world.entities.load().is_empty());
+        world.level.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn autosave_during_unload_cannot_replace_detached_entities_with_empty_snapshot() {
+        use pumpkin_world::chunk::io::Dirtiable;
+        let directory = tempfile::tempdir().unwrap();
+        let world = test_world(directory.path());
+        let position = Vector2::new(0, 0);
+        let chunk = world.level.get_entity_chunk(position).await;
+        let records = vec![minecart_fixture()];
+        *chunk.data.lock().unwrap() = records.clone();
+        chunk.live.store(true, Ordering::Relaxed);
+        chunk.mark_dirty(true);
+
+        // This is the unload boundary: the live list has been detached, but the
+        // chunk stays live until remove_entities_in_chunks finishes its snapshot.
+        let unloading = world.entity_storage_lock.lock().await;
+        assert!(world.entities.load().is_empty());
+        let mut saving = Box::pin(world.save());
+        assert!(futures::poll!(&mut saving).is_pending());
+        assert_eq!(
+            *chunk.data.lock().unwrap(),
+            records,
+            "autosave must wait instead of snapshotting the temporarily empty live list"
+        );
+
+        chunk.live.store(false, Ordering::Relaxed);
+        drop(unloading);
+        saving.await;
+        assert_eq!(*chunk.data.lock().unwrap(), records);
+        assert!(
+            !chunk.is_dirty(),
+            "manual save must flush entity snapshots to disk"
+        );
+        let original_path = world.level.level_folder.entities_folder.join("r.0.0.mca");
+        assert!(tokio::fs::metadata(original_path).await.unwrap().len() > 8192);
+        world.level.shutdown().await;
+    }
+
     #[tokio::test]
     async fn concurrent_uncached_load_cannot_resurrect_a_killed_passenger() {
         let directory = tempfile::tempdir().unwrap();
@@ -660,13 +1694,15 @@ mod tests {
             x: position.x,
             z: position.y,
             data: std::sync::Mutex::new(vec![original]),
+            preserved_tags: std::sync::Mutex::new(NbtCompound::new()),
             live: std::sync::atomic::AtomicBool::new(false),
             dirty: std::sync::atomic::AtomicBool::new(true),
         });
         world
             .level
             .write_entity_chunks(vec![(position, stored)])
-            .await;
+            .await
+            .unwrap();
         assert!(world.level.get_entity_chunk_sync(&position).is_none());
 
         // Hold every Rayon decoder until both requests have reached their
@@ -698,7 +1734,7 @@ mod tests {
             "concurrent decodes must publish one canonical chunk"
         );
 
-        let loaded = world.load_entity_chunk(&first).unwrap();
+        let loaded = world.load_entity_chunk(&first, None).unwrap();
         assert_eq!(loaded.len(), 2);
         loaded[0]
             .get_entity()
@@ -707,7 +1743,7 @@ mod tests {
             .get_entity()
             .set_custom_name(pumpkin_util::text::TextComponent::text("Changed cart"));
         loaded[1].get_entity().remove();
-        assert!(world.load_entity_chunk(&second).is_none());
+        assert!(world.load_entity_chunk(&second, None).is_none());
         assert!(world.preserved_entity_records.get(&position).is_none());
         world.remove_entities_in_chunks([position]).await;
         let saved = first.data.lock().unwrap().clone();
@@ -717,7 +1753,8 @@ mod tests {
         world
             .level
             .write_entity_chunks(vec![(position, first.clone())])
-            .await;
+            .await
+            .unwrap();
         world.level.clean_entity_chunks([position]);
         let mut stream_a = world.level.receive_entity_chunks(vec![position]);
         let mut stream_b = world.level.receive_entity_chunks(vec![position]);
@@ -725,10 +1762,10 @@ mod tests {
         let a = a.unwrap().0.upgrade().unwrap();
         let b = b.unwrap().0.upgrade().unwrap();
         assert!(Arc::ptr_eq(&a, &b));
-        let reloaded = world.load_entity_chunk(&a).unwrap();
+        let reloaded = world.load_entity_chunk(&a, None).unwrap();
         assert_eq!(reloaded.len(), 1);
         assert_eq!(reloaded[0].get_entity().entity_uuid, Uuid::from_u128(1));
-        assert!(world.load_entity_chunk(&b).is_none());
+        assert!(world.load_entity_chunk(&b, None).is_none());
         assert!(
             !world
                 .entities
@@ -739,6 +1776,114 @@ mod tests {
         world.remove_entities_in_chunks([position]).await;
         world.level.shutdown().await;
     }
+    #[test]
+    fn revival_during_queued_cleanup_retains_the_complete_disk_snapshot() {
+        use pumpkin_config::chunk::AnvilChunkConfig;
+        use pumpkin_world::chunk::{
+            ChunkEntityData,
+            format::anvil::AnvilChunkFile,
+            io::{Dirtiable, FileIO, LoadedData, file_manager::ChunkFileManager},
+        };
+        use std::time::Duration;
+
+        let runtime = storage_race_runtime();
+        runtime.block_on(async {
+            let directory = tempfile::tempdir().unwrap();
+            let world = test_world(directory.path());
+            let position = Vector2::new(19, 0);
+            let chunk = world.level.get_entity_chunk(position).await;
+            let mut unsupported = NbtCompound::new();
+            unsupported.put_string("id", "custom:unknown_entity".into());
+            unsupported.put_uuid("UUID", Uuid::from_u128(90));
+            unsupported.put_string("opaque", "keep unsupported entity data".into());
+            let records = vec![minecart_fixture(), unsupported.clone()];
+            *chunk.data.lock().unwrap() = records.clone();
+            chunk.mark_dirty(true);
+            world
+                .level
+                .write_entity_chunks(vec![(position, chunk.clone())])
+                .await
+                .unwrap();
+            chunk.mark_dirty(true);
+            assert_eq!(Arc::strong_count(&chunk), 2);
+
+            // Occupy the only blocking worker before cleanup can read its region
+            // or serialize the selected chunk. The async cleanup still reaches
+            // its write await and owns both selected/save-list references.
+            let (release, blocker) = pause_blocking_worker().await;
+            world.level.clean_entity_chunks([position]);
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while Arc::strong_count(&chunk) < 4 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+
+            let lifecycle = world.entity_storage_lock.lock().await;
+            world.level.mark_chunks_as_newly_watched(&[position]).await;
+            let loaded = world.load_entity_chunk(&chunk, None).unwrap();
+            assert_eq!(loaded.len(), 2);
+            assert!(world.load_entity_chunk(&chunk, None).is_none());
+            assert_eq!(world.entities.load().len(), 2);
+            assert_eq!(
+                world
+                    .preserved_entity_records
+                    .get(&position)
+                    .unwrap()
+                    .as_slice(),
+                &[unsupported.clone()]
+            );
+            drop(lifecycle);
+            drop(release);
+            blocker.await.unwrap();
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while chunk.is_dirty() || Arc::strong_count(&chunk) != 2 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+
+            // Read with a fresh serializer before World::save or shutdown can
+            // repair the file. This checks committed disk data, not the old cache.
+            let reader = ChunkFileManager::<AnvilChunkFile<ChunkEntityData>>::new(
+                AnvilChunkConfig::default(),
+            );
+            let (send, mut receive) = tokio::sync::mpsc::channel(1);
+            reader
+                .fetch_chunks(&world.level.level_folder, &[position], send)
+                .await;
+            let Some(LoadedData::Loaded(persisted)) = receive.recv().await else {
+                panic!("cleanup must leave a readable entity region");
+            };
+            assert_eq!(*persisted.data.lock().unwrap(), records);
+
+            // Keeping the old snapshot must not replay a passenger killed while
+            // live: the next normal unload replaces it with the live tree.
+            loaded[0]
+                .get_entity()
+                .remove_passenger_on_disconnect(loaded[1].get_entity().entity_id);
+            loaded[1].get_entity().remove();
+            world.level.mark_chunks_as_not_watched([position]).await;
+            world.remove_unwatched_entities_in_chunks([position]).await;
+            let updated = chunk.data.lock().unwrap().clone();
+            assert_eq!(updated.len(), 2);
+            assert!(updated.contains(&unsupported));
+            assert!(
+                updated
+                    .iter()
+                    .all(|record| record.get_list("Passengers").is_none())
+            );
+            let revived = world.load_entity_chunk(&chunk, None).unwrap();
+            assert_eq!(revived.len(), 1);
+            assert_eq!(revived[0].get_entity().entity_uuid, Uuid::from_u128(1));
+            assert!(world.load_entity_chunk(&chunk, None).is_none());
+            world.remove_entities_in_chunks([position]).await;
+            world.level.shutdown().await;
+        });
+    }
+
     #[tokio::test]
     async fn duplicate_delivery_is_not_preserved_as_a_replayable_entity_tree() {
         let directory = tempfile::tempdir().unwrap();
@@ -750,7 +1895,8 @@ mod tests {
         let mut unknown = NbtCompound::new();
         unknown.put_string("id", "custom:unknown_entity".to_string());
         unknown.put_uuid("UUID", Uuid::from_u128(90));
-        let loaded = world.load_entity_records(position, vec![stale.clone(), unknown.clone()]);
+        let loaded =
+            world.load_entity_records(position, vec![stale.clone(), unknown.clone()], None);
         loaded[0]
             .get_entity()
             .set_custom_name(pumpkin_util::text::TextComponent::text("Changed cart"));
@@ -758,7 +1904,11 @@ mod tests {
             .get_entity()
             .remove_passenger_on_disconnect(loaded[1].get_entity().entity_id);
         loaded[1].get_entity().remove();
-        assert!(world.load_entity_records(position, vec![stale]).is_empty());
+        assert!(
+            world
+                .load_entity_records(position, vec![stale], None)
+                .is_empty()
+        );
         assert_eq!(
             world
                 .preserved_entity_records
@@ -776,7 +1926,7 @@ mod tests {
                 .iter()
                 .all(|record| record.get_list("Passengers").is_none())
         );
-        let loaded = world.load_entity_chunk(&chunk).unwrap();
+        let loaded = world.load_entity_chunk(&chunk, None).unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].get_entity().entity_uuid, Uuid::from_u128(1));
         let mut saved = NbtCompound::new();

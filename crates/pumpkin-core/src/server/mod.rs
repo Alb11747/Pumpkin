@@ -384,7 +384,7 @@ impl Server {
             });
         }
 
-        let mut worlds_vec = Vec::new();
+        let mut worlds_vec: Vec<Arc<World>> = Vec::new();
         for dim in &server.dimensions {
             info!(
                 "Loading {}",
@@ -393,16 +393,35 @@ impl Server {
                     .to_pretty_console()
             );
             let config = Arc::new(server.advanced_config.world.clone());
-            let level = into_level(dim.clone(), &config, world_path.clone(), seed);
-            let world = Arc::new(World::load(
-                level.clone(),
-                server.level_info.clone(),
-                dim.clone(),
-                block_registry.clone(),
-                Arc::downgrade(&server),
-            ));
+            let loaded = async {
+                let level = into_level(dim.clone(), &config, world_path.clone(), seed)?;
+                match World::load(
+                    level.clone(),
+                    server.level_info.clone(),
+                    dim.clone(),
+                    block_registry.clone(),
+                    Arc::downgrade(&server),
+                ) {
+                    Ok(world) => Ok(Arc::new(world)),
+                    Err(error) => {
+                        level.shutdown().await;
+                        Err(error)
+                    }
+                }
+            }
+            .await;
+            let world = match loaded {
+                Ok(world) => world,
+                Err(error) => {
+                    for previous in &worlds_vec {
+                        previous.level.shutdown().await;
+                        previous.level.world_portal.store(Arc::new(None));
+                    }
+                    return Err(error);
+                }
+            };
             let portal: Arc<dyn WorldPortalExt> = Arc::new(WorldPortal(world.clone()));
-            level.world_portal.store(Arc::new(Some(portal)));
+            world.level.world_portal.store(Arc::new(Some(portal)));
             worlds_vec.push(world);
         }
 
@@ -462,7 +481,11 @@ impl Server {
             })
     }
 
-    pub fn create_world(self: &Arc<Self>, name: String, dimension: Dimension) -> Arc<World> {
+    pub fn create_world(
+        self: &Arc<Self>,
+        name: String,
+        dimension: Dimension,
+    ) -> Result<Arc<World>, WorldInfoError> {
         {
             let worlds = self.worlds.load();
             let world = worlds
@@ -470,7 +493,7 @@ impl Server {
                 .find(|w| w.get_world_name() == name && w.dimension == dimension)
                 .cloned();
             if let Some(world) = world {
-                return world;
+                return Ok(world);
             }
         }
 
@@ -482,8 +505,16 @@ impl Server {
         let seed = self.level_info.load().world_gen_settings.seed;
 
         let level =
-            pumpkin_world::dimension::into_level(dimension.clone(), &config, world_path, seed);
-        let world: World = World::load(level.clone(), l_info, dimension, registry, weak);
+            pumpkin_world::dimension::into_level(dimension.clone(), &config, world_path, seed)?;
+        let world = match World::load(level.clone(), l_info, dimension, registry, weak) {
+            Ok(world) => world,
+            Err(error) => {
+                tokio::spawn(async move {
+                    level.shutdown().await;
+                });
+                return Err(error);
+            }
+        };
         let world = Arc::new(world);
         let portal: Arc<dyn WorldPortalExt> = Arc::new(WorldPortal(world.clone()));
         level.world_portal.store(Arc::new(Some(portal)));
@@ -495,7 +526,7 @@ impl Server {
         let mut event =
             crate::plugin::api::events::world::world_init::WorldInitEvent::new(world.clone());
         self.plugin_manager.fire_blocking(self, &mut event);
-        world
+        Ok(world)
     }
 
     pub async fn unload_world(&self, name: &str) -> Result<(), String> {
@@ -816,11 +847,6 @@ impl Server {
         );
         self.management_hub.broadcast_player_left(&player_dto);
 
-        player.increment_stat(
-            pumpkin_data::statistic::StatisticCategory::Custom,
-            pumpkin_data::statistic::CustomStatistic::LeaveGame as i32,
-            1,
-        );
         // TODO: Config if we want decrease online
         self.listing
             .lock()

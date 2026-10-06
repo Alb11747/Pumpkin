@@ -276,6 +276,10 @@ impl BlockEntity for BeaconBlockEntity {
         }
     }
 
+    fn nbt_aliases(&self) -> &'static [(&'static str, &'static str)] {
+        &[("custom_name", "CustomName")]
+    }
+
     fn write_nbt(&self, nbt: &mut NbtCompound) {
         let primary = self.primary_effect.load(Ordering::Relaxed);
         if primary >= 0 {

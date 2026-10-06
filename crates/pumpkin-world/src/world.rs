@@ -83,6 +83,10 @@ pub trait WorldPortalExt: Send + Sync {
     );
 
     fn spawn_structure_entities(&self, _entities: Vec<NbtCompound>) {}
+
+    /// Snapshots and retires live block entities under the level's tick fence.
+    /// The caller holds the canonical terrain entry until this returns.
+    fn unload_chunk_block_entities(&self, _chunk: &crate::chunk::ChunkData) {}
 }
 
 pub trait BlockAccessor: Send + Sync {

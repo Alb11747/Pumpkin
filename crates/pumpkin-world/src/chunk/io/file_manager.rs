@@ -22,23 +22,9 @@ use super::{ChunkSerializer, FileIO, LoadedData, run_blocking};
 /// A simple implementation of the `ChunkSerializer` trait that loads and saves data
 /// to disk using parallelism and a lazy-loading cache keyed by file path.
 ///
-/// ### Concurrency model
-///
-/// * `file_locks` — one `Arc<RwLock<S>>` per on-disk file, created lazily.
-///   All readers/writers for the same region file share this lock, so there
-///   are never two concurrent writers for the same file.
-/// * `watchers` — a ref-count per path.  While a path has active watchers the
-///   serializer is **not** evicted from the cache and the file is **not**
-///   flushed to disk (the caller owns the flush lifecycle).
-///
-/// ### Lock ordering (must never be violated to avoid deadlocks)
-///
-/// 1. `file_locks`  (outer)
-/// 2. individual `RwLock<S>` inside each loader  (inner)
-/// 3. `watchers`  (independent — never held at the same time as either above)
-///
-/// `watchers` is always acquired in its own critical section, after all
-/// serializer locks are released, which keeps it strictly independent.
+/// Each cached region has one async write lock covering serialization and disk
+/// commit. Watchers only control cache retention: a successful save is always
+/// on disk. Failed or cancelled saves pin the dirty region until a later commit.
 pub struct ChunkFileManager<S: ChunkSerializer<WriteBackend = PathBuf>> {
     file_locks: RwLock<BTreeMap<PathBuf, Arc<ChunkSerializerLazyLoader<S>>>>,
     watchers: RwLock<BTreeMap<PathBuf, usize>>,
@@ -49,10 +35,29 @@ pub(crate) trait PathFromLevelFolder {
     fn file_path(folder: &LevelFolder, file_name: &str) -> PathBuf;
 }
 
+struct CachedSerializer<S> {
+    data: S,
+    dirty: bool,
+}
+
+// Clearing a chunk's flag claims a snapshot, not a successful save. Restore it
+// on errors and cancellation, without clearing mutations made during the save.
+struct PendingSave<P: Dirtiable> {
+    chunks: Vec<Arc<P>>,
+}
+
+impl<P: Dirtiable> Drop for PendingSave<P> {
+    fn drop(&mut self) {
+        for chunk in &self.chunks {
+            chunk.mark_dirty(true);
+        }
+    }
+}
+
 struct ChunkSerializerLazyLoader<S: ChunkSerializer<WriteBackend = PathBuf>> {
     path: PathBuf,
     /// Initialised at most once; subsequent calls reuse the same Arc.
-    internal: OnceCell<Arc<RwLock<S>>>,
+    internal: OnceCell<Arc<RwLock<CachedSerializer<S>>>>,
 }
 
 impl<S: ChunkSerializer<WriteBackend = PathBuf> + 'static> ChunkSerializerLazyLoader<S> {
@@ -76,18 +81,20 @@ impl<S: ChunkSerializer<WriteBackend = PathBuf> + 'static> ChunkSerializerLazyLo
         if Arc::strong_count(loader) > 1 {
             return false;
         }
-        loader
-            .internal
-            .get()
-            .is_none_or(|arc| Arc::strong_count(arc) == 1)
+        loader.internal.get().is_none_or(|arc| {
+            Arc::strong_count(arc) == 1 && arc.try_read().is_ok_and(|serializer| !serializer.dirty)
+        })
     }
 
     /// Returns the serializer, initialising it from disk on the first call.
-    async fn get(&self) -> Result<Arc<RwLock<S>>, ChunkReadingError> {
+    async fn get(&self) -> Result<Arc<RwLock<CachedSerializer<S>>>, ChunkReadingError> {
         self.internal
             .get_or_try_init(|| async {
                 let serializer = self.read_from_disk().await?;
-                Ok(Arc::new(RwLock::new(serializer)))
+                Ok(Arc::new(RwLock::new(CachedSerializer {
+                    data: serializer,
+                    dirty: false,
+                })))
             })
             .await
             .cloned()
@@ -135,7 +142,10 @@ impl<S: ChunkSerializer<WriteBackend = PathBuf>> ChunkFileManager<S> {
     ///
     /// Uses an optimistic read-first pattern: in the common case (cache hit)
     /// we never need a write-lock on the map.
-    async fn get_serializer(&self, path: &Path) -> Result<Arc<RwLock<S>>, ChunkReadingError> {
+    async fn get_serializer(
+        &self,
+        path: &Path,
+    ) -> Result<Arc<RwLock<CachedSerializer<S>>>, ChunkReadingError> {
         {
             let locks = self.file_locks.read().await;
             if let Some(loader) = locks.get(path) {
@@ -163,7 +173,7 @@ impl<S: ChunkSerializer<WriteBackend = PathBuf>> ChunkFileManager<S> {
     ///
     /// The entry is only removed when *both* conditions hold:
     /// 1. No watcher still references the path.
-    /// 2. No other `Arc` clone is live (ensured via `can_remove`).
+    /// 2. No other `Arc` clone is live and the region is clean.
     async fn maybe_evict(&self, path: &PathBuf) {
         // Check watchers independently of file_locks to honour lock ordering.
         let still_watched = {
@@ -309,7 +319,7 @@ where
                 // Hold the read lock only for the duration of `get_chunks`.
                 let read = async move {
                     let serializer = chunk_serializer.read().await;
-                    serializer.get_chunks(chunks, send).await;
+                    serializer.data.get_chunks(chunks, send).await;
                 };
 
                 join!(forward, read);
@@ -362,50 +372,31 @@ where
 
                 {
                     let mut writer = chunk_serializer.write().await;
+                    let mut pending = PendingSave { chunks: Vec::new() };
                     for chunk in &chunk_locks {
-                        // Atomically snapshot and clear the dirty flag before we
-                        // write so that any mutation that races in *during* this
-                        // serialisation round will mark dirty again correctly.
-                        let was_dirty = chunk.is_dirty();
-                        chunk.mark_dirty(false);
-
-                        if was_dirty {
+                        if chunk.take_dirty() {
+                            pending.chunks.push(chunk.clone());
+                            // Pin the region before a fallible or cancellable update.
+                            writer.dirty = true;
                             writer
+                                .data
                                 .update_chunk(chunk.clone(), &self.chunk_config)
                                 .await?;
                         }
                     }
-                    // Write-lock released here — flush can proceed under a read-lock.
-                }
-
-                trace!("Chunk data updated for {}", path.display());
-
-                // We check watchers *after* releasing the write-lock to honour
-                // lock ordering (serializer lock → watchers, never the reverse).
-                let is_watched = {
-                    let watchers = self.watchers.read().await;
-                    watchers.get(&path).is_some_and(|&c| c > 0)
-                };
-
-                if !is_watched {
-                    // A read-lock suffices for `write()` since we have already
-                    // applied all mutations above.
-                    {
-                        let serializer = chunk_serializer.read().await;
+                    if writer.dirty {
                         debug!("Flushing {} to disk", path.display());
-                        serializer
+                        writer
+                            .data
                             .write(&path)
                             .await
                             .map_err(ChunkWritingError::IoError)?;
-                        // Read-lock released here.
-                    };
-
-                    // Drop our handle so `can_remove` may succeed.
-                    drop(chunk_serializer);
-
-                    // Evict the cache entry when no longer needed.
-                    self.maybe_evict(&path).await;
-                }
+                        writer.dirty = false;
+                    }
+                    pending.chunks.clear();
+                };
+                drop(chunk_serializer);
+                self.maybe_evict(&path).await;
 
                 Ok(())
             });
@@ -523,3 +514,7 @@ where
         }
     }
 }
+
+#[cfg(test)]
+#[path = "file_manager_tests.rs"]
+mod tests;

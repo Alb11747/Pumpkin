@@ -165,23 +165,22 @@ fn resolve_palette(structure: &NbtCompound) -> GameTestResult<Vec<PaletteEntry>>
         let entry = entry
             .extract_compound()
             .ok_or_else(|| invalid_structure(format!("Palette entry {index} is not a compound")))?;
-        let name = entry
-            .get_string("Name")
-            .ok_or_else(|| invalid_structure(format!("Palette entry {index} is missing 'Name'")))?;
+        let decoded =
+            pumpkin_world::generation::structure::template::PaletteEntry::from_nbt_compound(entry)
+                .map_err(|cause| invalid_structure(format!("Palette entry {index}: {cause}")))?;
+        let name = decoded.name.as_str();
         let block = Block::from_name(name).ok_or_else(|| {
             invalid_structure(format!("Unknown block '{name}' in structure palette"))
         })?;
 
         let mut test_mode = None;
-        let state = if let Some(properties) = entry.get_compound("Properties") {
-            let mut property_pairs = Vec::with_capacity(properties.child_tags.len());
-            for (property_name, property_value) in &properties.child_tags {
-                let property_value = property_value.extract_string().ok_or_else(|| {
-                    invalid_structure(format!(
-                        "Block '{name}' property '{property_name}' in palette entry {index} is not a string"
-                    ))
-                })?;
-                if block == &Block::TEST_BLOCK && property_name.as_ref() == "mode" {
+        let state = if decoded.properties.is_empty() {
+            block.default_state
+        } else {
+            let mut property_pairs = Vec::with_capacity(decoded.properties.len());
+            for (property_name, property_value) in &decoded.properties {
+                let property_value = property_value.as_str();
+                if block == &Block::TEST_BLOCK && property_name == "mode" {
                     test_mode = Some(TestBlockMode::from_serialized_name(property_value).ok_or_else(
                         || {
                             invalid_structure(format!(
@@ -200,8 +199,6 @@ fn resolve_palette(structure: &NbtCompound) -> GameTestResult<Vec<PaletteEntry>>
                         "No Pumpkin block state matches palette entry {index} for '{name}'"
                     ))
                 })?
-        } else {
-            block.default_state
         };
 
         if block == &Block::TEST_BLOCK && test_mode.is_none() {

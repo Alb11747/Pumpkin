@@ -18,6 +18,7 @@ use thiserror::Error;
 pub mod format;
 pub mod io;
 pub mod palette;
+pub mod structure_spawns;
 
 // TODO
 pub const CHUNK_WIDTH: usize = BlockPalette::SIZE;
@@ -89,6 +90,7 @@ pub struct ChunkData {
     /// `carving_mask` and others; writing the chunk back without them loses
     /// map data that nothing here can regenerate.
     pub preserved_tags: std::sync::Mutex<NbtCompound>,
+    pub structure_spawns: std::sync::Mutex<structure_spawns::StructureSpawnState>,
 }
 
 pub struct ChunkEntityData {
@@ -97,6 +99,8 @@ pub struct ChunkEntityData {
     /// Chunk Z
     pub z: i32,
     pub data: std::sync::Mutex<Vec<NbtCompound>>,
+    /// Unmanaged entity-region metadata retained across snapshots.
+    pub preserved_tags: std::sync::Mutex<NbtCompound>,
     /// Set once the serialized entities have been consumed and spawned. From then on the
     /// live entity list is the source of truth and `data` is rebuilt from it on every save.
     pub live: AtomicBool,
@@ -650,6 +654,7 @@ impl ChunkData {
             inhabited_time: std::sync::atomic::AtomicU64::new(0),
             custom_data: std::sync::Mutex::new(NbtCompound::new()),
             preserved_tags: std::sync::Mutex::new(NbtCompound::new()),
+            structure_spawns: std::sync::Mutex::default(),
         }
     }
 

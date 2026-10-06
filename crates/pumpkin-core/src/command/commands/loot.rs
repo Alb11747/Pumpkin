@@ -427,13 +427,28 @@ impl CommandExecutor for LootExecutor {
                 for entity in &target_entities {
                     let resource_name = entity.get_entity().entity_type.resource_name;
                     let key = format!("minecraft:entities/{resource_name}");
+                    let mut entity_params = params.clone();
+                    entity_params.this_entity = Some(entity.get_entity().entity_type);
+                    entity_params.killer_entity = killer
+                        .as_ref()
+                        .map(|player| player.get_entity().entity_type);
+                    entity_params.cube_size = (entity.get_entity().entity_type
+                        == &pumpkin_data::entity::EntityType::SLIME
+                        || entity.get_entity().entity_type
+                            == &pumpkin_data::entity::EntityType::MAGMA_CUBE)
+                        .then(|| {
+                            entity
+                                .get_entity()
+                                .data
+                                .load(std::sync::atomic::Ordering::Relaxed)
+                        });
                     if let Some(loot_table) = context.server().datapack_manager.get_loot_table(&key)
                     {
                         let seed: i64 = rand::random();
                         drops.extend(crate::world::loot::generate_loot_from_handle(
                             &loot_table,
                             seed,
-                            &params,
+                            &entity_params,
                         ));
                         last_key = Some(key);
                     }

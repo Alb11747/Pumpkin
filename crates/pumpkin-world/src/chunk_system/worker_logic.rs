@@ -126,7 +126,10 @@ pub async fn io_read_work(
                 {
                     break;
                 }
-                notified.await;
+                tokio::select! {
+                    () = notified => {},
+                    () = level.cancel_token.cancelled() => return,
+                }
             }
         }
 
@@ -231,19 +234,29 @@ pub async fn io_write_work(
             vec
         })
         .await;
-        let upgrade_failed = match upgrade_result {
-            Ok(vec) => {
-                if let Err(e) = level
-                    .chunk_saver
-                    .save_chunks(&level.level_folder, vec)
-                    .await
-                {
-                    error!("Failed to save chunks: {:?}", e);
-                }
-                false
+        let chunks = match upgrade_result {
+            Ok(chunks) => chunks,
+            Err(cause) => {
+                level.fail_chunk_system(format!("Failed to upgrade chunks for saving: {cause}"));
+                // Keep the read barrier: disk does not contain this version.
+                break;
             }
-            Err(_) => true,
         };
+        let mut retry_delay = std::time::Duration::from_secs(1);
+        while let Err(cause) = level
+            .chunk_saver
+            .save_chunks(&level.level_folder, chunks.clone())
+            .await
+        {
+            error!(
+                "Failed to save chunks: {cause}; retaining data and retrying in {}s",
+                retry_delay.as_secs()
+            );
+            // Keep both the canonical instances and read barriers until commit,
+            // including during shutdown. Cancelling here would discard world data.
+            tokio::time::sleep(retry_delay).await;
+            retry_delay = (retry_delay * 2).min(std::time::Duration::from_secs(30));
+        }
 
         {
             let mut data = lock
@@ -270,11 +283,6 @@ pub async fn io_write_work(
             }
         }
         lock.1.notify_waiters();
-
-        if upgrade_failed {
-            error!("Failed to upgrade chunks for saving");
-            break;
-        }
     }
 }
 
@@ -370,7 +378,8 @@ mod tests {
                 directory.path().to_path_buf(),
                 0,
                 Dimension::OVERWORLD,
-            );
+            )
+            .unwrap();
             let path = level.level_folder.region_folder.join("r.0.0.mca");
             tokio::fs::write(&path, original).await.unwrap();
             let positions = vec![ChunkPos::new(0, 0), ChunkPos::new(1, 0)];
@@ -405,7 +414,8 @@ mod tests {
             directory.path().to_path_buf(),
             0,
             Dimension::OVERWORLD,
-        );
+        )
+        .unwrap();
         let (request, recv) = tokio::sync::mpsc::channel(1);
         let (send, results) = crossbeam::channel::unbounded();
         drop(results);
@@ -436,6 +446,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_terrain_write_keeps_reload_barrier_until_retry_commits() {
+        use crate::chunk::{ChunkData, io::Dirtiable};
+        let directory = tempfile::tempdir().unwrap();
+        let level = Level::from_root_folder(
+            &LevelConfig::default(),
+            directory.path().into(),
+            0,
+            Dimension::OVERWORLD,
+        )
+        .unwrap();
+        let position = ChunkPos::new(0, 0);
+        let chunk = Arc::new(ChunkData::empty(0, 0));
+        chunk.mark_dirty(true);
+        let temporary = level.level_folder.region_folder.join("r.0.0.tmp");
+        tokio::fs::create_dir(&temporary).await.unwrap();
+        let lock = Arc::new((
+            std::sync::Mutex::new(super::super::HashMapType::default()),
+            tokio::sync::Notify::new(),
+        ));
+        lock.0.lock().unwrap().insert(position, 1);
+        let (send, recv) = tokio::sync::mpsc::channel(1);
+        send.send(vec![(position, Chunk::Level(chunk.clone()))])
+            .await
+            .unwrap();
+        drop(send);
+        let mut writer = tokio::spawn(io_write_work(recv, level.clone(), lock.clone()));
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), &mut writer)
+                .await
+                .is_err(),
+            "a failed write must remain pending instead of claiming success"
+        );
+        assert_eq!(lock.0.lock().unwrap().get(&position), Some(&1));
+        assert!(chunk.is_dirty());
+        tokio::fs::remove_dir(&temporary).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), writer)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!lock.0.lock().unwrap().contains_key(&position));
+        assert!(!chunk.is_dirty());
+        let (send, mut recv) = tokio::sync::mpsc::channel(1);
+        level
+            .chunk_saver
+            .fetch_chunks(&level.level_folder, &[position], send)
+            .await;
+        assert!(matches!(recv.recv().await, Some(LoadedData::Loaded(_))));
+        tokio::time::timeout(Duration::from_secs(10), level.shutdown())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn absent_region_still_starts_chunk_generation() {
         let directory = tempfile::tempdir().unwrap();
         let level = Level::from_root_folder(
@@ -443,7 +506,8 @@ mod tests {
             directory.path().to_path_buf(),
             0,
             Dimension::OVERWORLD,
-        );
+        )
+        .unwrap();
         let pos = ChunkPos::new(0, 0);
         let results = read_batch(&level, vec![pos]).await;
         assert_eq!(results.len(), 1);

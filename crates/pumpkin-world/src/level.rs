@@ -5,7 +5,7 @@ use crate::generation::generator::WorldGenerator;
 use crate::lighting::DynamicLightEngine;
 use crate::{
     chunk::{
-        ChunkData, ChunkEntityData, ChunkReadingError,
+        ChunkData, ChunkEntityData, ChunkReadingError, ChunkWritingError,
         format::anvil::AnvilChunkFile,
         io::{
             Dirtiable, FileIO, LoadedData,
@@ -36,7 +36,7 @@ use std::{
 };
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, info, warn};
 // use tokio::runtime::Handle;
 use tokio::{
     sync::{
@@ -90,6 +90,8 @@ pub struct Level {
     loaded_entity_chunks: Arc<DashMap<Vector2<i32>, SyncEntityChunk>>,
     pub chunks_with_scheduled_ticks: Arc<dashmap::DashSet<Vector2<i32>>>,
     pub chunk_loading: Mutex<ChunkLoading>,
+    /// Covers block-entity tick batches and the final snapshot before terrain eviction.
+    pub block_entity_tick_lock: Mutex<()>,
 
     chunk_watchers: Arc<DashMap<Vector2<i32>, usize>>,
 
@@ -146,14 +148,13 @@ pub struct LevelFolder {
 }
 
 impl Level {
-    #[must_use]
     #[expect(clippy::too_many_lines)]
     pub fn from_root_folder(
         level_config: &LevelConfig,
         root_folder: PathBuf,
         seed: i64,
         dimension: Dimension,
-    ) -> Arc<Self> {
+    ) -> Result<Arc<Self>, crate::world_info::WorldInfoError> {
         let (namespace, name) = match dimension.minecraft_name.split_once(':') {
             Some((ns, n)) => (ns, n),
             None => ("minecraft", dimension.minecraft_name),
@@ -197,8 +198,6 @@ impl Level {
             poi_folder,
         });
 
-        let main_folder = &level_folder.root_folder;
-
         let mut is_flat = false;
         let mut flat_layers = Vec::new();
         let mut flat_biome = "minecraft:plains".to_string();
@@ -206,7 +205,18 @@ impl Level {
         let mut biome_source: Option<crate::world_info::BiomeSource> = None;
         let mut structure_overrides: Option<Vec<String>> = None;
 
-        if let Some(wgs) = crate::world_info::data_files::read_world_gen_settings(main_folder)
+        let world_gen_settings = crate::world_info::data_files::read_dimension_world_gen_settings(
+            &level_folder.root_folder,
+            &level_folder.dim_folder,
+            dimension.minecraft_name,
+        )?;
+        let seed = world_gen_settings
+            .as_ref()
+            .map_or(seed, |settings| settings.seed);
+        let generate_structures = world_gen_settings
+            .as_ref()
+            .is_none_or(|settings| settings.generate_structures);
+        if let Some(wgs) = world_gen_settings
             && let Some(dim_settings) = wgs.dimensions.get(dimension.minecraft_name)
         {
             biome_source.clone_from(&dim_settings.generator.biome_source);
@@ -217,11 +227,7 @@ impl Level {
                     .generator
                     .settings
                     .as_ref()
-                    .and_then(crate::world_info::GeneratorSettings::as_flat_settings)
-                    .or_else(|| {
-                        crate::world_info::FlatLevelGeneratorPreset::from_name("classic_flat")
-                            .map(|p| p.settings)
-                    });
+                    .and_then(crate::world_info::GeneratorSettings::as_flat_settings);
                 if let Some(flat_settings) = flat_settings {
                     flat_layers = flat_settings.to_flat_layers();
                     structure_overrides = flat_settings.structure_overrides_vec();
@@ -232,6 +238,10 @@ impl Level {
             {
                 generator_settings_name = Some(s.clone());
             }
+        }
+
+        if !generate_structures {
+            structure_overrides = Some(Vec::new());
         }
 
         let dim_min_y = dimension.min_y;
@@ -283,6 +293,7 @@ impl Level {
             loaded_entity_chunks: Arc::new(DashMap::new()),
             chunks_with_scheduled_ticks: Arc::new(dashmap::DashSet::new()),
             chunk_loading: Mutex::new(ChunkLoading::new(level_channel.clone())),
+            block_entity_tick_lock: Mutex::new(()),
             chunk_watchers: Arc::new(DashMap::new()),
             tasks: TaskTracker::new(),
             chunk_system_tasks: TaskTracker::new(),
@@ -311,7 +322,7 @@ impl Level {
                 .as_mut(),
         );
 
-        level_ref
+        Ok(level_ref)
     }
 
     pub fn set_world_gen(&self, generator: Arc<WorldGenerator>) {
@@ -337,6 +348,7 @@ impl Level {
                 x: pos.x,
                 z: pos.y,
                 data: std::sync::Mutex::new(Vec::new()),
+                preserved_tags: std::sync::Mutex::new(pumpkin_nbt::NbtCompound::new()),
                 live: AtomicBool::new(false),
                 dirty: AtomicBool::new(false),
             });
@@ -429,12 +441,22 @@ impl Level {
             .iter()
             .map(|chunk| (*chunk.key(), chunk.value().clone()))
             .collect::<Vec<_>>();
+        self.entity_saver.clear_watched_chunks().await;
+        let mut retry_delay = Duration::from_secs(1);
+        while self
+            .write_entity_chunks(chunks_to_write.clone())
+            .await
+            .is_err()
+        {
+            error!(
+                "Entity chunks remain unsaved; retrying in {}s",
+                retry_delay.as_secs()
+            );
+            tokio::time::sleep(retry_delay).await;
+            retry_delay = (retry_delay * 2).min(Duration::from_secs(30));
+        }
         self.loaded_entity_chunks.clear();
         self.pending_entity_loads.clear();
-
-        // TODO: I think the chunk_saver should be at the server level
-        self.entity_saver.clear_watched_chunks().await;
-        self.write_entity_chunks(chunks_to_write).await;
     }
 
     pub fn loaded_chunk_count(&self) -> usize {
@@ -494,40 +516,43 @@ impl Level {
         !self.mark_chunks_as_not_watched([chunk]).await.is_empty()
     }
 
-    // In Level::clean_entity_chunks()
     pub fn clean_entity_chunks(
         self: &Arc<Self>,
         chunks: impl IntoIterator<Item = impl std::borrow::Borrow<Vector2<i32>>>,
     ) {
-        let chunks_to_process: Vec<_> = chunks
-            .into_iter()
-            .filter_map(|pos_borrow| {
-                let pos = pos_borrow.borrow();
-                // Only include chunks with no watchers
-                let has_watchers = self
-                    .chunk_watchers
-                    .get(pos)
-                    .is_some_and(|count| *count != 0);
-
-                if has_watchers {
-                    return None;
-                }
-
-                // Remove immediately to prevent race conditions
-                self.pending_entity_loads.remove(pos);
-                self.loaded_entity_chunks.remove(pos)
-            })
-            .collect();
-
-        if chunks_to_process.is_empty() {
-            return;
-        }
-
+        let positions: Vec<_> = chunks.into_iter().map(|pos| *pos.borrow()).collect();
         let level = self.clone();
         self.spawn_task(async move {
-            debug!("Writing {} entity chunks to disk", chunks_to_process.len());
-            level.write_entity_chunks(chunks_to_process).await;
+            level.save_and_clean_entity_chunks(positions).await;
         });
+    }
+
+    async fn save_and_clean_entity_chunks(&self, positions: Vec<Vector2<i32>>) {
+        let chunks: Vec<_> = positions
+            .into_iter()
+            .filter_map(|pos| {
+                if self.is_chunk_watched(&pos) {
+                    return None;
+                }
+                self.get_entity_chunk_sync(&pos).map(|chunk| (pos, chunk))
+            })
+            .collect();
+        if self.write_entity_chunks(chunks.clone()).await.is_err() {
+            // The cache remains canonical and dirty; the next cleanup or shutdown retries it.
+            return;
+        }
+        for (pos, chunk) in chunks {
+            // remove_if holds the map shard while checking ownership. A loader
+            // either clones this exact chunk first or reads its committed successor
+            // from disk after removal. Live or borrowed chunks cannot be retired.
+            self.loaded_entity_chunks.remove_if(&pos, |_, current| {
+                Arc::ptr_eq(current, &chunk)
+                    && !self.is_chunk_watched(&pos)
+                    && !current.is_dirty()
+                    && !current.live.load(Ordering::Relaxed)
+                    && Arc::strong_count(current) == 2
+            });
+        }
     }
 
     pub fn get_tick_data(
@@ -863,38 +888,42 @@ impl Level {
         .unwrap_or(Block::VOID_AIR.default_state.id)
     }
 
-    pub async fn write_chunks(&self, chunks_to_write: Vec<(Vector2<i32>, SyncChunk)>) {
-        if chunks_to_write.is_empty() {
-            return;
+    pub async fn write_chunks(
+        &self,
+        chunks_to_write: Vec<(Vector2<i32>, SyncChunk)>,
+    ) -> Result<(), ChunkWritingError> {
+        let result = self
+            .chunk_saver
+            .save_chunks(&self.level_folder, chunks_to_write)
+            .await;
+        if let Err(error) = &result {
+            error!("Failed writing chunks to disk: {error}");
         }
-
-        let chunk_saver = self.chunk_saver.clone();
-        let level_folder = self.level_folder.clone();
-
-        trace!("Sending chunks to ChunkIO {:}", chunks_to_write.len());
-        if let Err(error) = chunk_saver
-            .save_chunks(&level_folder, chunks_to_write)
-            .await
-        {
-            error!("Failed writing Chunk to disk {error}");
-        }
+        result
     }
 
-    pub async fn write_entity_chunks(&self, chunks_to_write: Vec<(Vector2<i32>, SyncEntityChunk)>) {
-        if chunks_to_write.is_empty() {
-            return;
-        }
+    /// Persists the entity snapshots currently held by this level.
+    pub async fn save_entity_chunks(&self) -> Result<(), ChunkWritingError> {
+        let chunks = self
+            .loaded_entity_chunks
+            .iter()
+            .map(|chunk| (*chunk.key(), chunk.value().clone()))
+            .collect();
+        self.write_entity_chunks(chunks).await
+    }
 
-        let chunk_saver = self.entity_saver.clone();
-        let level_folder = self.level_folder.clone();
-
-        trace!("Sending chunks to ChunkIO {:}", chunks_to_write.len());
-        if let Err(error) = chunk_saver
-            .save_chunks(&level_folder, chunks_to_write)
-            .await
-        {
-            error!("Failed writing Chunk to disk {error}");
+    pub async fn write_entity_chunks(
+        &self,
+        chunks_to_write: Vec<(Vector2<i32>, SyncEntityChunk)>,
+    ) -> Result<(), ChunkWritingError> {
+        let result = self
+            .entity_saver
+            .save_chunks(&self.level_folder, chunks_to_write)
+            .await;
+        if let Err(error) = &result {
+            error!("Failed writing entity chunks to disk: {error}");
         }
+        result
     }
 
     pub fn is_chunk_loaded(&self, coordinates: &Vector2<i32>) -> bool {
@@ -974,7 +1003,7 @@ impl Level {
     ) {
         let tick_order = self.schedule_tick_counts.fetch_add(1, Ordering::Relaxed);
         let scheduled_tick = ScheduledTick {
-            delay,
+            delay: i32::from(delay),
             position: block_pos,
             priority,
             // SAFETY: `block` is a valid reference that outlives this function call for scheduling.
@@ -1001,7 +1030,7 @@ impl Level {
     ) {
         let tick_order = self.schedule_tick_counts.fetch_add(1, Ordering::Relaxed);
         let scheduled_tick = ScheduledTick {
-            delay,
+            delay: i32::from(delay),
             position: block_pos,
             priority,
             // SAFETY: `fluid` is a valid reference that outlives this function call for scheduling.
@@ -1082,7 +1111,8 @@ mod tests {
                 directory.path().to_path_buf(),
                 0,
                 Dimension::OVERWORLD,
-            );
+            )
+            .unwrap();
             let path = level.level_folder.region_folder.join("r.0.0.mca");
             tokio::fs::write(&path, &original).await.unwrap();
             let pos = Vector2::new(0, 0);
@@ -1121,7 +1151,8 @@ mod tests {
                 directory.path().to_path_buf(),
                 0,
                 Dimension::OVERWORLD,
-            );
+            )
+            .unwrap();
             let path = level.level_folder.entities_folder.join("r.0.0.mca");
             let original = b"unreadable existing entities";
             tokio::fs::write(&path, original).await.unwrap();
@@ -1155,6 +1186,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cleanup_keeps_canonical_entity_chunk_available_to_reload() {
+        let directory = TempDir::new().unwrap();
+        let level = Level::from_root_folder(
+            &LevelConfig::default(),
+            directory.path().into(),
+            0,
+            Dimension::OVERWORLD,
+        )
+        .unwrap();
+        let position = Vector2::new(0, 0);
+        let chunk = level.get_entity_chunk(position).await;
+        chunk.mark_dirty(true);
+        level.clean_entity_chunks([position]);
+        assert!(
+            Arc::ptr_eq(&chunk, &level.get_entity_chunk_sync(&position).unwrap()),
+            "cleanup must not remove the canonical instance before its asynchronous save"
+        );
+        assert!(Arc::ptr_eq(&chunk, &level.get_entity_chunk(position).await));
+        level.save_and_clean_entity_chunks(vec![position]).await;
+        assert!(
+            Arc::ptr_eq(&chunk, &level.get_entity_chunk(position).await),
+            "a borrowed instance must remain canonical after commit"
+        );
+        timeout(Duration::from_secs(10), level.shutdown())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_entity_cleanup_retains_latest_data_until_successful_retry() {
+        let directory = TempDir::new().unwrap();
+        let level = Level::from_root_folder(
+            &LevelConfig::default(),
+            directory.path().into(),
+            0,
+            Dimension::OVERWORLD,
+        )
+        .unwrap();
+        let position = Vector2::new(0, 0);
+        let chunk = level.get_entity_chunk(position).await;
+        let mut record = pumpkin_nbt::compound::NbtCompound::new();
+        record.put_string("id", "minecraft:pig".into());
+        chunk.data.lock().unwrap().push(record);
+        chunk.mark_dirty(true);
+        level
+            .write_entity_chunks(vec![(position, chunk.clone())])
+            .await
+            .unwrap();
+        let path = level.level_folder.entities_folder.join("r.0.0.mca");
+        let original = tokio::fs::read(&path).await.unwrap();
+        let temporary = path.with_extension("tmp");
+        tokio::fs::create_dir(&temporary).await.unwrap();
+        chunk.data.lock().unwrap().clear();
+        chunk.mark_dirty(true);
+        level.save_and_clean_entity_chunks(vec![position]).await;
+        assert!(chunk.is_dirty());
+        assert!(Arc::ptr_eq(&chunk, &level.get_entity_chunk(position).await));
+        assert!(chunk.data.lock().unwrap().is_empty());
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), original);
+        tokio::fs::remove_dir(&temporary).await.unwrap();
+        drop(chunk);
+        level.save_and_clean_entity_chunks(vec![position]).await;
+        assert!(level.get_entity_chunk_sync(&position).is_none());
+        let reloaded = level.get_entity_chunk(position).await;
+        assert!(
+            reloaded.data.lock().unwrap().is_empty(),
+            "removed entity must not resurrect after reload"
+        );
+        timeout(Duration::from_secs(10), level.shutdown())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn absent_entity_chunk_still_generates() {
         let directory = TempDir::new().unwrap();
         let level = Level::from_root_folder(
@@ -1162,7 +1267,8 @@ mod tests {
             directory.path().to_path_buf(),
             0,
             Dimension::OVERWORLD,
-        );
+        )
+        .unwrap();
         let pos = Vector2::new(0, 0);
         let chunk = timeout(Duration::from_secs(10), level.get_entity_chunk(pos))
             .await
@@ -1182,7 +1288,7 @@ mod tests {
         let config = LevelConfig::default();
 
         let overworld_level =
-            Level::from_root_folder(&config, root.clone(), 0, Dimension::OVERWORLD);
+            Level::from_root_folder(&config, root.clone(), 0, Dimension::OVERWORLD).unwrap();
         assert_eq!(
             overworld_level.level_folder.dim_folder,
             root.join("dimensions").join("minecraft").join("overworld")
@@ -1195,13 +1301,15 @@ mod tests {
                 .join("region")
         );
 
-        let nether_level = Level::from_root_folder(&config, root.clone(), 0, Dimension::THE_NETHER);
+        let nether_level =
+            Level::from_root_folder(&config, root.clone(), 0, Dimension::THE_NETHER).unwrap();
         assert_eq!(
             nether_level.level_folder.dim_folder,
             root.join("dimensions").join("minecraft").join("the_nether")
         );
 
-        let end_level = Level::from_root_folder(&config, root.clone(), 0, Dimension::THE_END);
+        let end_level =
+            Level::from_root_folder(&config, root.clone(), 0, Dimension::THE_END).unwrap();
         assert_eq!(
             end_level.level_folder.dim_folder,
             root.join("dimensions").join("minecraft").join("the_end")
@@ -1220,13 +1328,68 @@ mod tests {
         std::fs::create_dir_all(root.join("DIM1").join("region")).unwrap();
 
         let overworld_level =
-            Level::from_root_folder(&config, root.clone(), 0, Dimension::OVERWORLD);
+            Level::from_root_folder(&config, root.clone(), 0, Dimension::OVERWORLD).unwrap();
         assert_eq!(overworld_level.level_folder.dim_folder, root);
 
-        let nether_level = Level::from_root_folder(&config, root.clone(), 0, Dimension::THE_NETHER);
+        let nether_level =
+            Level::from_root_folder(&config, root.clone(), 0, Dimension::THE_NETHER).unwrap();
         assert_eq!(nether_level.level_folder.dim_folder, root.join("DIM-1"));
 
-        let end_level = Level::from_root_folder(&config, root.clone(), 0, Dimension::THE_END);
+        let end_level =
+            Level::from_root_folder(&config, root.clone(), 0, Dimension::THE_END).unwrap();
         assert_eq!(end_level.level_folder.dim_folder, root.join("DIM1"));
+    }
+    #[tokio::test]
+    async fn imported_dimension_metadata_controls_seed_and_generator() {
+        use crate::world_info::{
+            GeneratorSettings, WorldGenSettings, data_files::write_world_gen_settings,
+        };
+        let directory = TempDir::new().unwrap();
+        let root = directory.path().to_path_buf();
+        let config = LevelConfig::default();
+        let root_settings = WorldGenSettings::new(Seed(123));
+        write_world_gen_settings(&root, &root_settings, 4903).unwrap();
+        let nether_folder = root.join("dimensions/minecraft/the_nether");
+        let mut nether_settings = WorldGenSettings::new(Seed(456));
+        nether_settings.generate_structures = false;
+        write_world_gen_settings(&nether_folder, &nether_settings, 4903).unwrap();
+        let end_folder = root.join("dimensions/minecraft/the_end");
+        let mut end_settings = WorldGenSettings::new(Seed(789));
+        let end = end_settings
+            .dimensions
+            .get_mut("minecraft:the_end")
+            .unwrap();
+        end.generator.generator_type = "minecraft:flat".to_string();
+        end.generator.settings = Some(GeneratorSettings::Compound(serde_json::json!({
+            "biome": "minecraft:the_end", "layers": [{"block": "minecraft:end_stone", "height": 7}]
+        })));
+        write_world_gen_settings(&end_folder, &end_settings, 4903).unwrap();
+
+        let overworld =
+            Level::from_root_folder(&config, root.clone(), -1, Dimension::OVERWORLD).unwrap();
+        let nether =
+            Level::from_root_folder(&config, root.clone(), -1, Dimension::THE_NETHER).unwrap();
+        let end = Level::from_root_folder(&config, root, -1, Dimension::THE_END).unwrap();
+        assert_eq!(
+            (overworld.seed.0, nether.seed.0, end.seed.0),
+            (123, 456, 789)
+        );
+        assert_eq!(nether.world_gen().seed(), 456);
+        let nether_generator = nether.world_gen();
+        let WorldGenerator::Noise(noise) = &*nether_generator else {
+            panic!("historical noise generator replaced");
+        };
+        assert!(noise.enabled_structure_sets.as_ref().unwrap().is_empty());
+        let generator = end.world_gen();
+        let WorldGenerator::Flat(flat) = &*generator else {
+            panic!("historical flat generator replaced by noise");
+        };
+        assert_eq!(flat.seed, 789);
+        assert_eq!(flat.layers[0].block, "minecraft:end_stone");
+        assert_eq!(flat.layers[0].height, 7);
+        assert_eq!(flat.biome, "minecraft:the_end");
+        overworld.shutdown().await;
+        nether.shutdown().await;
+        end.shutdown().await;
     }
 }

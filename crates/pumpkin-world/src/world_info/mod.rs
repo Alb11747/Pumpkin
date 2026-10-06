@@ -13,7 +13,7 @@ pub mod data_files;
 
 // Constraint: disk biome palette serialization changed in 1.21.5
 pub const MINIMUM_SUPPORTED_WORLD_DATA_VERSION: i32 = 4435; // 1.21.9
-pub const MAXIMUM_SUPPORTED_WORLD_DATA_VERSION: i32 = 4903; // 26.2
+pub const MAXIMUM_SUPPORTED_WORLD_DATA_VERSION: i32 = 5023; // 26.3
 
 pub const MINIMUM_SUPPORTED_LEVEL_VERSION: i32 = 19132; // 1.21.9
 pub const MAXIMUM_SUPPORTED_LEVEL_VERSION: i32 = 19133; // 1.21.9
@@ -160,8 +160,20 @@ fn default_world_version_series() -> String {
 pub struct WorldGenSettings {
     // the numerical seed of the world
     pub seed: i64,
+    #[serde(
+        default = "default_generate_structures",
+        alias = "generate_features",
+        deserialize_with = "deserialize_bool_from_byte"
+    )]
+    pub generate_structures: bool,
+    #[serde(default, deserialize_with = "deserialize_bool_from_byte")]
+    pub bonus_chest: bool,
     #[serde(default)]
     pub dimensions: Dimensions,
+}
+
+const fn default_generate_structures() -> bool {
+    true
 }
 
 impl Default for WorldGenSettings {
@@ -477,6 +489,8 @@ impl WorldGenSettings {
             Self {
                 dimensions,
                 seed: seed.0 as i64,
+                generate_structures: true,
+                bonus_chest: false,
             }
         })
     }
@@ -486,6 +500,8 @@ impl WorldGenSettings {
         Self {
             dimensions: preset.dimensions.clone(),
             seed: seed.0 as i64,
+            generate_structures: true,
+            bonus_chest: false,
         }
     }
 

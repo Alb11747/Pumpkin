@@ -22,6 +22,15 @@ pub enum LootCondition {
         chances: &'static [f32],
     },
     AllOf(&'static [Self]),
+    Inverted(&'static Self),
+    CubeSize {
+        min: i32,
+        max: i32,
+    },
+    DamageSourceEntity {
+        entity_type: &'static str,
+        frog_variant: Option<&'static str>,
+    },
 }
 
 /// Bonus count formulas when tools have fortune or looting enchantments.
@@ -103,6 +112,14 @@ pub enum DynamicLootCondition {
     AnyOf(Vec<Self>),
     Inverted(Box<Self>),
     EntityOnFire,
+    CubeSize {
+        min: i32,
+        max: i32,
+    },
+    DamageSourceEntity {
+        entity_type: String,
+        frog_variant: Option<String>,
+    },
     WeatherCheck {
         raining: Option<bool>,
         thundering: Option<bool>,
@@ -136,6 +153,15 @@ impl From<LootCondition> for DynamicLootCondition {
             LootCondition::AllOf(conditions) => {
                 Self::AllOf(conditions.iter().copied().map(Self::from).collect())
             }
+            LootCondition::Inverted(condition) => Self::Inverted(Box::new(Self::from(*condition))),
+            LootCondition::CubeSize { min, max } => Self::CubeSize { min, max },
+            LootCondition::DamageSourceEntity {
+                entity_type,
+                frog_variant,
+            } => Self::DamageSourceEntity {
+                entity_type: entity_type.to_string(),
+                frog_variant: frog_variant.map(str::to_string),
+            },
         }
     }
 }

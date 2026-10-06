@@ -31,7 +31,10 @@ fn parse_pool(val: &Value) -> DynamicLootPool {
         }
     }
 
-    let pool_conditions = val.get("conditions").map_or(Vec::new(), parse_conditions);
+    let pool_conditions = val
+        .get("condition")
+        .or_else(|| val.get("conditions"))
+        .map_or(Vec::new(), parse_conditions);
     let condition = combine_conditions(pool_conditions);
 
     DynamicLootPool {
@@ -92,9 +95,14 @@ fn parse_entry(val: &Value, pool_entries: &mut Vec<DynamicLootEntry>, empty_weig
         }
         "item" | "tag" => {
             if let Some(name) = val.get("name").and_then(Value::as_str) {
-                let (min_count, max_count, bonus_formula) =
-                    val.get("functions").map_or((1, 1, None), parse_functions);
-                let conditions = val.get("conditions").map_or(Vec::new(), parse_conditions);
+                let (min_count, max_count, bonus_formula) = val
+                    .get("modifier")
+                    .or_else(|| val.get("functions"))
+                    .map_or((1, 1, None), parse_functions);
+                let conditions = val
+                    .get("condition")
+                    .or_else(|| val.get("conditions"))
+                    .map_or(Vec::new(), parse_conditions);
                 let condition = combine_conditions(conditions);
 
                 pool_entries.push(DynamicLootEntry {
@@ -123,13 +131,14 @@ fn parse_functions(val: &Value) -> (i32, i32, Option<LootBonusFormula>) {
     let mut max_count = 1;
     let mut bonus_formula = None;
 
-    let Some(functions) = val.as_array() else {
-        return (min_count, max_count, bonus_formula);
-    };
+    let functions = val
+        .as_array()
+        .map_or_else(|| std::slice::from_ref(val), Vec::as_slice);
 
     for func in functions {
         let func_type = func
-            .get("function")
+            .get("type")
+            .or_else(|| func.get("function"))
             .and_then(Value::as_str)
             .unwrap_or_default();
         let func_type = func_type.strip_prefix("minecraft:").unwrap_or(func_type);
@@ -177,7 +186,7 @@ fn parse_functions(val: &Value) -> (i32, i32, Option<LootBonusFormula>) {
                     }
                 }
             }
-            "looting_enchant" => {
+            "looting_enchant" | "enchanted_count_increase" => {
                 let max_bonus = func.get("count").map_or(1, |c| {
                     c.get("max")
                         .and_then(Value::as_i64)
@@ -194,15 +203,16 @@ fn parse_functions(val: &Value) -> (i32, i32, Option<LootBonusFormula>) {
 }
 
 fn parse_conditions(val: &Value) -> Vec<DynamicLootCondition> {
-    let Some(arr) = val.as_array() else {
-        return Vec::new();
-    };
+    let arr = val
+        .as_array()
+        .map_or_else(|| std::slice::from_ref(val), Vec::as_slice);
     arr.iter().map(parse_condition).collect()
 }
 
 fn parse_condition(val: &Value) -> DynamicLootCondition {
     let cond_type = val
-        .get("condition")
+        .get("type")
+        .or_else(|| val.get("condition"))
         .and_then(Value::as_str)
         .unwrap_or_default();
     let cond_type = cond_type.strip_prefix("minecraft:").unwrap_or(cond_type);
@@ -279,19 +289,8 @@ fn parse_condition(val: &Value) -> DynamicLootCondition {
                 DynamicLootCondition::None
             }
         }
-        "entity_properties" => {
-            let on_fire = val
-                .get("predicate")
-                .and_then(|p| p.get("flags"))
-                .and_then(|f| f.get("is_on_fire"))
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            if on_fire {
-                DynamicLootCondition::EntityOnFire
-            } else {
-                DynamicLootCondition::None
-            }
-        }
+        "entity_properties" => parse_entity_properties(val),
+        "damage_source_properties" => parse_damage_source_properties(val),
         "weather_check" => {
             let raining = val.get("raining").and_then(Value::as_bool);
             let thundering = val.get("thundering").and_then(Value::as_bool);
@@ -302,6 +301,62 @@ fn parse_condition(val: &Value) -> DynamicLootCondition {
         }
         _ => DynamicLootCondition::None,
     }
+}
+
+fn parse_entity_properties(val: &Value) -> DynamicLootCondition {
+    if val.get("entity").and_then(Value::as_str) == Some("this")
+        && let Some(size) = val
+            .get("predicate")
+            .and_then(|predicate| predicate.get("minecraft:type_specific/cube_mob"))
+            .and_then(|cube| cube.get("size"))
+    {
+        let (min, max) = size.as_i64().map_or_else(
+            || {
+                (
+                    size.get("min")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(i64::from(i32::MIN)) as i32,
+                    size.get("max")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(i64::from(i32::MAX)) as i32,
+                )
+            },
+            |size| (size as i32, size as i32),
+        );
+        return DynamicLootCondition::CubeSize { min, max };
+    }
+    let on_fire = val
+        .get("predicate")
+        .and_then(|p| p.get("flags"))
+        .and_then(|f| f.get("is_on_fire"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if on_fire {
+        DynamicLootCondition::EntityOnFire
+    } else {
+        DynamicLootCondition::None
+    }
+}
+
+fn parse_damage_source_properties(val: &Value) -> DynamicLootCondition {
+    let source = val
+        .get("predicate")
+        .and_then(|predicate| predicate.get("source_entity"));
+    let entity_type = source
+        .and_then(|source| source.get("minecraft:entity_type"))
+        .and_then(Value::as_str);
+    entity_type
+        .filter(|entity_type| *entity_type == "minecraft:frog")
+        .map_or(DynamicLootCondition::None, |entity_type| {
+            let frog_variant = source
+                .and_then(|source| source.get("minecraft:components"))
+                .and_then(|components| components.get("minecraft:frog/variant"))
+                .and_then(Value::as_str);
+            DynamicLootCondition::DamageSourceEntity {
+                entity_type: entity_type.to_string(),
+                frog_variant: frog_variant.map(str::to_string),
+            }
+        })
 }
 
 fn combine_conditions(conditions: Vec<DynamicLootCondition>) -> DynamicLootCondition {
@@ -365,6 +420,43 @@ fn load_loot_tables_recursive<S: std::hash::BuildHasher>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn modern_frog_loot_preserves_variant_and_inverted_size_conditions() -> Result<(), &'static str>
+    {
+        use crate::world::loot::{LootContextParameters, generate_dynamic_loot_with_context};
+        use pumpkin_data::{entity::EntityType, frog_variant::FrogVariant, item::Item};
+
+        let json = r#"{"pools":[{"rolls":1,"entries":[
+            {"type":"minecraft:item","name":"minecraft:magma_cream","modifier":{"type":"minecraft:set_count","count":1},
+             "condition":{"type":"minecraft:all_of","terms":[
+                {"type":"minecraft:inverted","term":{"type":"minecraft:damage_source_properties","predicate":{"source_entity":{"minecraft:entity_type":"minecraft:frog"}}}},
+                {"type":"minecraft:entity_properties","entity":"this","predicate":{"minecraft:type_specific/cube_mob":{"size":{"min":2}}}}
+             ]}},
+            {"type":"minecraft:item","name":"minecraft:pearlescent_froglight","modifier":{"type":"minecraft:set_count","count":1},
+             "condition":{"type":"minecraft:damage_source_properties","predicate":{"source_entity":{"minecraft:entity_type":"minecraft:frog","minecraft:components":{"minecraft:frog/variant":"minecraft:warm"}}}}}
+        ]}]}"#;
+        let table = parse_loot_table(json).ok_or("test fixture must parse")?;
+        let mut params = LootContextParameters {
+            cube_size: Some(1),
+            killer_entity: Some(&EntityType::FROG),
+            killer_frog_variant: Some(FrogVariant::Warm),
+            ..Default::default()
+        };
+        let drops = generate_dynamic_loot_with_context(&table, 42, &params);
+        assert_eq!(drops.len(), 1);
+        assert_eq!(drops[0].item.id, Item::PEARLESCENT_FROGLIGHT.id);
+        params.killer_frog_variant = Some(FrogVariant::Cold);
+        assert!(generate_dynamic_loot_with_context(&table, 42, &params).is_empty());
+        params.killer_entity = Some(&EntityType::PLAYER);
+        params.killer_frog_variant = None;
+        assert!(generate_dynamic_loot_with_context(&table, 42, &params).is_empty());
+        params.cube_size = Some(2);
+        let drops = generate_dynamic_loot_with_context(&table, 42, &params);
+        assert_eq!(drops.len(), 1);
+        assert_eq!(drops[0].item.id, Item::MAGMA_CREAM.id);
+        Ok(())
+    }
 
     #[test]
     fn parse_simple_loot_table() {

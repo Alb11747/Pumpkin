@@ -57,6 +57,10 @@ impl BlockEntity for EndGatewayBlockEntity {
         }
     }
 
+    fn nbt_aliases(&self) -> &'static [(&'static str, &'static str)] {
+        &[("ExitPortal", "exit_portal")]
+    }
+
     fn write_nbt(&self, nbt: &mut NbtCompound) {
         if let Ok(age) = self.age.lock() {
             nbt.put_long("Age", *age);

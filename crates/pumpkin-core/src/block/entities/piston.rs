@@ -256,16 +256,31 @@ impl BlockEntity for PistonBlockEntity {
     where
         Self: Sized,
     {
-        // TODO
-        let pushed_block_state = Block::AIR.default_state;
-        let facing = nbt.get_byte(FACING).unwrap_or(0);
+        use pumpkin_world::generation::structure::template::{BlockStateResolver, PaletteEntry};
+        let pushed_block_state = nbt
+            .get_compound("blockState")
+            .and_then(|state| PaletteEntry::from_nbt_compound(state).ok())
+            .and_then(|entry| BlockStateResolver::resolve_simple(&entry))
+            .unwrap_or_else(|| {
+                if nbt.get("blockState").is_some() {
+                    tracing::warn!("Cannot decode piston moved block state");
+                }
+                Block::AIR.default_state
+            });
+        let facing = nbt
+            .get_int(FACING)
+            .or_else(|| nbt.get_byte(FACING).map(i32::from))
+            .unwrap_or(0);
         let last_progress = nbt.get_float(LAST_PROGRESS).unwrap_or(0.0);
         let extending = nbt.get_bool(EXTENDING).unwrap_or(false);
         let source = nbt.get_bool(SOURCE).unwrap_or(false);
         Self {
             pushed_block_state,
             position,
-            facing: BlockDirection::from_index(facing as u8).unwrap_or(BlockDirection::Down),
+            facing: u8::try_from(facing)
+                .ok()
+                .and_then(BlockDirection::from_index)
+                .unwrap_or(BlockDirection::Down),
             current_progress: last_progress.into(),
             last_progress: last_progress.into(),
             extending,
@@ -274,8 +289,14 @@ impl BlockEntity for PistonBlockEntity {
     }
 
     fn write_nbt(&self, nbt: &mut NbtCompound) {
-        // TODO: pushed_block_state
-        nbt.put_byte(FACING, self.facing.to_index() as i8);
+        nbt.put_compound(
+            "blockState",
+            pumpkin_world::generation::structure::template::PaletteEntry::from_block_state(
+                self.pushed_block_state.id,
+            )
+            .to_nbt_compound(),
+        );
+        nbt.put_int(FACING, i32::from(self.facing.to_index()));
         nbt.put_float(LAST_PROGRESS, self.last_progress.load());
         nbt.put_bool(EXTENDING, self.extending);
         nbt.put_bool(SOURCE, self.source);
@@ -283,16 +304,50 @@ impl BlockEntity for PistonBlockEntity {
 
     fn chunk_data_nbt(&self) -> Option<NbtCompound> {
         let mut nbt = NbtCompound::new();
-        // TODO: pushed_block_state
-        nbt.put_byte(FACING, self.facing.to_index() as i8);
-        nbt.put_float(LAST_PROGRESS, self.last_progress.load());
-        nbt.put_bool(EXTENDING, self.extending);
-        nbt.put_bool(SOURCE, self.source);
-        // TODO: duplicated code because of async :c
+        self.write_nbt(&mut nbt);
         Some(nbt)
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+}
+
+#[cfg(test)]
+mod storage_tests {
+    use super::*;
+    use pumpkin_world::generation::structure::template::PaletteEntry;
+
+    #[test]
+    fn piston_moved_state_and_integer_facing_survive_modern_and_legacy_storage() {
+        let moved = Block::HOPPER
+            .from_properties(&[("facing", "east"), ("enabled", "false")])
+            .to_state_id(&Block::HOPPER);
+        let mut state = PaletteEntry::from_block_state(moved).to_nbt_compound();
+        for legacy in [false, true] {
+            if legacy {
+                let name = state.child_tags.remove("id").unwrap();
+                state.put("Name", name);
+                let properties = state.child_tags.remove("properties").unwrap();
+                state.put("Properties", properties);
+            }
+            let mut nbt = NbtCompound::new();
+            nbt.put_compound("blockState", state.clone());
+            nbt.put_int("facing", 5);
+            nbt.put_float("progress", 0.25);
+            nbt.put_bool("extending", true);
+            let piston = PistonBlockEntity::from_nbt(&nbt, BlockPos::new(0, 64, 0));
+            assert_eq!(piston.pushed_block_state.id, moved);
+            assert_eq!(piston.facing, BlockDirection::East);
+            let saved = piston.chunk_data_nbt().unwrap();
+            assert_eq!(saved.get_int("facing"), Some(5));
+            let state = saved.get_compound("blockState").unwrap();
+            assert_eq!(state.get_string("id"), Some("minecraft:hopper"));
+            assert!(state.get("Name").is_none() && state.get("Properties").is_none());
+            let restored = PistonBlockEntity::from_nbt(&saved, BlockPos::new(0, 64, 0));
+            assert_eq!(restored.pushed_block_state.id, moved);
+            assert_eq!(restored.current_progress.load(), 0.25);
+            assert!(restored.extending);
+        }
     }
 }

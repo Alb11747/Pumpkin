@@ -319,6 +319,7 @@ pub struct RustFmtError;
 /// or formatting fails.
 pub fn format_code(unformatted_code: &str) -> Result<String, RustFmtError> {
     let child_result = Command::new("rustfmt")
+        .args(["--edition", "2024", "--config", "newline_style=Unix"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

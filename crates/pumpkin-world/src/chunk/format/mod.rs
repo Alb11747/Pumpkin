@@ -1,6 +1,5 @@
 use std::{
     path::PathBuf,
-    str::FromStr,
     sync::{
         RwLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -10,7 +9,7 @@ use std::{
 use bytes::Bytes;
 use pumpkin_data::{Block, BlockStateId, chunk::ChunkStatus, fluid::Fluid};
 use pumpkin_nbt::compound::NbtCompound;
-use pumpkin_util::resource_location::{FromResourceLocation, ResourceLocation, ToResourceLocation};
+use pumpkin_util::resource_location::{FromResourceLocation, ToResourceLocation};
 use rustc_hash::FxHashMap;
 
 use crate::{
@@ -21,7 +20,7 @@ use crate::{
     },
     generation::section_coords,
     level::LevelFolder,
-    tick::{ScheduledTick, TickPriority, scheduler::ChunkTickScheduler},
+    tick::{ScheduledTick, scheduler::ChunkTickScheduler},
 };
 use pumpkin_util::math::position::BlockPos;
 use pumpkin_util::math::vector2::Vector2;
@@ -56,7 +55,9 @@ const MODELLED_ROOT_TAGS: &[&str] = &[
 fn preserved_root_tags(root_tag: &NbtCompound) -> NbtCompound {
     let mut preserved = NbtCompound::new();
     for (name, tag) in &root_tag.child_tags {
-        if !MODELLED_ROOT_TAGS.contains(&&**name) {
+        // Starlight's version describes generated lighting caches, which Pumpkin
+        // rebuilds without the corresponding section flags and sentinel sections.
+        if !MODELLED_ROOT_TAGS.contains(&&**name) && &**name != "starlight.light_version" {
             preserved.put(name, tag.clone());
         }
     }
@@ -71,7 +72,7 @@ impl SingleChunkDataSerializer for ChunkData {
 
     #[inline]
     fn to_bytes(&self) -> Result<Bytes, ChunkSerializingError> {
-        Ok(self.internal_to_bytes())
+        self.internal_to_bytes()
     }
 
     #[inline]
@@ -96,6 +97,10 @@ impl Dirtiable for ChunkData {
     #[inline]
     fn is_dirty(&self) -> bool {
         self.dirty.load(Ordering::Relaxed)
+    }
+
+    fn take_dirty(&self) -> bool {
+        self.dirty.swap(false, Ordering::Relaxed)
     }
 }
 
@@ -207,24 +212,37 @@ fn extract_u8_array(tag: &pumpkin_nbt::tag::NbtTag) -> Option<Box<[u8]>> {
     }
 }
 
-fn parse_scheduled_tick<T>(nbt: &pumpkin_nbt::compound::NbtCompound) -> Option<ScheduledTick<T>>
+fn parse_scheduled_ticks<T>(
+    root: &NbtCompound,
+    name: &str,
+) -> Result<Vec<ScheduledTick<T>>, ChunkParsingError>
 where
     T: FromResourceLocation,
 {
-    let x = nbt.get_int("x")?;
-    let y = nbt.get_int("y")?;
-    let z = nbt.get_int("z")?;
-    let delay = nbt.get_int("t")? as u8;
-    let priority = TickPriority::try_from(nbt.get_int("p")?).ok()?;
-    let res_loc_str = nbt.get_string("i")?;
-    let res_loc = ResourceLocation::from_str(res_loc_str).ok()?;
-    let value = T::from_resource_location(&res_loc)?;
-    Some(ScheduledTick {
-        delay,
-        priority,
-        position: BlockPos::new(x, y, z),
-        value,
-    })
+    let Some(tag) = root.get(name) else {
+        return Ok(Vec::new());
+    };
+    let pumpkin_nbt::tag::NbtTag::List(list) = tag else {
+        return Err(ChunkParsingError::ErrorDeserializingChunk(format!(
+            "{name} must be a list"
+        )));
+    };
+    list.iter()
+        .enumerate()
+        .map(|(index, tag)| {
+            let tick = match tag {
+                pumpkin_nbt::tag::NbtTag::Compound(compound) => {
+                    ScheduledTick::from_nbt_compound(compound)
+                }
+                _ => None,
+            };
+            tick.ok_or_else(|| {
+                ChunkParsingError::ErrorDeserializingChunk(format!(
+                    "Invalid {name}[{index}]: expected a known tick type and integer x/y/z/t/p"
+                ))
+            })
+        })
+        .collect()
 }
 
 impl ChunkData {
@@ -239,11 +257,11 @@ impl ChunkData {
             && chunk_data[2] == 0x00;
 
         let mut cursor = std::io::Cursor::new(chunk_data);
-        let mut reader = pumpkin_nbt::deserializer::NbtReadHelperJava::new(&mut cursor);
+        let mut reader = pumpkin_nbt::deserializer::NbtReadHelperJava::new_preserving(&mut cursor);
         let nbt = if is_named {
-            pumpkin_nbt::Nbt::read(&mut reader)
+            pumpkin_nbt::Nbt::read_complete(&mut reader)
         } else {
-            pumpkin_nbt::Nbt::read_unnamed(&mut reader)
+            pumpkin_nbt::Nbt::read_unnamed_complete(&mut reader)
         }
         .map_err(|e| ChunkParsingError::ErrorDeserializingChunk(e.to_string()))?;
 
@@ -405,37 +423,30 @@ impl ChunkData {
                     .map(|a| a.to_vec().into_boxed_slice()),
             },
         );
-        let mut block_ticks = Vec::new();
-        if let Some(list) = root_tag.get_list("block_ticks") {
-            for tag in list {
-                if let pumpkin_nbt::tag::NbtTag::Compound(compound) = tag
-                    && let Some(tick) = parse_scheduled_tick::<&'static Block>(compound)
-                {
-                    block_ticks.push(tick);
-                }
-            }
-        }
-
-        let mut fluid_ticks = Vec::new();
-        if let Some(list) = root_tag.get_list("fluid_ticks") {
-            for tag in list {
-                if let pumpkin_nbt::tag::NbtTag::Compound(compound) = tag
-                    && let Some(tick) = parse_scheduled_tick::<&'static Fluid>(compound)
-                {
-                    fluid_ticks.push(tick);
-                }
-            }
-        }
+        let block_ticks = parse_scheduled_ticks::<&'static Block>(&root_tag, "block_ticks")?;
+        let fluid_ticks = parse_scheduled_ticks::<&'static Fluid>(&root_tag, "fluid_ticks")?;
 
         let mut block_entities = FxHashMap::default();
-        if let Some(list) = root_tag.get_list("block_entities") {
+        if let Some(tag) = root_tag.get("block_entities") {
+            let invalid =
+                |message: &str| ChunkParsingError::ErrorDeserializingChunk(message.to_owned());
+            let list = tag
+                .extract_list()
+                .ok_or_else(|| invalid("Invalid block_entities list"))?;
             for tag in list {
-                if let pumpkin_nbt::tag::NbtTag::Compound(nbt) = tag
-                    && let Some(x) = nbt.get_int("x")
-                    && let Some(y) = nbt.get_int("y")
-                    && let Some(z) = nbt.get_int("z")
+                let nbt = tag
+                    .extract_compound()
+                    .ok_or_else(|| invalid("Invalid block entity record"))?;
+                let (Some(x), Some(y), Some(z)) =
+                    (nbt.get_int("x"), nbt.get_int("y"), nbt.get_int("z"))
+                else {
+                    return Err(invalid("Missing or invalid block entity position"));
+                };
+                if block_entities
+                    .insert(BlockPos::new(x, y, z), nbt.clone())
+                    .is_some()
                 {
-                    block_entities.insert(BlockPos::new(x, y, z), nbt.clone());
+                    return Err(invalid("Duplicate block entity position"));
                 }
             }
         }
@@ -481,11 +492,12 @@ impl ChunkData {
             inhabited_time: AtomicU64::new(root_tag.get_long("InhabitedTime").unwrap_or(0) as u64),
             custom_data: std::sync::Mutex::new(custom_data),
             preserved_tags: std::sync::Mutex::new(preserved_root_tags(&root_tag)),
+            structure_spawns: std::sync::Mutex::default(),
         })
     }
 
     #[allow(clippy::too_many_lines)]
-    fn internal_to_bytes(&self) -> Bytes {
+    fn internal_to_bytes(&self) -> Result<Bytes, ChunkSerializingError> {
         use pumpkin_nbt::tag::NbtTag;
 
         fn extract_light_ref(light: Option<&LightContainer>) -> Option<&[u8]> {
@@ -591,25 +603,10 @@ impl ChunkData {
                 .palette
                 .iter()
                 .map(|&id| {
-                    let block = Block::from_state_id(id);
-                    let mut comp = NbtCompound::new();
-                    let name = if block.name.starts_with("minecraft:") {
-                        block.name.to_string()
-                    } else {
-                        format!("minecraft:{}", block.name)
-                    };
-                    comp.put_string("Name", name);
-                    if let Some(props) = block.properties(id) {
-                        let prop_vec = props.to_props();
-                        if !prop_vec.is_empty() {
-                            let mut props_comp = NbtCompound::new();
-                            for (k, v) in prop_vec {
-                                props_comp.put_string(k, v.to_string());
-                            }
-                            comp.put_compound("Properties", props_comp);
-                        }
-                    }
-                    NbtTag::Compound(comp)
+                    NbtTag::Compound(
+                        crate::generation::structure::template::PaletteEntry::from_block_state(id)
+                            .to_nbt_compound(),
+                    )
                 })
                 .collect();
             bs_comp.put_list("palette", palette_tags);
@@ -660,7 +657,7 @@ impl ChunkData {
             tick_comp.put_int("x", tick.position.0.x);
             tick_comp.put_int("y", tick.position.0.y);
             tick_comp.put_int("z", tick.position.0.z);
-            tick_comp.put_int("t", tick.delay as i32);
+            tick_comp.put_int("t", tick.delay);
             tick_comp.put_int("p", tick.priority as i32);
             tick_comp.put_string("i", tick.value.to_resource_location());
             block_ticks_list.push(NbtTag::Compound(tick_comp));
@@ -673,7 +670,7 @@ impl ChunkData {
             tick_comp.put_int("x", tick.position.0.x);
             tick_comp.put_int("y", tick.position.0.y);
             tick_comp.put_int("z", tick.position.0.z);
-            tick_comp.put_int("t", tick.delay as i32);
+            tick_comp.put_int("t", tick.delay);
             tick_comp.put_int("p", tick.priority as i32);
             tick_comp.put_string("i", tick.value.to_resource_location());
             fluid_ticks_list.push(NbtTag::Compound(tick_comp));
@@ -703,7 +700,8 @@ impl ChunkData {
         }
 
         let nbt = pumpkin_nbt::Nbt::from(root_compound);
-        nbt.write()
+        nbt.try_write_preserving()
+            .map_err(ChunkSerializingError::ErrorSerializingChunk)
     }
 
     pub fn set_custom_data(&self, namespace: &str, key: &str, value: pumpkin_nbt::tag::NbtTag) {
@@ -785,6 +783,10 @@ impl Dirtiable for ChunkEntityData {
     fn is_dirty(&self) -> bool {
         self.dirty.load(Ordering::Relaxed)
     }
+
+    fn take_dirty(&self) -> bool {
+        self.dirty.swap(false, Ordering::Relaxed)
+    }
 }
 
 impl SingleChunkDataSerializer for ChunkEntityData {
@@ -795,7 +797,7 @@ impl SingleChunkDataSerializer for ChunkEntityData {
 
     #[inline]
     fn to_bytes(&self) -> Result<Bytes, ChunkSerializingError> {
-        Ok(self.internal_to_bytes())
+        self.internal_to_bytes()
     }
 
     #[inline]
@@ -814,28 +816,27 @@ impl ChunkEntityData {
             && chunk_data[1] == 0x00
             && chunk_data[2] == 0x00;
         let mut cursor = std::io::Cursor::new(chunk_data);
-        let mut reader = pumpkin_nbt::deserializer::NbtReadHelperJava::new(
+        let mut reader = pumpkin_nbt::deserializer::NbtReadHelperJava::new_preserving(
             pumpkin_nbt::deserializer::NbtStreamReader(&mut cursor),
         );
         let nbt = if is_named {
-            pumpkin_nbt::Nbt::read(&mut reader)
+            pumpkin_nbt::Nbt::read_complete(&mut reader)
         } else {
-            pumpkin_nbt::Nbt::read_unnamed(&mut reader)
+            pumpkin_nbt::Nbt::read_unnamed_complete(&mut reader)
         }
         .map_err(|e| ChunkParsingError::ErrorDeserializingChunk(e.to_string()))?;
 
-        let pos_array = match (nbt.get_int("Position-X"), nbt.get_int("Position-Z")) {
-            (Some(x), Some(z)) => [x, z],
-            _ => {
-                if let Some(pumpkin_nbt::tag::NbtTag::IntArray(pos)) = nbt.get("Position") {
-                    if pos.len() >= 2 {
-                        [pos[0], pos[1]]
-                    } else {
-                        [0, 0]
-                    }
-                } else {
-                    [0, 0]
-                }
+        let invalid =
+            |message: &str| ChunkParsingError::ErrorDeserializingChunk(message.to_owned());
+        let pos_array = if let Some(position_tag) = nbt.get("Position") {
+            let Some(&[x, z]) = position_tag.extract_int_array() else {
+                return Err(invalid("Invalid entity chunk Position"));
+            };
+            [x, z]
+        } else {
+            match (nbt.get_int("Position-X"), nbt.get_int("Position-Z")) {
+                (Some(x), Some(z)) => [x, z],
+                _ => return Err(invalid("Missing entity chunk Position")),
             }
         };
 
@@ -849,25 +850,42 @@ impl ChunkEntityData {
         let entities = match nbt.get("Entities") {
             Some(pumpkin_nbt::tag::NbtTag::List(list)) => list
                 .iter()
-                .filter_map(|t| match t {
-                    pumpkin_nbt::tag::NbtTag::Compound(c) => Some(c.clone()),
-                    _ => None,
+                .map(|tag| {
+                    tag.extract_compound()
+                        .cloned()
+                        .ok_or_else(|| invalid("Invalid entity chunk record"))
                 })
-                .collect(),
-            _ => Vec::new(),
+                .collect::<Result<Vec<_>, _>>()?,
+            Some(_) => return Err(invalid("Invalid entity chunk Entities list")),
+            None => Vec::new(),
         };
+        let mut preserved_tags = nbt.root_tag;
+        for key in [
+            "DataVersion",
+            "Position",
+            "Position-X",
+            "Position-Z",
+            "Entities",
+        ] {
+            preserved_tags.child_tags.remove(key);
+        }
 
         Ok(Self {
             x: position.x,
             z: position.y,
             data: std::sync::Mutex::new(entities),
+            preserved_tags: std::sync::Mutex::new(preserved_tags),
             live: AtomicBool::new(false),
             dirty: AtomicBool::new(false),
         })
     }
 
-    fn internal_to_bytes(&self) -> Bytes {
-        let mut root = NbtCompound::new();
+    fn internal_to_bytes(&self) -> Result<Bytes, ChunkSerializingError> {
+        let mut root = self
+            .preserved_tags
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         root.put_int("DataVersion", WORLD_DATA_VERSION);
         root.put(
             "Position",
@@ -883,7 +901,8 @@ impl ChunkEntityData {
         root.put_list("Entities", entities_tag);
 
         let nbt = pumpkin_nbt::Nbt::from(root);
-        nbt.write()
+        nbt.try_write_preserving()
+            .map_err(ChunkSerializingError::ErrorSerializingChunk)
     }
 }
 
@@ -1023,6 +1042,278 @@ mod tests {
     use pumpkin_nbt::compound::NbtCompound;
     use pumpkin_nbt::tag::NbtTag;
 
+    fn entity_chunk_root(position: Vector2<i32>) -> NbtCompound {
+        let mut root = NbtCompound::new();
+        root.put_int("DataVersion", WORLD_DATA_VERSION);
+        root.put("Position", NbtTag::IntArray(vec![position.x, position.y]));
+        root.put_list("Entities", Vec::new());
+        root
+    }
+
+    fn decode_preserving(bytes: &[u8]) -> pumpkin_nbt::Nbt {
+        let mut reader = pumpkin_nbt::deserializer::NbtReadHelperJava::new_preserving(
+            std::io::Cursor::new(bytes),
+        );
+        pumpkin_nbt::Nbt::read_complete(&mut reader).expect("valid complete saved NBT")
+    }
+
+    fn assert_complete_documents<T: SingleChunkDataSerializer>(mut root: NbtCompound) {
+        root.put_int("duplicate", 1);
+        for named in [true, false] {
+            let nbt = pumpkin_nbt::Nbt::from(root.clone());
+            let bytes = if named {
+                nbt.try_write_preserving().unwrap()
+            } else {
+                nbt.try_write_unnamed_preserving().unwrap()
+            };
+            assert!(T::from_bytes(&bytes, Vector2::new(0, 0)).is_ok());
+            let mut trailing = bytes.to_vec();
+            trailing.push(42);
+            assert!(T::from_bytes(&trailing.into(), Vector2::new(0, 0)).is_err());
+            let truncated = Bytes::copy_from_slice(&bytes[..bytes.len() - 1]);
+            assert!(T::from_bytes(&truncated, Vector2::new(0, 0)).is_err());
+            let mut duplicate = bytes[..bytes.len() - 1].to_vec();
+            duplicate.extend_from_slice(&[
+                3, 0, 9, b'd', b'u', b'p', b'l', b'i', b'c', b'a', b't', b'e', 0, 0, 0, 2, 0,
+            ]);
+            assert!(T::from_bytes(&duplicate.into(), Vector2::new(0, 0)).is_err());
+        }
+    }
+
+    #[test]
+    fn chunk_endpoints_require_complete_unambiguous_documents() {
+        assert_complete_documents::<ChunkData>(
+            test_chunk(vec![test_section(-4, "minecraft:stone", true)]).root_tag,
+        );
+        assert_complete_documents::<ChunkEntityData>(entity_chunk_root(Vector2::new(0, 0)));
+    }
+
+    #[test]
+    fn entity_chunk_position_is_exact_and_modern_position_wins_over_aliases() {
+        let position = Vector2::new(-7, 12);
+        let mut root = entity_chunk_root(position);
+        root.put_int("Position-X", 900);
+        root.put_int("Position-Z", 901);
+        let load = |root: NbtCompound| {
+            let bytes = pumpkin_nbt::Nbt::from(root).try_write_preserving().unwrap();
+            ChunkEntityData::from_bytes(&bytes, position)
+        };
+        let chunk = load(root.clone()).unwrap();
+        assert_eq!(chunk.position(), (-7, 12));
+        let saved = decode_preserving(&chunk.to_bytes().unwrap());
+        assert_eq!(saved.get_int_array("Position"), Some([-7, 12].as_slice()));
+        assert!(saved.get("Position-X").is_none() && saved.get("Position-Z").is_none());
+
+        root.put_int("Position-X", position.x);
+        root.put_int("Position-Z", position.y);
+        for invalid in [
+            NbtTag::IntArray(vec![]),
+            NbtTag::IntArray(vec![-7]),
+            NbtTag::IntArray(vec![-7, 12, 99]),
+            NbtTag::IntArray(vec![-8, 12]),
+            NbtTag::LongArray(vec![-7, 12]),
+            NbtTag::String("-7,12".into()),
+        ] {
+            let mut malformed = root.clone();
+            malformed.put("Position", invalid);
+            assert!(
+                load(malformed).is_err(),
+                "modern position must not fall back"
+            );
+        }
+        root.child_tags.remove("Position");
+        assert_eq!(load(root.clone()).unwrap().position(), (-7, 12));
+        for key in ["Position-X", "Position-Z"] {
+            let mut missing = root.clone();
+            missing.child_tags.remove(key);
+            assert!(load(missing).is_err());
+            let mut wrong_type = root.clone();
+            wrong_type.put_short(key, 0);
+            assert!(load(wrong_type).is_err());
+        }
+        assert!(load(NbtCompound::new()).is_err());
+    }
+
+    #[test]
+    fn entity_chunk_rejects_invalid_entity_lists_without_dropping_records() {
+        let position = Vector2::new(0, 0);
+        for invalid in [
+            NbtTag::Int(1),
+            NbtTag::Compound(NbtCompound::new()),
+            NbtTag::List(vec![NbtTag::String("not a record".into())]),
+            NbtTag::List(vec![NbtTag::Int(1), NbtTag::Int(2)]),
+        ] {
+            let mut root = entity_chunk_root(position);
+            root.put("Entities", invalid);
+            let bytes = pumpkin_nbt::Nbt::from(root).try_write_preserving().unwrap();
+            assert!(ChunkEntityData::from_bytes(&bytes, position).is_err());
+        }
+        let mut root = entity_chunk_root(position);
+        root.child_tags.remove("Entities");
+        let bytes = pumpkin_nbt::Nbt::from(root).try_write_preserving().unwrap();
+        assert!(
+            ChunkEntityData::from_bytes(&bytes, position)
+                .unwrap()
+                .data
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn entity_chunk_keeps_typed_root_metadata_and_mixed_component_lists() {
+        use pumpkin_util::{text::TextComponent, version::JavaMinecraftVersion};
+
+        let position = Vector2::new(-7, 12);
+        let mut metadata = NbtCompound::new();
+        metadata.put("bytes", NbtTag::ByteArray(vec![-128, 0, 127].into()));
+        metadata.put("longs", NbtTag::LongArray(vec![i64::MIN, i64::MAX]));
+        let mut empty_name = NbtCompound::new();
+        empty_name.put_string("", "opaque empty-name compound".into());
+        metadata.put_list(
+            "ordered",
+            vec![NbtTag::Compound(empty_name), NbtTag::Int(42)],
+        );
+        let name = TextComponent::text("Farm cart")
+            .add_child(TextComponent::text(" plain"))
+            .add_child(TextComponent::text(" styled").bold());
+        let mut record = NbtCompound::new();
+        record.put_string("id", "minecraft:minecart".into());
+        record.put("UUID", NbtTag::IntArray(vec![1, 2, 3, 4]));
+        record.put(
+            "CustomName",
+            name.to_nbt_tag_for_version(&JavaMinecraftVersion::V_26_3),
+        );
+        let mut root = entity_chunk_root(position);
+        root.put_compound("future:metadata", metadata);
+        root.put_list("Entities", vec![NbtTag::Compound(record)]);
+        let bytes = pumpkin_nbt::Nbt::from(root).try_write_preserving().unwrap();
+        let original = decode_preserving(&bytes);
+        let chunk = ChunkEntityData::from_bytes(&bytes, position).unwrap();
+        chunk.data.lock().unwrap()[0].put_int("RuntimeChange", 9);
+        let saved = decode_preserving(&chunk.to_bytes().unwrap());
+        assert_eq!(
+            saved.get("future:metadata"),
+            original.get("future:metadata")
+        );
+        assert_eq!(saved.get_int("DataVersion"), Some(WORLD_DATA_VERSION));
+        let saved_record = saved.get_list("Entities").unwrap()[0]
+            .extract_compound()
+            .unwrap();
+        let original_record = original.get_list("Entities").unwrap()[0]
+            .extract_compound()
+            .unwrap();
+        assert_eq!(
+            saved_record.get("CustomName"),
+            original_record.get("CustomName")
+        );
+        assert_eq!(
+            TextComponent::try_from_nbt(saved_record.get("CustomName").unwrap()).unwrap(),
+            name
+        );
+        assert_eq!(saved_record.get_int("RuntimeChange"), Some(9));
+
+        // Clearing live records must not expose a stale Entities copy from the retained root.
+        chunk.data.lock().unwrap().clear();
+        let empty = decode_preserving(&chunk.to_bytes().unwrap());
+        assert!(empty.get_list("Entities").unwrap().is_empty());
+        assert_eq!(
+            empty.get("future:metadata"),
+            original.get("future:metadata")
+        );
+    }
+
+    #[test]
+    fn terrain_rejects_lossy_block_entity_records_but_retains_unknown_types() {
+        let mut record = NbtCompound::new();
+        record.put_string("id", "future:unsupported_block_entity".into());
+        record.put_int("x", 1);
+        record.put_int("y", 64);
+        record.put_int("z", 2);
+        let mut opaque = NbtCompound::new();
+        opaque.put("bytes", NbtTag::ByteArray(vec![0, -1, 42].into()));
+        record.put_compound("opaque", opaque);
+        let mut root = test_chunk(vec![test_section(-4, "minecraft:stone", true)]).root_tag;
+        let load = |root: NbtCompound| {
+            let bytes = pumpkin_nbt::Nbt::from(root).try_write_preserving().unwrap();
+            ChunkData::from_bytes(&bytes, Vector2::new(0, 0))
+        };
+        root.put_list("block_entities", vec![NbtTag::Compound(record.clone())]);
+        let valid = load(root.clone()).unwrap();
+        let saved = decode_preserving(&valid.to_bytes().unwrap());
+        assert_eq!(
+            saved.get_list("block_entities").unwrap(),
+            &[NbtTag::Compound(record.clone())]
+        );
+
+        for invalid in [
+            NbtTag::String("not a list".into()),
+            NbtTag::Compound(record.clone()),
+            NbtTag::List(vec![NbtTag::Int(1)]),
+            NbtTag::List(vec![
+                NbtTag::Compound(record.clone()),
+                NbtTag::Compound(record.clone()),
+            ]),
+        ] {
+            let mut malformed = root.clone();
+            malformed.put("block_entities", invalid);
+            assert!(load(malformed).is_err());
+        }
+        for key in ["x", "y", "z"] {
+            let mut missing = record.clone();
+            missing.child_tags.remove(key);
+            let mut malformed = root.clone();
+            malformed.put_list("block_entities", vec![NbtTag::Compound(missing)]);
+            assert!(load(malformed).is_err());
+            let mut wrong_type = record.clone();
+            wrong_type.put_string(key, "1".into());
+            let mut malformed = root.clone();
+            malformed.put_list("block_entities", vec![NbtTag::Compound(wrong_type)]);
+            assert!(load(malformed).is_err());
+        }
+    }
+
+    #[test]
+    fn chunk_endpoints_propagate_invalid_stored_tag_errors() {
+        let terrain = ChunkData::empty(0, 0);
+        terrain
+            .preserved_tags
+            .lock()
+            .unwrap()
+            .put("invalid", NbtTag::End);
+        assert!(matches!(
+            terrain.to_bytes(),
+            Err(ChunkSerializingError::ErrorSerializingChunk(
+                pumpkin_nbt::Error::NamedEndTag(_)
+            ))
+        ));
+        let root = entity_chunk_root(Vector2::new(0, 0));
+        let bytes = pumpkin_nbt::Nbt::from(root).try_write_preserving().unwrap();
+        let entities = ChunkEntityData::from_bytes(&bytes, Vector2::new(0, 0)).unwrap();
+        entities
+            .preserved_tags
+            .lock()
+            .unwrap()
+            .put("invalid", NbtTag::End);
+        assert!(matches!(
+            entities.to_bytes(),
+            Err(ChunkSerializingError::ErrorSerializingChunk(
+                pumpkin_nbt::Error::NamedEndTag(_)
+            ))
+        ));
+        entities.preserved_tags.lock().unwrap().child_tags.clear();
+        let mut invalid_record = NbtCompound::new();
+        invalid_record.put_list("invalid", vec![NbtTag::End]);
+        entities.data.lock().unwrap().push(invalid_record);
+        assert!(matches!(
+            entities.to_bytes(),
+            Err(ChunkSerializingError::ErrorSerializingChunk(
+                pumpkin_nbt::Error::InvalidListTag(0)
+            ))
+        ));
+    }
+
     fn test_section(y: i32, block: &str, with_biomes: bool) -> NbtCompound {
         let mut block_states = NbtCompound::new();
         let mut air = NbtCompound::new();
@@ -1060,6 +1351,119 @@ mod tests {
             NbtTag::List(sections.into_iter().map(NbtTag::Compound).collect()),
         );
         pumpkin_nbt::Nbt::new(String::new(), root)
+    }
+
+    fn test_scheduled_tick(x: i32, delay: i32, id: &str) -> NbtCompound {
+        let mut tick = NbtCompound::new();
+        tick.put_int("x", x);
+        tick.put_int("y", 64);
+        tick.put_int("z", 0);
+        tick.put_int("t", delay);
+        tick.put_int("p", 0);
+        tick.put_string("i", id.to_owned());
+        tick
+    }
+
+    #[test]
+    fn scheduled_ticks_keep_signed_int_delays_through_chunk_load_and_save() {
+        // Negative delays occur in the imported vanilla 26.3 world; future
+        // values cover the old byte wheel and larger-than-short boundaries.
+        let delays = [
+            i32::MIN,
+            -1_425_489,
+            -134,
+            -1,
+            0,
+            255,
+            256,
+            300,
+            70_000,
+            i32::MAX,
+        ];
+        let mut nbt = test_chunk(vec![test_section(-4, "minecraft:stone", true)]);
+        for (name, id) in [
+            ("block_ticks", "minecraft:stone"),
+            ("fluid_ticks", "minecraft:water"),
+        ] {
+            nbt.root_tag.put_list(
+                name,
+                delays
+                    .iter()
+                    .enumerate()
+                    .map(|(x, &delay)| NbtTag::Compound(test_scheduled_tick(x as i32, delay, id)))
+                    .collect(),
+            );
+        }
+        let chunk = ChunkData::from_bytes(&nbt.clone().write(), Vector2::new(0, 0)).unwrap();
+        let saved = decode_preserving(&chunk.to_bytes().unwrap());
+        for name in ["block_ticks", "fluid_ticks"] {
+            assert_eq!(
+                saved.get(name),
+                nbt.root_tag.get(name),
+                "{name} changed before ticking"
+            );
+        }
+        assert_eq!(chunk.block_ticks.step_tick().len(), 5);
+        assert_eq!(chunk.fluid_ticks.step_tick().len(), 5);
+        let advanced = decode_preserving(&chunk.to_bytes().unwrap());
+        for name in ["block_ticks", "fluid_ticks"] {
+            let delays: Vec<_> = advanced
+                .get_list(name)
+                .unwrap()
+                .iter()
+                .map(|tag| {
+                    let NbtTag::Compound(tick) = tag else {
+                        panic!("tick must be a compound")
+                    };
+                    tick.get_int("t").unwrap()
+                })
+                .collect();
+            assert_eq!(delays, [254, 255, 299, 69_999, 2_147_483_646]);
+        }
+    }
+
+    #[test]
+    fn malformed_scheduled_ticks_fail_loading_instead_of_disappearing() {
+        for (name, id) in [
+            ("block_ticks", "minecraft:stone"),
+            ("fluid_ticks", "minecraft:water"),
+        ] {
+            let valid = test_scheduled_tick(0, -134, id);
+            let mut invalid = vec![NbtTag::Int(1), NbtTag::List(vec![NbtTag::Int(1)])];
+            for key in ["x", "y", "z", "t", "p", "i"] {
+                let mut missing = valid.clone();
+                missing.child_tags.remove(key);
+                invalid.push(NbtTag::List(vec![NbtTag::Compound(missing)]));
+                let mut wrong_type = valid.clone();
+                wrong_type.put(key, NbtTag::Long(1));
+                invalid.push(NbtTag::List(vec![NbtTag::Compound(wrong_type)]));
+            }
+            let mut unknown = valid.clone();
+            unknown.put_string("i", "example:unknown_tick_type".to_owned());
+            invalid.push(NbtTag::List(vec![
+                NbtTag::Compound(valid),
+                NbtTag::Compound(unknown),
+            ]));
+            for tag in invalid {
+                let mut nbt = test_chunk(vec![test_section(-4, "minecraft:stone", true)]);
+                nbt.root_tag.put(name, tag);
+                let Err(error) = ChunkData::from_bytes(&nbt.write(), Vector2::new(0, 0)) else {
+                    panic!("malformed {name} must not load");
+                };
+                assert!(format!("{error:?}").contains(name));
+            }
+        }
+    }
+
+    #[test]
+    fn saved_tick_priority_clamps_like_vanilla() {
+        for (encoded, expected) in [(-100, -3), (-1, -1), (0, 0), (1, 1), (100, 3)] {
+            let mut nbt = test_scheduled_tick(0, -134, "minecraft:stone");
+            nbt.put_int("p", encoded);
+            let tick = ScheduledTick::<&'static Block>::from_nbt_compound(&nbt).unwrap();
+            assert_eq!(tick.to_nbt_compound().get_int("p"), Some(expected));
+            assert_eq!(tick.delay, -134);
+        }
     }
 
     #[test]
@@ -1246,6 +1650,42 @@ mod tests {
     }
 
     #[test]
+    fn modern_chunk_palette_round_trips_named_state_properties() {
+        let chunk = ChunkData::empty(0, 0);
+        let hopper = Block::HOPPER
+            .from_properties(&[("facing", "east"), ("enabled", "false")])
+            .to_state_id(&Block::HOPPER);
+        chunk.section.set_block_absolute_y(2, 10, 3, hopper);
+        let bytes = chunk.internal_to_bytes().expect("chunk serializes");
+        let mut cursor = std::io::Cursor::new(bytes.as_ref());
+        let root = pumpkin_nbt::Nbt::read(&mut pumpkin_nbt::deserializer::NbtReadHelperJava::new(
+            &mut cursor,
+        ))
+        .unwrap()
+        .root_tag;
+        assert_eq!(root.get_int("DataVersion"), Some(5023));
+        for section in root.get_list("sections").unwrap() {
+            for entry in section
+                .extract_compound()
+                .unwrap()
+                .get_compound("block_states")
+                .unwrap()
+                .get_list("palette")
+                .unwrap()
+            {
+                let entry = entry.extract_compound().unwrap();
+                assert!(entry.get_string("id").is_some());
+                assert!(entry.get("Name").is_none() && entry.get("Properties").is_none());
+            }
+        }
+        let reloaded = ChunkData::internal_from_bytes(&bytes, Vector2::new(0, 0)).unwrap();
+        assert_eq!(
+            reloaded.section.get_block_absolute_y(2, 10, 3),
+            Some(hopper)
+        );
+    }
+
+    #[test]
     fn extract_u8_array_from_vanilla_string_palette() {
         let list_tag = NbtTag::List(vec![
             NbtTag::String("minecraft:plains".to_string().into()),
@@ -1310,6 +1750,7 @@ mod tests {
         let mut plugin_data = NbtCompound::new();
         plugin_data.put("payload", NbtTag::ByteArray(vec![0, -1, 42].into()));
         nbt.root_tag.put_compound("example:metadata", plugin_data);
+        nbt.root_tag.put_int("starlight.light_version", 9);
 
         let written = nbt.root_tag.clone();
         let chunk = ChunkData::from_bytes(&nbt.write(), Vector2::new(0, 0)).expect("chunk parses");
@@ -1318,6 +1759,8 @@ mod tests {
         let mut cursor = std::io::Cursor::new(saved.as_ref());
         let mut reader = pumpkin_nbt::deserializer::NbtReadHelperJava::new(&mut cursor);
         let reloaded = pumpkin_nbt::Nbt::read(&mut reader).expect("saved chunk parses");
+
+        assert!(reloaded.root_tag.get("starlight.light_version").is_none());
 
         for key in [
             "structures",

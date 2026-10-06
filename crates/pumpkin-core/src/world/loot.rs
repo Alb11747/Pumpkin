@@ -18,6 +18,8 @@ pub struct LootContextParameters {
     pub this_entity: Option<&'static EntityType>,
     pub killer_entity: Option<&'static EntityType>,
     pub direct_killer_entity: Option<&'static EntityType>,
+    pub cube_size: Option<i32>,
+    pub killer_frog_variant: Option<pumpkin_data::frog_variant::FrogVariant>,
     pub position: Option<pumpkin_util::math::vector3::Vector3<f64>>,
     pub world_time: u64,
     pub damage_type: Option<DamageType>,
@@ -78,6 +80,13 @@ fn check_dynamic_condition(
             !check_dynamic_condition(cond, has_silk_touch, has_shears, fortune_level, params, rng)
         }
         DynamicLootCondition::EntityOnFire => params.is_on_fire.unwrap_or(false),
+        DynamicLootCondition::CubeSize { min, max } => params
+            .cube_size
+            .is_some_and(|size| (*min..=*max).contains(&size)),
+        DynamicLootCondition::DamageSourceEntity {
+            entity_type,
+            frog_variant,
+        } => damage_source_entity_matches(entity_type, frog_variant.as_deref(), params),
         DynamicLootCondition::WeatherCheck {
             raining,
             thundering,
@@ -139,6 +148,101 @@ fn check_condition(
         LootCondition::AllOf(conditions) => conditions
             .iter()
             .all(|c| check_condition(*c, has_silk_touch, has_shears, fortune_level, params, rng)),
+        LootCondition::Inverted(condition) => !check_condition(
+            *condition,
+            has_silk_touch,
+            has_shears,
+            fortune_level,
+            params,
+            rng,
+        ),
+        LootCondition::CubeSize { min, max } => params
+            .cube_size
+            .is_some_and(|size| (min..=max).contains(&size)),
+        LootCondition::DamageSourceEntity {
+            entity_type,
+            frog_variant,
+        } => damage_source_entity_matches(entity_type, frog_variant, params),
+    }
+}
+
+fn damage_source_entity_matches(
+    entity_type: &str,
+    frog_variant: Option<&str>,
+    params: &LootContextParameters,
+) -> bool {
+    params.killer_entity.is_some_and(|killer| {
+        killer.resource_name
+            == entity_type
+                .strip_prefix("minecraft:")
+                .unwrap_or(entity_type)
+    }) && frog_variant.is_none_or(|variant| {
+        params
+            .killer_frog_variant
+            .is_some_and(|frog| frog.asset_id() == variant || frog.to_name() == variant)
+    })
+}
+
+#[cfg(test)]
+mod frog_loot_tests {
+    use super::*;
+    use pumpkin_data::frog_variant::FrogVariant;
+
+    #[test]
+    fn magma_cube_frog_kills_drop_only_the_killers_froglight() {
+        for (variant, item) in [
+            (FrogVariant::Warm, &Item::PEARLESCENT_FROGLIGHT),
+            (FrogVariant::Cold, &Item::VERDANT_FROGLIGHT),
+            (FrogVariant::Temperate, &Item::OCHRE_FROGLIGHT),
+        ] {
+            let params = LootContextParameters {
+                this_entity: Some(&EntityType::MAGMA_CUBE),
+                cube_size: Some(1),
+                killer_entity: Some(&EntityType::FROG),
+                killer_frog_variant: Some(variant),
+                ..Default::default()
+            };
+            for seed in 0..64 {
+                let drops = generate_loot_with_context(
+                    &pumpkin_data::loot_table::ENTITIES_MAGMA_CUBE,
+                    seed,
+                    &params,
+                );
+                assert_eq!(drops.len(), 1);
+                assert_eq!(drops[0].item.id, item.id);
+                assert_eq!(drops[0].item_count, 1);
+            }
+        }
+    }
+
+    #[test]
+    fn magma_cube_other_deaths_never_drop_froglights_or_small_cube_cream() {
+        let mut cream_drops = 0;
+        for size in [1, 2, 4] {
+            let params = LootContextParameters {
+                this_entity: Some(&EntityType::MAGMA_CUBE),
+                cube_size: Some(size),
+                killer_entity: Some(&EntityType::PLAYER),
+                ..Default::default()
+            };
+            for seed in 0..256 {
+                let drops = generate_loot_with_context(
+                    &pumpkin_data::loot_table::ENTITIES_MAGMA_CUBE,
+                    seed,
+                    &params,
+                );
+                if size == 1 {
+                    assert!(drops.is_empty());
+                }
+                for drop in drops {
+                    assert_eq!(drop.item.id, Item::MAGMA_CREAM.id);
+                    assert_eq!(drop.item_count, 1);
+                    cream_drops += 1;
+                }
+            }
+        }
+        assert!(cream_drops > 0);
+        assert!(cream_drops < 512);
     }
 }
 

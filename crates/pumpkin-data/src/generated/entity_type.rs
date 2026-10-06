@@ -28,6 +28,8 @@ pub struct EntityType {
     pub track_deltas: bool,
     pub dimension: [f32; 2],
     pub eye_height: f32,
+    pub passenger_attachments: &'static [Vector3<f64>],
+    pub vehicle_attachment: Vector3<f64>,
     pub spawn_dimensions_scale: f32,
     pub spawn_restriction: SpawnRestriction,
     pub resource_name: &'static str,
@@ -171,6 +173,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [1.375f32, 0.5625f32],
         eye_height: 0.5625f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.5625f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -197,6 +201,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [1.375f32, 0.5625f32],
         eye_height: 0.5625f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.5625f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -253,6 +259,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.35f32, 0.6f32],
         eye_height: 0.36f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.6000000238418579f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, -0.03999999910593033f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -279,6 +287,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [6f32, 0.5f32],
         eye_height: 0.425f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.5f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -334,6 +344,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.7f32, 0.65f32],
         eye_height: 0.26f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.6499999761581421f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::OnGround,
@@ -387,6 +399,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.5f32, 1.975f32],
         eye_height: 1.7775f32,
+        passenger_attachments: &[Vector3::new(0f64, 1.975000023841858f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -413,6 +427,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.5f32, 0.5f32],
         eye_height: 0.13f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.5f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -469,6 +485,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.75f32, 0.42f32],
         eye_height: 0.2751f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.41999998688697815f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::InWater,
@@ -495,6 +513,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [1.375f32, 0.5625f32],
         eye_height: 0.5625f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.5625f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -521,6 +541,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [1.375f32, 0.5625f32],
         eye_height: 0.5625f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.5625f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -575,6 +597,8 @@ impl EntityType {
         track_deltas: false,
         dimension: [0.5f32, 0.9f32],
         eye_height: 0.45f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.8999999761581421f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::OnGround,
@@ -632,6 +656,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.55f32, 0.5f32],
         eye_height: 0.3f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.5f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -658,6 +684,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [1.375f32, 0.5625f32],
         eye_height: 0.5625f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.5625f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -684,6 +712,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [1.375f32, 0.5625f32],
         eye_height: 0.5625f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.5625f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -714,7 +744,7 @@ impl EntityType {
             (Attributes::MAX_ABSORPTION, 0f64),
             (Attributes::MAX_HEALTH, 20f64),
             (Attributes::MOVEMENT_EFFICIENCY, 0f64),
-            (Attributes::MOVEMENT_SPEED, 0.2300000041723251f64),
+            (Attributes::MOVEMENT_SPEED, 0.23000000417232513f64),
             (Attributes::NAME_TAG_DISTANCE, 64f64),
             (Attributes::OXYGEN_BONUS, 0f64),
             (Attributes::SAFE_FALL_DISTANCE, 3f64),
@@ -739,6 +769,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.6f32, 1.8f32],
         eye_height: 1.53f32,
+        passenger_attachments: &[Vector3::new(0f64, 1.7999999523162842f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::OnGround,
@@ -765,6 +797,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0f32, 0f32],
         eye_height: 0f32,
+        passenger_attachments: &[Vector3::new(0f64, 0f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -820,6 +854,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.6f32, 1.99f32],
         eye_height: 1.74f32,
+        passenger_attachments: &[Vector3::new(0f64, 1.9900000095367432f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0.699999988079071f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::OnGround,
@@ -875,6 +911,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.6f32, 1.77f32],
         eye_height: 1.3452f32,
+        passenger_attachments: &[Vector3::new(0f64, 1.7699999809265137f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::OnGround,
@@ -901,6 +939,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.3125f32, 0.3125f32],
         eye_height: 0f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.3125f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -956,6 +996,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [1.7f32, 2.375f32],
         eye_height: 2.275f32,
+        passenger_attachments: &[Vector3::new(0f64, 2.375f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::OnGround,
@@ -1011,6 +1053,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [1.7f32, 2.375f32],
         eye_height: 2.275f32,
+        passenger_attachments: &[Vector3::new(0f64, 2.375f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::OnGround,
@@ -1067,6 +1111,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.6f32, 0.7f32],
         eye_height: 0.35f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.512499988079071f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::OnGround,
@@ -1122,6 +1168,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.7f32, 0.5f32],
         eye_height: 0.45f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.5f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::OnGround,
@@ -1148,6 +1196,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [1.375f32, 0.5625f32],
         eye_height: 0.5625f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.5625f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -1174,6 +1224,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [1.375f32, 0.5625f32],
         eye_height: 0.5625f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.5625f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -1200,6 +1252,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.98f32, 0.7f32],
         eye_height: 0.595f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.1875f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -1255,6 +1309,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.4f32, 0.7f32],
         eye_height: 0.644f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.7f64, -0.1f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::OnGround,
@@ -1309,6 +1365,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.5f32, 0.3f32],
         eye_height: 0.195f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.30000001192092896f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::InWater,
@@ -1335,6 +1393,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.98f32, 0.7f32],
         eye_height: 0.595f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.1875f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -1389,6 +1449,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.49f32, 0.98f32],
         eye_height: 0.8125f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.9800000190734863f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -1444,6 +1506,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.9f32, 1.4f32],
         eye_height: 1.3f32,
+        passenger_attachments: &[Vector3::new(0f64, 1.368749976158142f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::OnGround,
@@ -1499,6 +1563,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.9f32, 2.7f32],
         eye_height: 2.3f32,
+        passenger_attachments: &[Vector3::new(0f64, 2.700000047683716f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::OnGround,
@@ -1554,6 +1620,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.6f32, 1.7f32],
         eye_height: 1.445f32,
+        passenger_attachments: &[Vector3::new(0f64, 1.7000000476837158f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::OnGround,
@@ -1580,6 +1648,8 @@ impl EntityType {
         track_deltas: false,
         dimension: [1f32, 0.25f32],
         eye_height: 0.2125f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.25f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -1606,6 +1676,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [1.375f32, 0.5625f32],
         eye_height: 0.5625f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.5625f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -1632,6 +1704,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [1.375f32, 0.5625f32],
         eye_height: 0.5625f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.5625f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -1687,6 +1761,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.9f32, 0.6f32],
         eye_height: 0.3f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.6000000238418579f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::InWater,
@@ -1742,6 +1818,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [1.3964844f32, 1.5f32],
         eye_height: 1.425f32,
+        passenger_attachments: &[Vector3::new(0f64, 1.1124999523162842f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::OnGround,
@@ -1768,6 +1846,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [1f32, 1f32],
         eye_height: 0.85f32,
+        passenger_attachments: &[Vector3::new(0f64, 1f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -1798,7 +1878,7 @@ impl EntityType {
             (Attributes::MAX_ABSORPTION, 0f64),
             (Attributes::MAX_HEALTH, 20f64),
             (Attributes::MOVEMENT_EFFICIENCY, 0f64),
-            (Attributes::MOVEMENT_SPEED, 0.2300000041723251f64),
+            (Attributes::MOVEMENT_SPEED, 0.23000000417232513f64),
             (Attributes::NAME_TAG_DISTANCE, 64f64),
             (Attributes::OXYGEN_BONUS, 0f64),
             (Attributes::SAFE_FALL_DISTANCE, 3f64),
@@ -1824,6 +1904,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.6f32, 1.95f32],
         eye_height: 1.74f32,
+        passenger_attachments: &[Vector3::new(0f64, 2.012500047683716f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0.699999988079071f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::InWater,
@@ -1850,6 +1932,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.25f32, 0.25f32],
         eye_height: 0.2125f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.25f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -1905,6 +1989,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [1.9975f32, 1.9975f32],
         eye_height: 0.99875f32,
+        passenger_attachments: &[Vector3::new(0f64, 2.3506250381469727f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::InWater,
@@ -1931,6 +2017,8 @@ impl EntityType {
         track_deltas: false,
         dimension: [2f32, 2f32],
         eye_height: 1.7f32,
+        passenger_attachments: &[Vector3::new(0f64, 2f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -1985,6 +2073,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [16f32, 8f32],
         eye_height: 6.8f32,
+        passenger_attachments: &[Vector3::new(0f64, 3f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::OnGround,
@@ -2011,6 +2101,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.25f32, 0.25f32],
         eye_height: 0.2125f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.25f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -2066,6 +2158,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.6f32, 2.9f32],
         eye_height: 2.55f32,
+        passenger_attachments: &[Vector3::new(0f64, 2.8062500953674316f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::OnGround,
@@ -2121,6 +2215,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.4f32, 0.3f32],
         eye_height: 0.13f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.23749999701976776f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::OnGround,
@@ -2176,6 +2272,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.6f32, 1.95f32],
         eye_height: 1.6575f32,
+        passenger_attachments: &[Vector3::new(0f64, 2f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0.6000000238418579f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -2202,6 +2300,8 @@ impl EntityType {
         track_deltas: false,
         dimension: [0.5f32, 0.8f32],
         eye_height: 0.68f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.800000011920929f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -2228,6 +2328,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.25f32, 0.25f32],
         eye_height: 0.2125f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.25f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -2254,6 +2356,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.5f32, 0.5f32],
         eye_height: 0.425f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.5f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -2280,6 +2384,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.25f32, 0.25f32],
         eye_height: 0.2125f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.25f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -2306,6 +2412,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.98f32, 0.98f32],
         eye_height: 0.83300006f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.9800000190734863f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -2332,6 +2440,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [1f32, 1f32],
         eye_height: 0.85f32,
+        passenger_attachments: &[Vector3::new(0f64, 1f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -2358,6 +2468,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.25f32, 0.25f32],
         eye_height: 0.2125f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.25f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -2384,6 +2496,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.25f32, 0.25f32],
         eye_height: 0.2125f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.25f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -2440,6 +2554,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.6f32, 0.7f32],
         eye_height: 0.4f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.6375f64, -0.25f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -2496,6 +2612,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.5f32, 0.5f32],
         eye_height: 0.425f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.375f64, -0.25f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::OnGround,
@@ -2522,6 +2640,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.98f32, 0.7f32],
         eye_height: 0.595f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.1875f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -2577,6 +2697,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [4f32, 4f32],
         eye_height: 2.6f32,
+        passenger_attachments: &[Vector3::new(0f64, 4.0625f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, -0.5f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::OnGround,
@@ -2632,6 +2754,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [3.6f32, 12f32],
         eye_height: 10.44f32,
+        passenger_attachments: &[Vector3::new(0f64, 12f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 3.75f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::OnGround,
@@ -2658,6 +2782,8 @@ impl EntityType {
         track_deltas: false,
         dimension: [0.5f32, 0.5f32],
         eye_height: 0f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.5f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -2712,6 +2838,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.8f32, 0.8f32],
         eye_height: 0.4f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.800000011920929f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::InWater,
@@ -2768,6 +2896,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.9f32, 1.3f32],
         eye_height: 1.105f32,
+        passenger_attachments: &[Vector3::new(0f64, 1.1124999523162842f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::OnGround,
@@ -2823,6 +2953,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.85f32, 0.85f32],
         eye_height: 0.425f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.9750000238418579f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::InWater,
@@ -2879,6 +3011,13 @@ impl EntityType {
         track_deltas: true,
         dimension: [4f32, 4f32],
         eye_height: 2.6f32,
+        passenger_attachments: &[
+            Vector3::new(0f64, 4f64, 1.7f64),
+            Vector3::new(-1.7f64, 4f64, 0f64),
+            Vector3::new(0f64, 4f64, -1.7f64),
+            Vector3::new(1.7f64, 4f64, 0f64),
+        ],
+        vehicle_attachment: Vector3::new(0f64, -0.5f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::OnGround,
@@ -2934,6 +3073,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [1.3964844f32, 1.4f32],
         eye_height: 1.19f32,
+        passenger_attachments: &[Vector3::new(0f64, 1.493749976158142f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::OnGround,
@@ -2960,6 +3101,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.98f32, 0.7f32],
         eye_height: 0.595f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.1875f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -3015,6 +3158,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [1.3964844f32, 1.6f32],
         eye_height: 1.52f32,
+        passenger_attachments: &[Vector3::new(0f64, 1.443750023841858f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::OnGround,
@@ -3045,7 +3190,7 @@ impl EntityType {
             (Attributes::MAX_ABSORPTION, 0f64),
             (Attributes::MAX_HEALTH, 20f64),
             (Attributes::MOVEMENT_EFFICIENCY, 0f64),
-            (Attributes::MOVEMENT_SPEED, 0.2300000041723251f64),
+            (Attributes::MOVEMENT_SPEED, 0.23000000417232513f64),
             (Attributes::NAME_TAG_DISTANCE, 64f64),
             (Attributes::OXYGEN_BONUS, 0f64),
             (Attributes::SAFE_FALL_DISTANCE, 3f64),
@@ -3071,6 +3216,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.6f32, 1.95f32],
         eye_height: 1.74f32,
+        passenger_attachments: &[Vector3::new(0f64, 2.075000047683716f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0.699999988079071f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::OnGround,
@@ -3126,6 +3273,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.6f32, 1.95f32],
         eye_height: 1.6575f32,
+        passenger_attachments: &[Vector3::new(0f64, 2f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0.6000000238418579f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -3152,6 +3301,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0f32, 0f32],
         eye_height: 0f32,
+        passenger_attachments: &[Vector3::new(0f64, 0f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -3207,6 +3358,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [1.4f32, 2.7f32],
         eye_height: 2.295f32,
+        passenger_attachments: &[Vector3::new(0f64, 2.700000047683716f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::OnGround,
@@ -3233,6 +3386,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.25f32, 0.25f32],
         eye_height: 0.2125f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.25f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -3259,6 +3414,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0f32, 0f32],
         eye_height: 0f32,
+        passenger_attachments: &[Vector3::new(0f64, 0f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -3285,6 +3442,8 @@ impl EntityType {
         track_deltas: false,
         dimension: [0.5f32, 0.5f32],
         eye_height: 0f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.5f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -3311,6 +3470,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [1.375f32, 0.5625f32],
         eye_height: 0.5625f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.5625f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -3337,6 +3498,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [1.375f32, 0.5625f32],
         eye_height: 0.5625f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.5625f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -3363,6 +3526,8 @@ impl EntityType {
         track_deltas: false,
         dimension: [0.375f32, 0.5f32],
         eye_height: 0.0625f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.5f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -3389,6 +3554,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0f32, 0f32],
         eye_height: 0f32,
+        passenger_attachments: &[Vector3::new(0f64, 0f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -3415,6 +3582,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.25f32, 0.25f32],
         eye_height: 0.2125f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.25f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -3470,6 +3639,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.9f32, 1.87f32],
         eye_height: 1.7765f32,
+        passenger_attachments: &[Vector3::new(0f64, 1.37f64, -0.3f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::OnGround,
@@ -3496,6 +3667,8 @@ impl EntityType {
         track_deltas: false,
         dimension: [0.25f32, 0.25f32],
         eye_height: 0.2125f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.25f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -3551,6 +3724,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.52f32, 0.52f32],
         eye_height: 0.325f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.5199999809265137f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 4f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::OnGround,
@@ -3577,6 +3752,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [1.375f32, 0.5625f32],
         eye_height: 0.5625f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.5625f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -3603,6 +3780,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [1.375f32, 0.5625f32],
         eye_height: 0.5625f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.5625f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -3656,6 +3835,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.6f32, 1.8f32],
         eye_height: 1.62f32,
+        passenger_attachments: &[Vector3::new(0f64, 1.7999999523162842f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0.6f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -3682,6 +3863,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0f32, 0f32],
         eye_height: 0f32,
+        passenger_attachments: &[Vector3::new(0f64, 0f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -3708,6 +3891,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.98f32, 0.7f32],
         eye_height: 0.595f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.1875f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -3763,6 +3948,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.9f32, 1.4f32],
         eye_height: 1.3f32,
+        passenger_attachments: &[Vector3::new(0f64, 1.368749976158142f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::OnGround,
@@ -3818,6 +4005,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [1.3964844f32, 1.6f32],
         eye_height: 1.52f32,
+        passenger_attachments: &[Vector3::new(0f64, 1.212499976158142f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::OnGround,
@@ -3874,6 +4063,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.875f32, 0.95f32],
         eye_height: 0.2751f32,
+        passenger_attachments: &[Vector3::new(0f64, 1.1375000476837158f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::InWater,
@@ -3900,6 +4091,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [1.375f32, 0.5625f32],
         eye_height: 0.5625f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.5625f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -3926,6 +4119,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [1.375f32, 0.5625f32],
         eye_height: 0.5625f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.5625f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -3982,6 +4177,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.6f32, 0.7f32],
         eye_height: 0.595f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.637499988079071f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::OnGround,
@@ -4008,6 +4205,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.25f32, 0.25f32],
         eye_height: 0.2125f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.25f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -4034,6 +4233,8 @@ impl EntityType {
         track_deltas: false,
         dimension: [0.5f32, 0.5f32],
         eye_height: 0.425f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.5f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -4060,6 +4261,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [1.375f32, 0.5625f32],
         eye_height: 0.5625f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.5625f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -4086,6 +4289,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [1.375f32, 0.5625f32],
         eye_height: 0.5625f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.5625f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -4142,6 +4347,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [1.3f32, 1.25f32],
         eye_height: 1.0625f32,
+        passenger_attachments: &[Vector3::new(0f64, 1.25f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -4197,6 +4404,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.6f32, 1.99f32],
         eye_height: 1.74f32,
+        passenger_attachments: &[Vector3::new(0f64, 1.9900000095367432f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0.699999988079071f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::OnGround,
@@ -4254,6 +4463,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.5f32, 0.9f32],
         eye_height: 0.54f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.4625000059604645f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::OnGround,
@@ -4309,6 +4520,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.9f32, 0.5f32],
         eye_height: 0.175f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.3375000059604645f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0.125f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -4364,6 +4577,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.9f32, 0.9f32],
         eye_height: 0.765f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.8687499761581421f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::OnGround,
@@ -4419,6 +4634,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.6f32, 1.95f32],
         eye_height: 1.79f32,
+        passenger_attachments: &[Vector3::new(0f64, 2.012500047683716f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0.699999988079071f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::OnGround,
@@ -4474,6 +4691,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.6f32, 1.95f32],
         eye_height: 1.79f32,
+        passenger_attachments: &[Vector3::new(0f64, 2.012500047683716f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0.699999988079071f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -4529,6 +4748,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.6f32, 1.95f32],
         eye_height: 1.6575f32,
+        passenger_attachments: &[Vector3::new(0f64, 2f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0.6000000238418579f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::OnGround,
@@ -4592,6 +4813,8 @@ impl EntityType {
         track_deltas: false,
         dimension: [0.6f32, 1.8f32],
         eye_height: 1.62f32,
+        passenger_attachments: &[Vector3::new(0f64, 1.7999999523162842f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0.6f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -4648,6 +4871,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [1.4f32, 1.4f32],
         eye_height: 1.19f32,
+        passenger_attachments: &[Vector3::new(0f64, 1.399999976158142f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::OnGround,
@@ -4674,6 +4899,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [1.375f32, 0.5625f32],
         eye_height: 0.5625f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.5625f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -4700,6 +4927,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [1.375f32, 0.5625f32],
         eye_height: 0.5625f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.5625f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -4754,6 +4983,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.7f32, 0.7f32],
         eye_height: 0.455f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.699999988079071f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::InWater,
@@ -4810,6 +5041,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.49f32, 0.6f32],
         eye_height: 0.59f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.6000000238418579f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::OnGround,
@@ -4865,6 +5098,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [1.95f32, 2.2f32],
         eye_height: 1.8700001f32,
+        passenger_attachments: &[Vector3::new(0f64, 2.2625f64, -0.0625f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::OnGround,
@@ -4919,6 +5154,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.7f32, 0.4f32],
         eye_height: 0.26f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.4000000059604645f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::InWater,
@@ -4948,7 +5185,7 @@ impl EntityType {
             (Attributes::MAX_ABSORPTION, 0f64),
             (Attributes::MAX_HEALTH, 8f64),
             (Attributes::MOVEMENT_EFFICIENCY, 0f64),
-            (Attributes::MOVEMENT_SPEED, 0.2300000041723251f64),
+            (Attributes::MOVEMENT_SPEED, 0.23000000417232513f64),
             (Attributes::NAME_TAG_DISTANCE, 64f64),
             (Attributes::OXYGEN_BONUS, 0f64),
             (Attributes::SAFE_FALL_DISTANCE, 3f64),
@@ -4974,6 +5211,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.9f32, 1.3f32],
         eye_height: 1.235f32,
+        passenger_attachments: &[Vector3::new(0f64, 1.2374999523162842f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::OnGround,
@@ -5028,6 +5267,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [1f32, 1f32],
         eye_height: 0.5f32,
+        passenger_attachments: &[Vector3::new(0f64, 1f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -5054,6 +5295,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.3125f32, 0.3125f32],
         eye_height: 0.265625f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.3125f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -5109,6 +5352,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.4f32, 0.3f32],
         eye_height: 0.13f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.23749999701976776f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::OnGround,
@@ -5164,6 +5409,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.6f32, 1.99f32],
         eye_height: 1.74f32,
+        passenger_attachments: &[Vector3::new(0f64, 1.9900000095367432f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0.699999988079071f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::OnGround,
@@ -5219,6 +5466,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [1.3964844f32, 1.6f32],
         eye_height: 1.52f32,
+        passenger_attachments: &[Vector3::new(0f64, 1.318750023841858f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::OnGround,
@@ -5274,6 +5523,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.52f32, 0.52f32],
         eye_height: 0.325f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.5199999809265137f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 4f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::OnGround,
@@ -5300,6 +5551,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.3125f32, 0.3125f32],
         eye_height: 0.265625f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.3125f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -5355,6 +5608,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [1.9f32, 1.75f32],
         eye_height: 1.05f32,
+        passenger_attachments: &[Vector3::new(0f64, 2.09375f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -5409,6 +5664,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.7f32, 1.9f32],
         eye_height: 1.7f32,
+        passenger_attachments: &[Vector3::new(0f64, 1.899999976158142f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::OnGround,
@@ -5435,6 +5692,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.25f32, 0.25f32],
         eye_height: 0.2125f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.25f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -5461,6 +5720,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.98f32, 0.7f32],
         eye_height: 0.595f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.1875f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -5487,6 +5748,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.5f32, 0.5f32],
         eye_height: 0.13f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.5f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -5542,6 +5805,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [1.4f32, 0.9f32],
         eye_height: 0.65f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.7649999856948853f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::OnGround,
@@ -5568,6 +5833,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.25f32, 0.25f32],
         eye_height: 0.2125f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.25f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -5594,6 +5861,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [1.375f32, 0.5625f32],
         eye_height: 0.5625f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.5625f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -5620,6 +5889,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [1.375f32, 0.5625f32],
         eye_height: 0.5625f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.5625f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -5674,6 +5945,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.8f32, 0.8f32],
         eye_height: 0.4f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.800000011920929f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::InWater,
@@ -5729,6 +6002,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.6f32, 1.99f32],
         eye_height: 1.74f32,
+        passenger_attachments: &[Vector3::new(0f64, 1.9900000095367432f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0.699999988079071f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::OnGround,
@@ -5784,6 +6059,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.9f32, 1.7f32],
         eye_height: 1.445f32,
+        passenger_attachments: &[Vector3::new(0f64, 1.7000000476837158f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::InLava,
@@ -5839,6 +6116,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.49f32, 0.49f32],
         eye_height: 0.175f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.49000000953674316f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 2f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::OnGround,
@@ -5894,6 +6173,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.4f32, 0.3f32],
         eye_height: 0.19500001f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.30000001192092896f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -5920,6 +6201,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0f32, 0f32],
         eye_height: 0f32,
+        passenger_attachments: &[Vector3::new(0f64, 0f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -5946,6 +6229,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.98f32, 0.98f32],
         eye_height: 0.15f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.9800000190734863f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -5972,6 +6257,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.98f32, 0.7f32],
         eye_height: 0.595f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.1875f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -6027,6 +6314,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.9f32, 1.87f32],
         eye_height: 1.7765f32,
+        passenger_attachments: &[Vector3::new(0f64, 1.37f64, -0.3f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -6053,6 +6342,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.5f32, 0.5f32],
         eye_height: 0.13f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.5f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -6107,6 +6398,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.5f32, 0.4f32],
         eye_height: 0.26f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.4000000059604645f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::InWater,
@@ -6162,6 +6455,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [1.2f32, 0.4f32],
         eye_height: 0.34f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.55625f64, -0.25f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::OnGround,
@@ -6217,6 +6512,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.4f32, 0.8f32],
         eye_height: 0.51875f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.737500011920929f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, -0.03999999910593033f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -6271,6 +6568,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.6f32, 1.95f32],
         eye_height: 1.62f32,
+        passenger_attachments: &[Vector3::new(0f64, 1.9500000476837158f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::OnGround,
@@ -6326,6 +6625,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.6f32, 1.95f32],
         eye_height: 1.6575f32,
+        passenger_attachments: &[Vector3::new(0f64, 2f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0.6000000238418579f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -6380,6 +6681,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.6f32, 1.95f32],
         eye_height: 1.62f32,
+        passenger_attachments: &[Vector3::new(0f64, 1.9500000476837158f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::OnGround,
@@ -6435,6 +6738,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.9f32, 2.9f32],
         eye_height: 2.4650002f32,
+        passenger_attachments: &[Vector3::new(0f64, 3.1500000953674316f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -6461,6 +6766,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.3125f32, 0.3125f32],
         eye_height: 0f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.3125f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -6516,6 +6823,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.6f32, 1.95f32],
         eye_height: 1.62f32,
+        passenger_attachments: &[Vector3::new(0f64, 2.262500047683716f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::OnGround,
@@ -6572,6 +6881,8 @@ impl EntityType {
         track_deltas: false,
         dimension: [0.9f32, 3.5f32],
         eye_height: 2.9750001f32,
+        passenger_attachments: &[Vector3::new(0f64, 3.5f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::OnGround,
@@ -6627,6 +6938,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.7f32, 2.4f32],
         eye_height: 2.1f32,
+        passenger_attachments: &[Vector3::new(0f64, 2.4000000953674316f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0.875f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::OnGround,
@@ -6653,6 +6966,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.3125f32, 0.3125f32],
         eye_height: 0.265625f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.3125f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -6709,6 +7024,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.6f32, 0.85f32],
         eye_height: 0.68f32,
+        passenger_attachments: &[Vector3::new(0f64, 0.81875f64, -0.0625f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::OnGround,
@@ -6764,6 +7081,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [1.3964844f32, 1.4f32],
         eye_height: 1.19f32,
+        passenger_attachments: &[Vector3::new(0f64, 1.493749976158142f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::OnGround,
@@ -6794,7 +7113,7 @@ impl EntityType {
             (Attributes::MAX_ABSORPTION, 0f64),
             (Attributes::MAX_HEALTH, 20f64),
             (Attributes::MOVEMENT_EFFICIENCY, 0f64),
-            (Attributes::MOVEMENT_SPEED, 0.2300000041723251f64),
+            (Attributes::MOVEMENT_SPEED, 0.23000000417232513f64),
             (Attributes::NAME_TAG_DISTANCE, 64f64),
             (Attributes::OXYGEN_BONUS, 0f64),
             (Attributes::SAFE_FALL_DISTANCE, 3f64),
@@ -6820,6 +7139,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.6f32, 1.95f32],
         eye_height: 1.74f32,
+        passenger_attachments: &[Vector3::new(0f64, 2.012500047683716f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0.699999988079071f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::OnGround,
@@ -6875,6 +7196,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [1.3964844f32, 1.6f32],
         eye_height: 1.52f32,
+        passenger_attachments: &[Vector3::new(0f64, 1.318750023841858f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::OnGround,
@@ -6931,6 +7254,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.875f32, 0.95f32],
         eye_height: 0.2751f32,
+        passenger_attachments: &[Vector3::new(0f64, 1.1375000476837158f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::Unrestricted,
@@ -6961,7 +7286,7 @@ impl EntityType {
             (Attributes::MAX_ABSORPTION, 0f64),
             (Attributes::MAX_HEALTH, 20f64),
             (Attributes::MOVEMENT_EFFICIENCY, 0f64),
-            (Attributes::MOVEMENT_SPEED, 0.2300000041723251f64),
+            (Attributes::MOVEMENT_SPEED, 0.23000000417232513f64),
             (Attributes::NAME_TAG_DISTANCE, 64f64),
             (Attributes::OXYGEN_BONUS, 0f64),
             (Attributes::SAFE_FALL_DISTANCE, 3f64),
@@ -6987,6 +7312,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.6f32, 1.95f32],
         eye_height: 1.74f32,
+        passenger_attachments: &[Vector3::new(0f64, 2.125f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0.699999988079071f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::OnGround,
@@ -7017,7 +7344,7 @@ impl EntityType {
             (Attributes::MAX_ABSORPTION, 0f64),
             (Attributes::MAX_HEALTH, 20f64),
             (Attributes::MOVEMENT_EFFICIENCY, 0f64),
-            (Attributes::MOVEMENT_SPEED, 0.2300000041723251f64),
+            (Attributes::MOVEMENT_SPEED, 0.23000000417232513f64),
             (Attributes::NAME_TAG_DISTANCE, 64f64),
             (Attributes::OXYGEN_BONUS, 0f64),
             (Attributes::SAFE_FALL_DISTANCE, 3f64),
@@ -7043,6 +7370,8 @@ impl EntityType {
         track_deltas: true,
         dimension: [0.6f32, 1.95f32],
         eye_height: 1.79f32,
+        passenger_attachments: &[Vector3::new(0f64, 2f64, 0f64)],
+        vehicle_attachment: Vector3::new(0f64, 0.699999988079071f64, 0f64),
         spawn_dimensions_scale: 1f32,
         spawn_restriction: SpawnRestriction {
             location: SpawnLocation::OnGround,

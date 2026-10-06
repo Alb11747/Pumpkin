@@ -106,19 +106,38 @@ pub struct SpawnOverrideStruct {
     pub spawns: Vec<SpawnEntryStruct>,
 }
 
-#[derive(Deserialize, Clone)]
+#[derive(Clone)]
 pub struct SpawnEntryStruct {
-    #[serde(rename = "type")]
     pub entity_type: String,
-    #[serde(default = "default_spawn_count", rename = "minCount")]
     pub min_count: u32,
-    #[serde(default = "default_spawn_count", rename = "maxCount")]
     pub max_count: u32,
     pub weight: u32,
 }
 
-fn default_spawn_count() -> u32 {
-    1
+impl<'de> Deserialize<'de> for SpawnEntryStruct {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Raw {
+            #[serde(rename = "type")]
+            entity_type: String,
+            #[serde(default, alias = "minCount")]
+            min_count: Option<i32>,
+            #[serde(default, alias = "maxCount")]
+            max_count: Option<i32>,
+            #[serde(default)]
+            count: Option<serde_json::Value>,
+            weight: u32,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        let (min, max) = crate::biome::spawn_count_range(raw.count, raw.min_count, raw.max_count)
+            .map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            entity_type: raw.entity_type,
+            min_count: min as u32,
+            max_count: max as u32,
+            weight: raw.weight,
+        })
+    }
 }
 
 /// Deserialized structure entry specifying its valid biomes and generation step.

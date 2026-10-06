@@ -835,6 +835,15 @@ impl EntityTracker {
     }
 
     pub fn add_entity(&self, entity: &Arc<dyn EntityBase>, world: &World) {
+        self.add_entity_excluding(entity, world, None);
+    }
+
+    pub(super) fn add_entity_excluding(
+        &self,
+        entity: &Arc<dyn EntityBase>,
+        world: &World,
+        excluded: Option<&Arc<Player>>,
+    ) {
         let entity_type = entity.get_entity().entity_type;
         let range = entity_type.client_tracking_range;
         if range == 0 {
@@ -853,7 +862,12 @@ impl EntityTracker {
         self.entity_map.insert(entity_id, tracked.clone());
 
         let players = world.players.load();
-        tracked.update_players(players.as_ref(), world);
+        let effective_range = tracked.get_effective_range();
+        for player in players.iter() {
+            if excluded.is_none_or(|excluded| !Arc::ptr_eq(excluded, player)) {
+                tracked.update_player_in_range(player, effective_range);
+            }
+        }
     }
 
     /// Must only be called after the player's own `CLogin` packet has been sent.

@@ -12,8 +12,8 @@ use super::BlockEvent;
 /// An event that occurs when a block grows.
 ///
 /// Scope:
-/// - Fired for crop random-tick growth.
-/// - Not fired yet for bonemeal growth, sapling/tree growth, kelp/cactus/sugar cane growth,
+/// - Fired for crop and kelp random-tick growth.
+/// - Not fired yet for bonemeal growth, sapling/tree growth, cactus/sugar cane growth,
 ///   mushroom spread, or other non-crop growth paths.
 #[cancellable]
 #[derive(Event, Clone)]

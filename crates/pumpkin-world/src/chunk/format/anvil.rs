@@ -37,8 +37,7 @@ pub const CHUNK_COUNT: usize = REGION_SIZE * REGION_SIZE;
 /// The number of bytes in a sector (4 KiB)
 const SECTOR_BYTES: usize = 4096;
 
-// 26.2
-pub const WORLD_DATA_VERSION: i32 = 4903;
+pub const WORLD_DATA_VERSION: i32 = crate::world_info::MAXIMUM_SUPPORTED_WORLD_DATA_VERSION;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -442,7 +441,8 @@ impl<S: SingleChunkDataSerializer> AnvilChunkFile<S> {
             chunk.serialized_data.write(&mut write).await?;
         }
 
-        write.flush().await
+        write.flush().await?;
+        write.get_ref().sync_all().await
     }
 
     /// Write entire file, disregarding saved offsets
@@ -486,6 +486,8 @@ impl<S: SingleChunkDataSerializer> AnvilChunkFile<S> {
         }
 
         write.flush().await?;
+        write.get_ref().sync_all().await?;
+        drop(write);
         tokio::fs::rename(temp_path, path).await?;
         Ok(())
     }
@@ -539,8 +541,12 @@ impl<S: SingleChunkDataSerializer + 'static> ChunkSerializer for AnvilChunkFile<
             WriteAction::Parts(parts) => self.write_indices(path, parts.iter().copied()).await,
         }?;
 
-        // If we still are in memory after this, we don't need to write again!
-        *write_action = WriteAction::Pass;
+        // A full rewrite packs sectors without updating the cached offsets.
+        // Keep rewriting the whole file until it is reloaded; using those old
+        // offsets for a subsequent in-place save would corrupt another chunk.
+        if !matches!(*write_action, WriteAction::All) {
+            *write_action = WriteAction::Pass;
+        }
         Ok(())
     }
 
@@ -1394,6 +1400,53 @@ mod tests {
         let file = AnvilChunkFile::<ChunkData>::read(region_with_first_location((2 << 8) | 1, 0));
 
         assert!(file.is_err());
+    }
+
+    #[tokio::test]
+    async fn cached_full_rewrite_never_reuses_obsolete_sector_offsets() {
+        use crate::chunk::io::LoadedData;
+        use pumpkin_config::chunk::AnvilChunkConfig;
+        use pumpkin_util::math::vector2::Vector2;
+        use std::sync::Arc;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("r.0.0.mca");
+        let mut region = AnvilChunkFile::<ChunkData>::default();
+        let chunk = Arc::new(ChunkData::empty(0, 0));
+        region
+            .update_chunk(chunk.clone(), &AnvilChunkConfig::default())
+            .await
+            .expect("first snapshot");
+        region.write(&path).await.expect("full rewrite");
+        chunk
+            .inhabited_time
+            .store(42, std::sync::atomic::Ordering::Relaxed);
+        region
+            .update_chunk(
+                chunk,
+                &AnvilChunkConfig {
+                    write_in_place: true,
+                    ..AnvilChunkConfig::default()
+                },
+            )
+            .await
+            .expect("second snapshot");
+        region.write(&path).await.expect("second write");
+        let reloaded = AnvilChunkFile::<ChunkData>::read(
+            tokio::fs::read(path).await.expect("region bytes").into(),
+        )
+        .expect("valid header after second write");
+        let (send, mut recv) = tokio::sync::mpsc::channel(1);
+        reloaded.get_chunks(vec![Vector2::new(0, 0)], send).await;
+        let Some(LoadedData::Loaded(chunk)) = recv.recv().await else {
+            panic!("full rewrite must not allow subsequent writes into the region header");
+        };
+        assert_eq!(
+            chunk
+                .inhabited_time
+                .load(std::sync::atomic::Ordering::Relaxed),
+            42
+        );
     }
 
     #[test]

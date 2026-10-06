@@ -121,6 +121,93 @@ struct Spawner {
     min_count: i32,
     /// Maximum number of entities in a spawn group.
     max_count: i32,
+    weight: u32,
+}
+
+pub(crate) fn spawn_count_range(
+    count: Option<Value>,
+    min: Option<i32>,
+    max: Option<i32>,
+) -> Result<(i32, i32), String> {
+    let range = match count {
+        Some(Value::Number(n)) => {
+            let value = n
+                .as_i64()
+                .and_then(|v| i32::try_from(v).ok())
+                .ok_or("Invalid spawn count")?;
+            (value, value)
+        }
+        Some(Value::Object(object))
+            if object.get("type").and_then(Value::as_str) == Some("minecraft:uniform") =>
+        {
+            let number = |key| {
+                object
+                    .get(key)
+                    .and_then(Value::as_i64)
+                    .and_then(|v| i32::try_from(v).ok())
+                    .ok_or("Invalid uniform spawn count")
+            };
+            (number("min_inclusive")?, number("max_inclusive")?)
+        }
+        None => (min.unwrap_or(1), max.unwrap_or(1)),
+        _ => return Err("Unsupported spawn count provider".into()),
+    };
+    if range.0 < 1 || range.1 < range.0 {
+        return Err("Invalid spawn count range".into());
+    }
+    Ok(range)
+}
+
+#[cfg(test)]
+mod spawn_count_tests {
+    use super::spawn_count_range;
+    use serde_json::json;
+
+    #[test]
+    fn parses_vanilla_counts_and_rejects_unsupported_providers() {
+        let structure: crate::structures::SpawnEntryStruct = serde_json::from_value(json!({
+            "type": "minecraft:blaze",
+            "count": {"type": "minecraft:uniform", "min_inclusive": 2, "max_inclusive": 3},
+            "weight": 10
+        }))
+        .unwrap();
+        assert_eq!((structure.min_count, structure.max_count), (2, 3));
+        let biome: super::Spawner = serde_json::from_value(json!({
+            "type": "minecraft:creeper", "count": 4, "weight": 100
+        }))
+        .unwrap();
+        assert_eq!(
+            (biome.min_count, biome.max_count, biome.weight),
+            (4, 4, 100)
+        );
+        assert_eq!(
+            spawn_count_range(Some(json!(5)), None, None).unwrap(),
+            (5, 5)
+        );
+        assert_eq!(
+            spawn_count_range(
+                Some(json!({"type": "minecraft:uniform", "min_inclusive": 2, "max_inclusive": 4})),
+                None,
+                None
+            )
+            .unwrap(),
+            (2, 4)
+        );
+        assert_eq!(spawn_count_range(None, Some(2), Some(3)).unwrap(), (2, 3));
+        assert!(
+            spawn_count_range(Some(json!({"type": "minecraft:weighted_list"})), None, None)
+                .is_err()
+        );
+        assert!(
+            spawn_count_range(
+                Some(json!({"type": "minecraft:uniform", "min_inclusive": 4, "max_inclusive": 2})),
+                None,
+                None
+            )
+            .is_err()
+        );
+        assert!(spawn_count_range(Some(json!(2147483648u64)), None, None).is_err());
+    }
 }
 
 impl<'de> Deserialize<'de> for Spawner {
@@ -134,31 +221,17 @@ impl<'de> Deserialize<'de> for Spawner {
             max_count: Option<i32>,
             #[serde(default)]
             count: Option<Value>,
+            weight: u32,
         }
 
         let raw = Raw::deserialize(deserializer)?;
-        let (min_count, max_count) = match raw.count {
-            Some(Value::Number(n)) => {
-                let value = n.as_i64().unwrap_or(1) as i32;
-                (value, value)
-            }
-            Some(Value::Object(object)) => {
-                let min = object
-                    .get("min_inclusive")
-                    .and_then(Value::as_i64)
-                    .unwrap_or(1) as i32;
-                let max = object
-                    .get("max_inclusive")
-                    .and_then(Value::as_i64)
-                    .unwrap_or(min as i64) as i32;
-                (min, max)
-            }
-            _ => (raw.min_count.unwrap_or(1), raw.max_count.unwrap_or(1)),
-        };
+        let (min_count, max_count) = spawn_count_range(raw.count, raw.min_count, raw.max_count)
+            .map_err(serde::de::Error::custom)?;
         Ok(Self {
             r#type: raw.r#type,
             min_count,
             max_count,
+            weight: raw.weight,
         })
     }
 }
@@ -169,11 +242,13 @@ impl Spawner {
         let r#type = &self.r#type;
         let min_count = &self.min_count;
         let max_count = &self.max_count;
+        let weight = self.weight;
         quote! {
             Spawner {
                 r#type: #r#type,
                 min_count: #min_count,
                 max_count: #max_count,
+                weight: #weight,
             }
         }
     }
@@ -535,11 +610,12 @@ pub fn build() -> TokenStream {
             pub water_creature: &'static [Spawner],
         }
 
-        #[derive(Debug)]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
         pub struct Spawner {
             pub r#type: &'static str,
             pub min_count: i32,
             pub max_count: i32,
+            pub weight: u32,
         }
 
         impl PartialEq for Biome {

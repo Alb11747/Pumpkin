@@ -268,6 +268,15 @@ impl BlockEntity for MobSpawnerBlockEntity {
         }
     }
 
+    fn nbt_aliases(&self) -> &'static [(&'static str, &'static str)] {
+        &[("EntityId", "SpawnData")]
+    }
+
+    fn nbt_dependencies(&self) -> &'static [(&'static str, &'static str)] {
+        // An unchanged weighted pool is opaque, but cannot revive a cleared spawn.
+        &[("SpawnPotentials", "SpawnData")]
+    }
+
     fn write_nbt(&self, nbt: &mut NbtCompound) {
         self.write_spawner_nbt(nbt);
     }

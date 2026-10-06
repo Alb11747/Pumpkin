@@ -33967,7 +33967,16 @@ static ENTITIES_MAGMA_CUBE_POOL0_ENTRIES: &[LootEntry] = &[
         weight: 1i32,
         min_count: -2i32,
         max_count: 1i32,
-        condition: LootCondition::None,
+        condition: LootCondition::AllOf(&[
+            LootCondition::Inverted(&LootCondition::DamageSourceEntity {
+                entity_type: "minecraft:frog",
+                frog_variant: None,
+            }),
+            LootCondition::CubeSize {
+                min: 2i32,
+                max: 2147483647i32,
+            },
+        ]),
         bonus_formula: Some(LootBonusFormula::UniformBonusCount(1i32)),
     },
     LootEntry {
@@ -33975,7 +33984,10 @@ static ENTITIES_MAGMA_CUBE_POOL0_ENTRIES: &[LootEntry] = &[
         weight: 1i32,
         min_count: 1i32,
         max_count: 1i32,
-        condition: LootCondition::None,
+        condition: LootCondition::DamageSourceEntity {
+            entity_type: "minecraft:frog",
+            frog_variant: Some("minecraft:warm"),
+        },
         bonus_formula: None,
     },
     LootEntry {
@@ -33983,7 +33995,10 @@ static ENTITIES_MAGMA_CUBE_POOL0_ENTRIES: &[LootEntry] = &[
         weight: 1i32,
         min_count: 1i32,
         max_count: 1i32,
-        condition: LootCondition::None,
+        condition: LootCondition::DamageSourceEntity {
+            entity_type: "minecraft:frog",
+            frog_variant: Some("minecraft:cold"),
+        },
         bonus_formula: None,
     },
     LootEntry {
@@ -33991,7 +34006,10 @@ static ENTITIES_MAGMA_CUBE_POOL0_ENTRIES: &[LootEntry] = &[
         weight: 1i32,
         min_count: 1i32,
         max_count: 1i32,
-        condition: LootCondition::None,
+        condition: LootCondition::DamageSourceEntity {
+            entity_type: "minecraft:frog",
+            frog_variant: Some("minecraft:temperate"),
+        },
         bonus_formula: None,
     },
 ];
@@ -34946,7 +34964,10 @@ static ENTITIES_SLIME_POOL0_ENTRIES: &[LootEntry] = &[
         weight: 1i32,
         min_count: 0i32,
         max_count: 2i32,
-        condition: LootCondition::None,
+        condition: LootCondition::Inverted(&LootCondition::DamageSourceEntity {
+            entity_type: "minecraft:frog",
+            frog_variant: None,
+        }),
         bonus_formula: Some(LootBonusFormula::UniformBonusCount(1i32)),
     },
     LootEntry {
@@ -34954,7 +34975,10 @@ static ENTITIES_SLIME_POOL0_ENTRIES: &[LootEntry] = &[
         weight: 1i32,
         min_count: 1i32,
         max_count: 1i32,
-        condition: LootCondition::None,
+        condition: LootCondition::DamageSourceEntity {
+            entity_type: "minecraft:frog",
+            frog_variant: None,
+        },
         bonus_formula: None,
     },
 ];
@@ -34963,7 +34987,10 @@ static ENTITIES_SLIME_POOLS: &[LootPool] = &[LootPool {
     min_rolls: 1i32,
     max_rolls: 1i32,
     empty_weight: 0i32,
-    condition: LootCondition::None,
+    condition: LootCondition::CubeSize {
+        min: 1i32,
+        max: 1i32,
+    },
 }];
 pub static ENTITIES_SLIME: LootTable = LootTable {
     pools: ENTITIES_SLIME_POOLS,

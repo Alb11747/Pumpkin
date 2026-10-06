@@ -9,14 +9,19 @@ use pumpkin_data::item_stack::ItemStack;
 use pumpkin_data::sound::Sound;
 use pumpkin_data::tag::{self, Taggable};
 use pumpkin_nbt::compound::NbtCompound;
+use pumpkin_protocol::codec::optional_int::OptionalInt;
 use pumpkin_protocol::codec::var_int::VarInt;
 
 use crate::entity::{
     Entity, EntityBase,
     ageable::{AgeableData, AgeableMob},
-    ai::goal::{
-        look_around::RandomLookAroundGoal, look_at_entity::LookAtEntityGoal, swim::SwimGoal,
-        tempt::TemptGoal, wander_around::WanderAroundGoal,
+    ai::{
+        goal::{
+            frog_shoot_tongue::FrogShootTongueGoal, look_around::RandomLookAroundGoal,
+            look_at_entity::LookAtEntityGoal, swim::SwimGoal, tempt::TemptGoal,
+            wander_around::WanderAroundGoal,
+        },
+        pathfinder::{Navigator, node::PathType},
     },
     mob::{Mob, MobEntity},
     passive::animal::Animal,
@@ -47,6 +52,16 @@ impl FrogEntity {
             tongue_target_id: AtomicI32::new(-1),
         };
         let mob_arc = Arc::new(frog);
+        {
+            let mut navigator = mob_arc
+                .mob_entity
+                .navigator
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *navigator = Navigator::amphibious(true);
+            navigator.set_pathfinding_malus(PathType::Water, 4.0);
+            navigator.set_pathfinding_malus(PathType::Trapdoor, -1.0);
+        };
         let mob_weak: Weak<dyn Mob> = {
             let mob_arc: Arc<dyn Mob> = mob_arc.clone();
             Arc::downgrade(&mob_arc)
@@ -61,12 +76,16 @@ impl FrogEntity {
 
             goal_selector.add_goal(0, Box::new(SwimGoal::default()));
             goal_selector.add_goal(1, Box::new(TemptGoal::new(1.0, FROG_FOOD, false)));
-            goal_selector.add_goal(2, Box::new(WanderAroundGoal::new(1.0)));
             goal_selector.add_goal(
-                3,
+                2,
+                Box::new(FrogShootTongueGoal::new(Arc::downgrade(&mob_arc))),
+            );
+            goal_selector.add_goal(3, Box::new(WanderAroundGoal::new(1.0)));
+            goal_selector.add_goal(
+                4,
                 LookAtEntityGoal::with_default(mob_weak, &EntityType::PLAYER, 6.0),
             );
-            goal_selector.add_goal(4, Box::new(RandomLookAroundGoal::default()));
+            goal_selector.add_goal(5, Box::new(RandomLookAroundGoal::default()));
         };
 
         mob_arc
@@ -84,6 +103,24 @@ impl FrogEntity {
             pumpkin_data::tracked_data::frog::VARIANT,
             VarInt(variant.id() as i32),
         );
+    }
+
+    pub fn set_tongue_target(&self, target: Option<i32>) {
+        self.tongue_target_id
+            .store(target.unwrap_or(-1), Ordering::Relaxed);
+        self.get_entity().set_synced_data(
+            pumpkin_data::tracked_data::frog::DATA_TONGUE_TARGET_ID,
+            OptionalInt(target),
+        );
+    }
+
+    /// Vanilla Frog.canEat restricts cube mobs to size one before consulting the food tag.
+    pub fn can_eat(target: &dyn EntityBase) -> bool {
+        let entity = target.get_entity();
+        entity
+            .entity_type
+            .has_tag(&tag::EntityType::MINECRAFT_FROG_FOOD)
+            && entity.data.load(Ordering::Relaxed) == 1
     }
 }
 
@@ -141,6 +178,7 @@ impl Mob for FrogEntity {
             pumpkin_data::tracked_data::frog::VARIANT,
             VarInt(self.get_variant().id() as i32),
         );
+        self.set_tongue_target(None);
     }
 
     fn mob_interact(&self, player: &Arc<Player>, item_stack: &mut ItemStack) -> bool {

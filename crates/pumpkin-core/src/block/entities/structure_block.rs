@@ -71,6 +71,13 @@ impl BlockEntity for StructureBlockBlockEntity {
         }
     }
 
+    fn nbt_aliases(&self) -> &'static [(&'static str, &'static str)] {
+        &[
+            ("showAir", "showair"),
+            ("showBoundingBox", "showboundingbox"),
+        ]
+    }
+
     fn write_nbt(&self, nbt: &mut NbtCompound) {
         if let Ok(name) = self.name.lock() {
             nbt.put_string("name", name.clone());

@@ -48,6 +48,10 @@ impl BlockEntity for BeehiveBlockEntity {
         }
     }
 
+    fn nbt_aliases(&self) -> &'static [(&'static str, &'static str)] {
+        &[("Bees", "bees"), ("FlowerPos", "flower_pos")]
+    }
+
     fn write_nbt(&self, nbt: &mut NbtCompound) {
         if let Ok(b) = self.bees.lock()
             && let Some(b) = b.as_ref()

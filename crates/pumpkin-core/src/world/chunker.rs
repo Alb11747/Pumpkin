@@ -39,14 +39,41 @@ pub fn is_within_chebyshev_distance(
     (target.x - center.x).abs().max((target.y - center.y).abs()) <= distance
 }
 
-#[allow(clippy::too_many_lines)]
 pub fn update_position(player: &Arc<Player>) {
+    let _ = update_position_task(player);
+}
+
+pub async fn update_position_and_wait(player: &Arc<Player>) {
+    if let Some(task) = update_position_task(player) {
+        if let Err(error) = task.await {
+            tracing::error!("Player chunk watcher update failed: {error}");
+        }
+    } else {
+        // An earlier movement task may still be queued even when the desired
+        // cylinder is unchanged. Establish its watches before the caller's
+        // post-teleport entity refresh; reconciliation does not double-count.
+        let world = player.world();
+        let (_, chunks_to_clean) = world.reconcile_player_entity_chunks(player).await;
+        if !chunks_to_clean.is_empty() {
+            world
+                .remove_unwatched_entities_in_chunks(&chunks_to_clean)
+                .await;
+            world.level.clean_entity_chunks(&chunks_to_clean);
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn update_position_task(player: &Arc<Player>) -> Option<tokio::task::JoinHandle<()>> {
     let entity = &player.get_entity();
     let new_chunk_center = entity.chunk_pos.load();
     let old_cylindrical = player.watched_section.load();
 
     // Vanilla `ChunkMap.move` -> re-pair on every move, not only on a view change.
     let world = player.world();
+    let batch_epoch = player
+        .chunk_send_epoch
+        .load(std::sync::atomic::Ordering::Relaxed);
     world.entity_tracker.update_player_position(player, &world);
 
     // This does break when a new player spawns
@@ -58,7 +85,7 @@ pub fn update_position(player: &Arc<Player>) {
     let new_cylindrical = Cylindrical::new(new_chunk_center, view_distance);
 
     if old_cylindrical == new_cylindrical {
-        return;
+        return None;
     }
 
     match player.client.as_ref() {
@@ -147,34 +174,37 @@ pub fn update_position(player: &Arc<Player>) {
     }
     player.watched_section.store(new_cylindrical);
 
-    // Make sure the watched section and the chunk watcher updates are async atomic. We want to
-    // ensure what we unload when the player disconnects is correct.
+    let mut watcher_task = None;
+    // Reconcile current intent after pending saves instead of replaying movement
+    // deltas that may be stale by the time this task runs.
     if !loading_chunks.is_empty() || !unloading_chunks.is_empty() {
-        let level = world.level.clone();
         let world_clone = world.clone();
-        let loading_chunks_clone = loading_chunks.clone();
-        let unloading_chunks_clone = unloading_chunks;
+        let player = player.clone();
 
         if let Some(server) = world.server.upgrade() {
-            server.spawn_task(async move {
-                level
-                    .mark_chunks_as_newly_watched(&loading_chunks_clone)
-                    .await;
-                let chunks_to_clean = level
-                    .mark_chunks_as_not_watched(&unloading_chunks_clone)
-                    .await;
+            watcher_task = Some(server.spawn_task(async move {
+                let (newly_watched, chunks_to_clean) =
+                    world_clone.reconcile_player_entity_chunks(&player).await;
+                // Another task may have registered this batch's references first.
+                // Deliver requested and newly registered chunks; the receiver
+                // validates the captured epoch and the player's current world.
+                let mut deliveries = loading_chunks;
+                deliveries.extend(newly_watched);
+                deliveries.sort_unstable_by_key(|position| (position.x, position.y));
+                deliveries.dedup();
+                if !deliveries.is_empty() {
+                    world_clone.spawn_world_entity_chunks(player, deliveries, batch_epoch);
+                }
 
                 if !chunks_to_clean.is_empty() {
                     world_clone
-                        .remove_entities_in_chunks(&chunks_to_clean)
+                        .remove_unwatched_entities_in_chunks(&chunks_to_clean)
                         .await;
                     world_clone.level.clean_entity_chunks(&chunks_to_clean);
                 }
-            });
+            }));
         }
     }
 
-    if !loading_chunks.is_empty() {
-        world.spawn_world_entity_chunks(player.clone(), loading_chunks);
-    }
+    watcher_task
 }

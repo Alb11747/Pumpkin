@@ -692,7 +692,8 @@ pub fn check_spawn_rules(
         {
             return false;
         }
-        return rand::random_range(0..20) == 0 || !world.can_see_sky(pos);
+        return rand::random_range(0..20) == 0
+            || !crate::world::natural_spawner::can_see_sky_from_below_water(world, pos);
     }
 
     // Generic mob spawn rules (Iron Golem, Snow Golem, Villager, Phantom, Shulker, Wandering Trader, Ender Dragon, etc.)

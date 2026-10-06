@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use pumpkin_data::{attributes::Attributes, sound::Sound};
+use pumpkin_nbt::compound::NbtCompound;
 
 use crate::entity::{
     Entity, EntityBase,
@@ -61,6 +62,14 @@ impl CustomSound for MagmaCubeEntity {
 }
 
 impl Mob for MagmaCubeEntity {
+    fn mob_write_nbt(&self, nbt: &mut NbtCompound) {
+        self.slime.mob_write_nbt(nbt);
+    }
+
+    fn mob_read_nbt(&self, nbt: &NbtCompound) {
+        self.slime.mob_read_nbt(nbt);
+    }
+
     fn get_mob_entity(&self) -> &MobEntity {
         self.slime.get_mob_entity()
     }

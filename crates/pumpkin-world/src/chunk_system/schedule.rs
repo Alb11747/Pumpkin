@@ -839,7 +839,7 @@ impl GenerationSchedule {
         }
     }
 
-    fn process_unload_queue(&mut self) {
+    fn process_unload_queue(&mut self, level: &Level) {
         if self.unload_chunks.is_empty() {
             return;
         }
@@ -877,17 +877,33 @@ impl GenerationSchedule {
             holder.occupied_by = EdgeKey::null();
 
             if holder.public {
-                self.unpublish_chunk(pos);
+                // Finish every already-cloned block-entity tick before taking the
+                // final snapshot. Removing the canonical entry under the same
+                // fence also prevents the next batch from finding retired entities.
+                let _block_entity_ticks = level
+                    .block_entity_tick_lock
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let removed = self.public_chunk_map.remove_if(&pos, |_, chunk| {
+                    if let Some(portal) = level.world_portal.load().as_ref() {
+                        portal.unload_chunk_block_entities(chunk);
+                    }
+                    true
+                });
+                if removed.is_some() {
+                    self.loaded_chunk_changes
+                        .push(LoadedChunkChange::Unloaded(pos));
+                }
                 holder.public = false;
             }
 
             if let Some(tmp) = holder.chunk {
                 match tmp {
                     Chunk::Level(chunk) => {
-                        // Save chunk to disk if dirty
-                        if chunk.is_dirty() {
-                            chunks.push((pos, Chunk::Level(chunk)));
-                        }
+                        // An in-flight autosave temporarily claims the dirty flag.
+                        // Queue this canonical instance even then: it can become
+                        // dirty again before that save commits.
+                        chunks.push((pos, Chunk::Level(chunk)));
                     }
                     Chunk::Proto(proto) => {
                         if !matches!(proto.stage, StagedChunkEnum::Empty | StagedChunkEnum::None) {
@@ -1263,7 +1279,7 @@ impl GenerationSchedule {
         loop {
             if level.should_unload.swap(false, Relaxed) {
                 self.garbage_collect_dependencies();
-                self.process_unload_queue();
+                self.process_unload_queue(level);
             }
             if level.should_save.swap(false, Relaxed) {
                 self.save_all_chunk(false);
@@ -1271,7 +1287,7 @@ impl GenerationSchedule {
             if level.shut_down_chunk_system.load(Relaxed) {
                 info!("Saving chunks before shutdown...");
                 self.garbage_collect_dependencies();
-                self.process_unload_queue();
+                self.process_unload_queue(level);
                 self.save_all_chunk(true);
                 break;
             }
@@ -1287,7 +1303,7 @@ impl GenerationSchedule {
             // is what puts stale dependency holders into the queue in the first place.
             if self.last_unload.elapsed() >= std::time::Duration::from_secs(1) {
                 self.garbage_collect_dependencies();
-                self.process_unload_queue();
+                self.process_unload_queue(level);
                 self.last_unload = std::time::Instant::now();
             }
 

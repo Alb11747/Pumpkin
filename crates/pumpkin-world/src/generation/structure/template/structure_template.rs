@@ -235,6 +235,22 @@ pub struct PaletteEntry {
 }
 
 impl PaletteEntry {
+    #[must_use]
+    pub fn from_block_state(id: pumpkin_data::BlockStateId) -> Self {
+        let block = pumpkin_data::Block::from_state_id(id);
+        let name = format!(
+            "minecraft:{}",
+            block.name.strip_prefix("minecraft:").unwrap_or(block.name)
+        );
+        let properties = block.properties(id).map_or_else(Vec::new, |properties| {
+            properties
+                .to_props()
+                .into_iter()
+                .map(|(key, value)| (key.to_owned(), value.to_string()))
+                .collect()
+        });
+        Self { name, properties }
+    }
     /// Creates a new palette entry with no properties.
     #[must_use]
     pub const fn new(name: String) -> Self {
@@ -323,28 +339,37 @@ impl PaletteEntry {
     /// Deserializes a palette entry from an NBT compound tag.
     pub fn from_nbt_compound(entry_compound: &NbtCompound) -> Result<Self, TemplateError> {
         // 26.3 renamed the palette keys from Name and Properties to id and properties
-        let name = entry_compound
-            .get_string("id")
-            .or_else(|| entry_compound.get_string("Name"))
+        let name_tag = entry_compound
+            .get("id")
+            .or_else(|| entry_compound.get("Name"));
+        let name = name_tag
             .ok_or(TemplateError::MissingField("palette.id"))?
+            .extract_string()
+            .ok_or(TemplateError::InvalidFieldType("palette.id"))?
             .to_string();
 
-        let properties: Vec<(String, String)> = entry_compound
-            .get_compound("properties")
-            .or_else(|| entry_compound.get_compound("Properties"))
-            .map_or_else(Vec::new, |props_compound| {
+        let properties_tag = entry_compound
+            .get("properties")
+            .or_else(|| entry_compound.get("Properties"));
+        let properties: Vec<(String, String)> = match properties_tag {
+            None => Vec::new(),
+            Some(properties) => {
+                let props_compound = properties
+                    .extract_compound()
+                    .ok_or(TemplateError::InvalidFieldType("palette.properties"))?;
                 props_compound
                     .child_tags
                     .iter()
-                    .filter_map(|(key, value)| {
+                    .map(|(key, value)| {
                         if let NbtTag::String(v) = value {
-                            Some((key.to_string(), v.to_string()))
+                            Ok((key.to_string(), v.to_string()))
                         } else {
-                            None
+                            Err(TemplateError::InvalidFieldType("palette.properties.value"))
                         }
                     })
-                    .collect()
-            });
+                    .collect::<Result<_, _>>()?
+            }
+        };
 
         Ok(Self { name, properties })
     }
@@ -1461,5 +1486,36 @@ mod tests {
                 .any(|entry| !entry.properties.is_empty() && entry.name.contains("trapdoor")),
             "the palette must keep the block properties"
         );
+    }
+
+    #[test]
+    fn palette_modern_fields_take_precedence_and_reject_malformed_values() {
+        let mut entry = NbtCompound::new();
+        entry.put_string("Name", "minecraft:oak_log".into());
+        let mut old_props = NbtCompound::new();
+        old_props.put_string("axis", "x".into());
+        entry.put_compound("Properties", old_props);
+        assert_eq!(
+            PaletteEntry::from_nbt_compound(&entry).unwrap().properties,
+            [("axis".into(), "x".into())]
+        );
+        entry.put_string("id", "minecraft:birch_log".into());
+        let mut props = NbtCompound::new();
+        props.put_string("axis", "z".into());
+        entry.put_compound("properties", props);
+        let decoded = PaletteEntry::from_nbt_compound(&entry).unwrap();
+        assert_eq!(decoded.name, "minecraft:birch_log");
+        assert_eq!(decoded.properties, [("axis".into(), "z".into())]);
+        let encoded = decoded.to_nbt_compound();
+        assert!(encoded.get("Name").is_none() && encoded.get("Properties").is_none());
+        entry.put_int("id", 1);
+        assert!(PaletteEntry::from_nbt_compound(&entry).is_err());
+        entry.put_string("id", "minecraft:birch_log".into());
+        entry.put_int("properties", 1);
+        assert!(PaletteEntry::from_nbt_compound(&entry).is_err());
+        let mut invalid = NbtCompound::new();
+        invalid.put_int("axis", 1);
+        entry.put_compound("properties", invalid);
+        assert!(PaletteEntry::from_nbt_compound(&entry).is_err());
     }
 }

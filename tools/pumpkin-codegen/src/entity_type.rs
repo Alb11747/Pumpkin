@@ -44,6 +44,10 @@ pub struct EntityType {
     pub dimension: [f32; 2],
     /// Eye height in blocks, used for line-of-sight calculations.
     pub eye_height: f32,
+    /// Unrotated attachment points, including vanilla defaults, in passenger order.
+    pub passenger_attachments: Vec<[f64; 3]>,
+    /// Unrotated attachment point used when this entity rides another entity.
+    pub vehicle_attachment: [f64; 3],
     /// Scale factor for spawn dimensions (e.g. slimes/magma cubes).
     pub spawn_dimensions_scale: f32,
     /// Spawn location restrictions for natural spawning.
@@ -86,6 +90,17 @@ pub enum MobCategory {
 
 /// Pairs a raw entity name string with its deserialized [`EntityType`] data for token generation.
 pub struct NamedEntityType<'a>(&'a str, &'a EntityType);
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn attachment_json_preserves_vanilla_double_precision() {
+        // Official 26.3 copper golem attachment. serde_json without float_roundtrip
+        // rounds this decimal one ULP upward before the generator ever sees it.
+        let attachment: [f64; 3] = serde_json::from_str("[0.0,0.9800000190734863,0.0]").unwrap();
+        assert_eq!(attachment[1].to_bits(), 0x3fef_5c29_0000_0000);
+    }
+}
 
 impl ToTokens for NamedEntityType<'_> {
     /// Emits an `EntityType { … }` struct literal token stream for the wrapped entity.
@@ -173,6 +188,14 @@ impl ToTokens for NamedEntityType<'_> {
         let fire_immune = entity.fire_immune;
         let eye_height = entity.eye_height;
         assert!(
+            !entity.passenger_attachments.is_empty(),
+            "missing passenger attachment for {name}"
+        );
+        let passenger_attachments = entity.passenger_attachments.iter().map(|[x, y, z]| {
+            quote! { Vector3::new(#x, #y, #z) }
+        });
+        let [vehicle_x, vehicle_y, vehicle_z] = entity.vehicle_attachment;
+        assert!(
             !(entity.mob.is_none() && name != "player"),
             "missing field 'mob', entity name {name}"
         );
@@ -212,6 +235,8 @@ impl ToTokens for NamedEntityType<'_> {
                 track_deltas: #track_deltas,
                 dimension: [#dimension0, #dimension1], // Correctly construct the array
                 eye_height: #eye_height,
+                passenger_attachments: &[#(#passenger_attachments),*],
+                vehicle_attachment: Vector3::new(#vehicle_x, #vehicle_y, #vehicle_z),
                 spawn_dimensions_scale: #spawn_dimensions_scale,
                 spawn_restriction: #spawn_restriction,
                 resource_name: #name,
@@ -286,6 +311,8 @@ pub fn build() -> TokenStream {
             pub track_deltas: bool,
             pub dimension: [f32; 2],
             pub eye_height: f32,
+            pub passenger_attachments: &'static [Vector3<f64>],
+            pub vehicle_attachment: Vector3<f64>,
             pub spawn_dimensions_scale: f32,
             pub spawn_restriction: SpawnRestriction,
             pub resource_name: &'static str,

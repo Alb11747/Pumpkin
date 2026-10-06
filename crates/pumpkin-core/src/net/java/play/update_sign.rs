@@ -56,17 +56,11 @@ impl JavaClient {
             Box::<str>::from(sign_data.line_4),
         ];
 
-        text.messages
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone_from(&new_messages);
-        // We do not filter anything, so the filtered copy has to track the raw one. Leaving it
-        // empty makes it differ, which puts an empty `filtered_messages` on the wire and blanks
-        // the sign for clients that render with text filtering enabled.
-        *text
-            .filtered_messages
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = new_messages;
+        for (index, message) in new_messages.into_iter().enumerate() {
+            // Vanilla treats submitted lines as literal text and retains each
+            // old line's style. With no filtering, both copies follow the edit.
+            text.set_message_with_filter(index, message, None, player.is_text_filtering_enabled());
+        }
         *sign_entity
             .currently_editing_player()
             .lock()

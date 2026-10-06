@@ -245,7 +245,7 @@ use pumpkin_data::particle::Particle;
 use pumpkin_data::sound::{Sound, SoundCategory};
 use pumpkin_data::statistic::StatisticCategory;
 use pumpkin_data::tag::Taggable;
-use pumpkin_data::{Block, BlockState, Enchantment, screen::WindowType, tag, translation};
+use pumpkin_data::{Block, BlockId, BlockState, Enchantment, screen::WindowType, tag, translation};
 use pumpkin_inventory::player::{
     player_inventory::PlayerInventory, player_screen_handler::PlayerScreenHandler,
 };
@@ -322,6 +322,7 @@ use pumpkin_data::potion::Effect;
 const MAX_CACHED_SIGNATURES: u8 = 128; // Vanilla: 128
 const MAX_PREVIOUS_MESSAGES: u8 = 20; // Vanilla: 20
 
+#[cfg(test)]
 fn write_root_vehicle(nbt: &mut NbtCompound, uuid: Uuid) {
     let value = uuid.as_u128();
     let mut root_vehicle = NbtCompound::new();
@@ -361,7 +362,99 @@ fn read_root_vehicle(nbt: &NbtCompound) -> Option<Uuid> {
     ))
 }
 
-pub const DATA_VERSION: i32 = 4903; // 26.2
+// Vanilla infers RootVehicle's world from the player's Dimension. A pending
+// import can outlive a Pumpkin world transfer, so retain its original ownership
+// explicitly instead of interpreting it in the player's next saved dimension.
+const ROOT_VEHICLE_ORIGIN: &str = "pumpkin:origin";
+const RETAINED_ROOT_VEHICLE: &str = "pumpkin:retained_root_vehicle";
+const ROOT_VEHICLE_ARCHIVE: &str = "pumpkin:vehicle_archive";
+
+fn vehicle_world_key(world: &World) -> String {
+    let root = &world.level.level_folder.root_folder;
+    let server = world.server.upgrade();
+    let server_root = server
+        .as_ref()
+        .map(|server| server.basic_config.get_world_path());
+    let path = server_root
+        .as_ref()
+        .and_then(|server_root| root.strip_prefix(server_root).ok())
+        .unwrap_or(root);
+    if path.as_os_str().is_empty() {
+        ".".to_owned()
+    } else {
+        path.to_string_lossy().replace('\\', "/")
+    }
+}
+
+fn bind_root_vehicle_origin(root: &mut NbtCompound, dimension: &str, world: &str) {
+    // Do not reinterpret an explicit but unknown/malformed provenance record.
+    if root.get(ROOT_VEHICLE_ORIGIN).is_none() {
+        let mut origin = NbtCompound::new();
+        origin.put_string("dimension", dimension.to_owned());
+        origin.put_string("world", world.to_owned());
+        root.put_compound(ROOT_VEHICLE_ORIGIN, origin);
+    }
+}
+
+fn root_vehicle_origin_matches(root: &NbtCompound, dimension: &str, world: &str) -> bool {
+    root.get_compound(ROOT_VEHICLE_ORIGIN)
+        .is_some_and(|origin| {
+            origin.get_string("dimension") == Some(dimension)
+                && origin.get_string("world") == Some(world)
+        })
+}
+
+fn prepare_root_vehicle_mount(
+    pending: &mut Option<NbtCompound>,
+    retained: &mut Option<NbtTag>,
+    matches: impl Fn(&NbtCompound) -> bool,
+) -> Option<NbtTag> {
+    if pending.as_ref().is_some_and(&matches) {
+        pending.take();
+    } else if retained
+        .as_ref()
+        .and_then(NbtTag::extract_compound)
+        .is_some_and(matches)
+    {
+        // A restored archive must not overwrite the other unresolved record
+        // when its next live snapshot replaces RootVehicle.
+        *retained = pending.take().map(NbtTag::Compound);
+    } else if let Some(pending) = pending.take() {
+        return retained.replace(NbtTag::Compound(pending));
+    }
+    None
+}
+
+fn archive_root_vehicle(original: &mut NbtCompound, record: NbtTag) {
+    let envelope = |record| {
+        let mut entry = NbtCompound::new();
+        entry.put("record", record);
+        NbtTag::Compound(entry)
+    };
+    let mut archive = match original.child_tags.remove(ROOT_VEHICLE_ARCHIVE) {
+        Some(NbtTag::List(entries))
+            if entries
+                .iter()
+                .all(|entry| matches!(entry, NbtTag::Compound(_))) =>
+        {
+            entries
+        }
+        Some(opaque) => vec![envelope(opaque)],
+        None => Vec::new(),
+    };
+    archive.push(envelope(record));
+    original.put(ROOT_VEHICLE_ARCHIVE, NbtTag::List(archive));
+}
+
+fn bind_vehicle_snapshot(root: &mut NbtCompound, world: &World) {
+    bind_root_vehicle_origin(
+        root,
+        world.dimension.minecraft_name,
+        &vehicle_world_key(world),
+    );
+}
+
+pub const DATA_VERSION: i32 = pumpkin_world::chunk::format::anvil::WORLD_DATA_VERSION;
 
 /// Food exhaustion applied for every block a player mines.
 ///
@@ -395,12 +488,14 @@ const OPTIONAL_PLAYER_NBT_FIELDS: &[&str] = &[
     "SpawnZ",
     "SpawnDimension",
     "SpawnForced",
+    "SpawnAngle",
     "RootVehicle",
+    RETAINED_ROOT_VEHICLE,
 ];
 
 fn merge_player_nbt(original: &NbtCompound, mut modeled: NbtCompound) -> NbtCompound {
-    // The current RootVehicle codec models Attach only. Retain the mounted
-    // entity subtree only while it still belongs to that same attached vehicle.
+    // Preserve unknown wrapper fields only while the attachment is unchanged;
+    // a freshly modeled Entity snapshot replaces the imported subtree.
     if read_root_vehicle(original).is_some()
         && read_root_vehicle(original) == read_root_vehicle(&modeled)
         && let (Some(saved), Some(current)) = (
@@ -416,8 +511,15 @@ fn merge_player_nbt(original: &NbtCompound, mut modeled: NbtCompound) -> NbtComp
     for field in OPTIONAL_PLAYER_NBT_FIELDS {
         merged.child_tags.remove(*field);
     }
-    if modeled.get("respawn").is_none() && modeled.get("SpawnX").is_none() {
-        merged.child_tags.remove("SpawnAngle");
+    if let (Some(saved), Some(current)) = (
+        original.get_compound("respawn"),
+        modeled.get_compound("respawn"),
+    ) {
+        let mut respawn = saved.clone();
+        // `angle` was Pumpkin's old spelling, superseded by vanilla yaw/pitch.
+        respawn.child_tags.remove("angle");
+        respawn.child_tags.extend(current.child_tags.clone());
+        modeled.put_compound("respawn", respawn);
     }
     merged.child_tags.extend(modeled.child_tags);
     merged
@@ -551,7 +653,9 @@ pub struct Player {
     pub held_chunk_tickets: Mutex<Option<(Option<i8>, Option<i8>)>>,
     pub chunk_send_epoch: AtomicU32,
     pub has_played_before: AtomicBool,
-    root_vehicle_uuid: AtomicCell<Option<Uuid>>,
+    restoring_vehicle: AtomicBool,
+    pending_root_vehicle: std::sync::Mutex<Option<NbtCompound>>,
+    retained_root_vehicle: std::sync::Mutex<Option<NbtTag>>,
     pub chat_session: Arc<Mutex<ChatSession>>,
     pub signature_cache: Mutex<MessageCache>,
     pub player_screen_handler: Arc<std::sync::Mutex<PlayerScreenHandler>>,
@@ -858,7 +962,9 @@ impl Player {
             last_food_saturation: AtomicBool::new(true),
             subscribed_debug_sample: AtomicBool::new(false),
             has_played_before: AtomicBool::new(false),
-            root_vehicle_uuid: AtomicCell::new(None),
+            restoring_vehicle: AtomicBool::new(false),
+            pending_root_vehicle: std::sync::Mutex::new(None),
+            retained_root_vehicle: std::sync::Mutex::new(None),
             chat_session: Arc::new(Mutex::new(ChatSession::default())), // Placeholder value until the player actually sets their session id
             signature_cache: Mutex::new(MessageCache::default()),
             player_screen_handler: player_screen_handler.clone(),
@@ -1248,11 +1354,23 @@ impl Player {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         if let Some(vehicle) = vehicle {
-            self.root_vehicle_uuid
-                .store(Some(vehicle.get_entity().entity_uuid));
+            let snapshot =
+                crate::world::entity_storage::save_player_vehicle(&vehicle).map(|mut root| {
+                    bind_vehicle_snapshot(&mut root, &vehicle.get_entity().world.load());
+                    root
+                });
+            *self
+                .pending_root_vehicle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = snapshot;
             vehicle
                 .get_entity()
                 .remove_passenger_on_disconnect(self.entity_id());
+            *self
+                .get_entity()
+                .vehicle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         }
 
         self.stats
@@ -1281,16 +1399,20 @@ impl Player {
         let level = &world.level;
 
         // Decrement the value of watched chunks
-        let chunks_to_clean = level.mark_chunks_as_not_watched(radial_chunks).await;
+        let chunks_to_clean = world.release_player_entity_chunks(self).await;
         // Remove chunks with no watchers from the cache
         if !chunks_to_clean.is_empty() {
-            world.remove_entities_in_chunks(&chunks_to_clean).await;
+            world
+                .remove_unwatched_entities_in_chunks(&chunks_to_clean)
+                .await;
             level.clean_entity_chunks(&chunks_to_clean);
         }
         // Remove left over entries from all possiblily loaded chunks
         let cleaned_chunks = level.clean_memory();
         if !cleaned_chunks.is_empty() {
-            world.remove_entities_in_chunks(&cleaned_chunks).await;
+            world
+                .remove_unwatched_entities_in_chunks(&cleaned_chunks)
+                .await;
             level.clean_entity_chunks(&cleaned_chunks);
         }
 
@@ -1304,20 +1426,107 @@ impl Player {
         //self.world().level.list_cached();
     }
 
+    pub(crate) fn pending_root_vehicle(&self) -> Option<NbtCompound> {
+        self.pending_root_vehicle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub(crate) fn pending_root_vehicle_for_world(&self, world: &World) -> Option<NbtCompound> {
+        let world_key = vehicle_world_key(world);
+        let matches = |root: &NbtCompound| {
+            root_vehicle_origin_matches(root, world.dimension.minecraft_name, &world_key)
+        };
+        self.pending_root_vehicle().filter(matches).or_else(|| {
+            self.retained_root_vehicle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .and_then(NbtTag::extract_compound)
+                .filter(|root| matches(root))
+                .cloned()
+        })
+    }
+
+    fn pending_vehicle_matches(&self, uuid: Uuid, world: &World) -> bool {
+        let world_key = vehicle_world_key(world);
+        let matches = |root: &NbtCompound| {
+            root.get_uuid("Attach") == Some(uuid)
+                && root_vehicle_origin_matches(root, world.dimension.minecraft_name, &world_key)
+        };
+        self.pending_root_vehicle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(matches)
+            || self
+                .retained_root_vehicle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .and_then(NbtTag::extract_compound)
+                .is_some_and(matches)
+    }
+
+    // Called after mount plugins accept, before changing either vehicle backlink.
+    // Keep one additional automatic restore candidate. Older unresolved records
+    // remain inert NBT archives so preserving imports never prevents normal riding.
+    pub(crate) fn prepare_vehicle_mount(&self, vehicle: &dyn EntityBase) {
+        let world = vehicle.get_entity().world.load();
+        let world_key = vehicle_world_key(&world);
+        let matches = |root: &NbtCompound| {
+            root.get_uuid("Attach") == Some(vehicle.get_entity().entity_uuid)
+                && root_vehicle_origin_matches(root, world.dimension.minecraft_name, &world_key)
+        };
+        let mut pending = self
+            .pending_root_vehicle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut retained = self
+            .retained_root_vehicle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let archived = prepare_root_vehicle_mount(&mut pending, &mut retained, matches);
+        drop(retained);
+        drop(pending);
+        if let Some(archived) = archived {
+            archive_root_vehicle(
+                &mut self
+                    .original_player_nbt
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                archived,
+            );
+        }
+    }
+
     pub(crate) fn try_restore_vehicle(self: &Arc<Self>, vehicle: &Arc<dyn EntityBase>) {
-        // Claim the UUID atomically, otherwise blank it
-        // between a non-matching swap and restore.
-        if self
-            .root_vehicle_uuid
-            .compare_exchange(Some(vehicle.get_entity().entity_uuid), None)
-            .is_err()
+        let world = self.world();
+        if self.client.closed()
+            || self.get_entity().is_removed()
+            || self.get_entity().has_vehicle()
+            || !self.pending_vehicle_matches(vehicle.get_entity().entity_uuid, &world)
+            || vehicle.get_entity().world.load().uuid != world.uuid
+            || world
+                .get_player_by_uuid(self.gameprofile.id)
+                .is_none_or(|member| !Arc::ptr_eq(&member, self))
+            || world
+                .get_entity_by_uuid(vehicle.get_entity().entity_uuid)
+                .is_none_or(|admitted| !Arc::ptr_eq(&admitted, vehicle))
+            || !crate::world::entity_storage::supports_player_vehicle(vehicle)
+            || self
+                .restoring_vehicle
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
         {
             return;
         }
-
         vehicle
             .get_entity()
             .add_passenger(vehicle.clone(), self.clone());
+        // Failed/cancelled mounts leave both records untouched for the next save.
+        self.restoring_vehicle.store(false, Ordering::Release);
     }
 
     pub fn clean_up_chunk_tickets(&self, level: &Arc<pumpkin_world::level::Level>) {
@@ -1915,7 +2124,8 @@ impl Player {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(RespawnPoint {
             dimension,
             position: final_block_pos,
-            yaw,
+            yaw: pumpkin_util::math::wrap_degrees(yaw),
+            pitch: pitch.clamp(-90.0, 90.0),
             force: forced,
         });
         true
@@ -1936,10 +2146,10 @@ impl Player {
     /// # Note
     /// This function does NOT send any packets. The caller is responsible for
     /// sending `NoRespawnBlockAvailable` if this returns `None`.
-    pub async fn calculate_respawn_point(&self) -> Option<CalculatedRespawnPoint> {
-        type BedProperties = pumpkin_data::block_properties::WhiteBedLikeProperties;
-        type AnchorProperties = pumpkin_data::block_properties::RespawnAnchorLikeProperties;
-
+    pub async fn calculate_respawn_point(
+        &self,
+        consume_spawn_block: bool,
+    ) -> Option<CalculatedRespawnPoint> {
         let respawn_point = {
             let respawn_guard = self
                 .respawn_point
@@ -1949,187 +2159,84 @@ impl Player {
         };
         let world = if self.world().dimension == respawn_point.dimension {
             self.world()
-        } else if let Some(server) = self.world().server.upgrade() {
-            server.get_world_from_dimension(&respawn_point.dimension)
         } else {
             self.world()
+                .server
+                .upgrade()?
+                .worlds
+                .load()
+                .iter()
+                .find(|world| world.dimension == respawn_point.dimension)?
+                .clone()
         };
-        let pos = &respawn_point.position;
-
-        // Ensure chunks around the spawn position are fetched
-        let min_chunk_x = (pos.0.x - 2) >> 4;
-        let max_chunk_x = (pos.0.x + 2) >> 4;
-        let min_chunk_z = (pos.0.z - 2) >> 4;
-        let max_chunk_z = (pos.0.z + 2) >> 4;
-        for cx in min_chunk_x..=max_chunk_x {
-            for cz in min_chunk_z..=max_chunk_z {
-                world
-                    .level
-                    .get_or_fetch_chunk(Vector2::new(cx, cz), |_| ())
-                    .await;
-            }
-        }
-
-        let (block, state_id) = world.get_block_and_state_id(pos);
-
-        // If force is set (from /spawnpoint command), validate position is safe
-        if respawn_point.force {
-            // For forced spawn, check if both the block and block above allow mob spawn
-            let block_state = world.get_block_state(pos);
-            let above_state = world.get_block_state(&pos.up());
-
-            // Check if blocks are passable (non-solid or air)
-            let block_safe = block_state.is_air() || !block_state.is_solid();
-            let above_safe = above_state.is_air() || !above_state.is_solid();
-
-            if block_safe && above_safe {
-                let position = Vector3::new(
-                    f64::from(pos.0.x) + 0.5,
-                    f64::from(pos.0.y) + 0.1,
-                    f64::from(pos.0.z) + 0.5,
-                );
-                debug!(
-                    "Returning forced spawn point at {:?}, dimension: {:?}",
-                    position, respawn_point.dimension
-                );
-                return Some(CalculatedRespawnPoint {
-                    position,
-                    yaw: respawn_point.yaw,
-                    pitch: 0.0,
-                    dimension: respawn_point.dimension.clone(),
-                });
-            }
-            return None;
-        }
-
-        // Handle bed respawn
-        if block.has_tag(&tag::Block::MINECRAFT_BEDS) {
-            let bed_props = BedProperties::from_state_id(state_id);
-            let facing = bed_props.facing;
-
-            // Try positions around the bed based on facing direction
-            // Vanilla tries multiple offset patterns; we use a simplified version
-            if let Some(spawn_pos) = Self::find_bed_spawn_position(&world, pos, facing) {
-                return Some(CalculatedRespawnPoint {
-                    position: spawn_pos,
-                    yaw: respawn_point.yaw,
-                    pitch: 0.0,
-                    dimension: respawn_point.dimension.clone(),
-                });
-            }
-            return None;
-        }
-
-        // Handle respawn anchor (Nether)
-        if block == &Block::RESPAWN_ANCHOR {
-            let anchor_props = AnchorProperties::from_state_id(state_id);
-            let charges = anchor_props.charges;
-
-            // Anchor needs at least 1 charge to work
-            if charges == 0 {
-                return None;
-            }
-
-            // Try positions around the anchor
-            if let Some(spawn_pos) = Self::find_anchor_spawn_position(&world, pos) {
-                // Decrement charges after successful respawn position found
-                let new_charges = charges - 1;
-                let mut new_props = anchor_props;
-                new_props.charges = new_charges;
-                world.set_block_state(
-                    pos,
-                    new_props.to_state_id(block),
-                    pumpkin_world::world::BlockFlags::NOTIFY_ALL,
-                );
-
-                return Some(CalculatedRespawnPoint {
-                    position: spawn_pos,
-                    yaw: respawn_point.yaw,
-                    pitch: 0.0,
-                    dimension: respawn_point.dimension.clone(),
-                });
-            }
-            return None;
-        }
-
-        None
+        respawn_point
+            .find_respawn_and_use_spawn_block(&world, consume_spawn_block)
+            .await
     }
 
-    /// Find a valid spawn position around a bed.
-    /// Vanilla uses a complex algorithm based on bed facing direction.
-    /// We use a simplified version that tries cardinal directions first.
+    // AbstractBedBlock.findStandUpPosition, including yaw-dependent side selection
+    // and the separate lower-level search for bunk beds.
     fn find_bed_spawn_position(
-        world: &Arc<crate::world::World>,
+        world: &Arc<World>,
         bed_pos: &BlockPos,
         facing: HorizontalFacing,
+        yaw: f32,
     ) -> Option<Vector3<f64>> {
-        // Get offsets based on bed facing direction (vanilla-like order)
-        let offsets = Self::get_bed_spawn_offsets(facing);
-
-        for (dx, dz) in offsets {
-            let check_pos = BlockPos(Vector3::new(
-                bed_pos.0.x + dx,
-                bed_pos.0.y,
-                bed_pos.0.z + dz,
-            ));
-
-            if let Some(pos) = Self::find_respawn_pos(world, &check_pos) {
-                return Some(pos);
+        let forward = facing.to_offset();
+        let (fx, fz) = (forward.x, forward.z);
+        let (mut sx, mut sz) = (-fz, fx);
+        let radians = yaw.to_radians();
+        if sx as f32 * -pumpkin_util::math::sin(radians)
+            + sz as f32 * pumpkin_util::math::cos(radians)
+            > 0.0
+        {
+            sx = -sx;
+            sz = -sz;
+        }
+        let surround = [
+            (sx, sz),
+            (sx - fx, sz - fz),
+            (sx - 2 * fx, sz - 2 * fz),
+            (-2 * fx, -2 * fz),
+            (-sx - 2 * fx, -sz - 2 * fz),
+            (-sx - fx, -sz - fz),
+            (-sx, -sz),
+            (-sx + fx, -sz + fz),
+            (fx, fz),
+            (sx + fx, sz + fz),
+        ];
+        let above = [(0, 0), (-fx, -fz)];
+        let bunk = world
+            .get_block(&bed_pos.down())
+            .has_tag(&tag::Block::MINECRAFT_BEDS);
+        for check_dangerous in [true, false] {
+            for origin in [Some(*bed_pos), bunk.then(|| bed_pos.down())]
+                .into_iter()
+                .flatten()
+            {
+                for (dx, dz) in surround {
+                    let pos = BlockPos::new(origin.0.x + dx, origin.0.y, origin.0.z + dz);
+                    if let Some(position) = Self::find_respawn_pos(world, &pos, check_dangerous) {
+                        return Some(position);
+                    }
+                }
             }
-
-            // Also try one block down (for beds on elevated platforms)
-            let check_pos_down = BlockPos(Vector3::new(
-                bed_pos.0.x + dx,
-                bed_pos.0.y - 1,
-                bed_pos.0.z + dz,
-            ));
-            if let Some(pos) = Self::find_respawn_pos(world, &check_pos_down) {
-                return Some(pos);
+            for (dx, dz) in above {
+                let pos = BlockPos::new(bed_pos.0.x + dx, bed_pos.0.y, bed_pos.0.z + dz);
+                if let Some(position) = Self::find_respawn_pos(world, &pos, check_dangerous) {
+                    return Some(position);
+                }
             }
         }
-
-        // Try on the bed itself as last resort
-        if let Some(pos) = Self::find_respawn_pos(world, bed_pos) {
-            return Some(pos);
-        }
-
         None
     }
 
-    /// Get spawn position offsets around a bed based on facing direction.
-    /// This is a simplified version of vanilla's getAroundBedOffsets.
-    fn get_bed_spawn_offsets(facing: HorizontalFacing) -> Vec<(i32, i32)> {
-        let (fx, fz) = match facing {
-            HorizontalFacing::North => (0, -1),
-            HorizontalFacing::South => (0, 1),
-            HorizontalFacing::West => (-1, 0),
-            HorizontalFacing::East => (1, 0),
-        };
-
-        // Clockwise rotation
-        let (rx, rz) = (-fz, fx);
-
-        vec![
-            (rx, rz),                   // Right of bed
-            (-rx, -rz),                 // Left of bed
-            (rx - fx, rz - fz),         // Right-back
-            (-rx - fx, -rz - fz),       // Left-back
-            (-fx, -fz),                 // Behind foot
-            (-fx * 2, -fz * 2),         // Further behind
-            (rx + fx, rz + fz),         // Right-front
-            (-rx + fx, -rz + fz),       // Left-front
-            (fx, fz),                   // In front
-            (rx - fx * 2, rz - fz * 2), // Far right-back
-        ]
-    }
-
-    /// Find a valid spawn position around a respawn anchor.
     fn find_anchor_spawn_position(
-        world: &Arc<crate::world::World>,
+        world: &Arc<World>,
         anchor_pos: &BlockPos,
     ) -> Option<Vector3<f64>> {
-        // Vanilla VALID_HORIZONTAL_SPAWN_OFFSETS
-        let horizontal_offsets: [(i32, i32); 8] = [
+        // RespawnAnchorBlock.RESPAWN_HORIZONTAL_OFFSETS.
+        let horizontal_offsets = [
             (0, -1),
             (-1, 0),
             (0, 1),
@@ -2139,75 +2246,118 @@ impl Player {
             (-1, 1),
             (1, 1),
         ];
-
-        // Try at same level, then one down, then one up
-        for dy in [0, -1, 1] {
-            for (dx, dz) in horizontal_offsets {
-                let check_pos = BlockPos(Vector3::new(
-                    anchor_pos.0.x + dx,
-                    anchor_pos.0.y + dy,
-                    anchor_pos.0.z + dz,
-                ));
-
-                if let Some(pos) = Self::find_respawn_pos(world, &check_pos) {
-                    return Some(pos);
+        for check_dangerous in [true, false] {
+            for dy in [0, -1, 1] {
+                for (dx, dz) in horizontal_offsets {
+                    let pos = BlockPos::new(
+                        anchor_pos.0.x + dx,
+                        anchor_pos.0.y + dy,
+                        anchor_pos.0.z + dz,
+                    );
+                    if let Some(position) = Self::find_respawn_pos(world, &pos, check_dangerous) {
+                        return Some(position);
+                    }
                 }
             }
+            if let Some(position) = Self::find_respawn_pos(world, &anchor_pos.up(), check_dangerous)
+            {
+                return Some(position);
+            }
         }
-
-        // Also try directly above the anchor
-        let above_pos = anchor_pos.up();
-        Self::find_respawn_pos(world, &above_pos)
+        None
     }
 
-    /// Check if a position is valid for respawning (vanilla Dismounting.findRespawnPos logic).
-    /// Returns the spawn position if valid, None otherwise.
-    fn find_respawn_pos(world: &Arc<crate::world::World>, pos: &BlockPos) -> Option<Vector3<f64>> {
+    fn respawn_block_is_dangerous(world: &World, pos: &BlockPos) -> bool {
         let (block, state) = world.get_block_and_state(pos);
-        let below_state = world.get_block_state(&pos.down());
+        block.has_tag(&tag::Block::MINECRAFT_FIRE)
+            || matches!(
+                block.id,
+                BlockId::LAVA
+                    | BlockId::MAGMA_BLOCK
+                    | BlockId::WITHER_ROSE
+                    | BlockId::SWEET_BERRY_BUSH
+                    | BlockId::CACTUS
+                    | BlockId::POWDER_SNOW
+            )
+            || (matches!(block.id, BlockId::CAMPFIRE | BlockId::SOUL_CAMPFIRE)
+                && pumpkin_data::block_properties::CampfireLikeProperties::from_state_id(state.id)
+                    .lit)
+    }
 
-        // Check if block at position is invalid for spawn (e.g., inside solid block)
-        if block.has_tag(&tag::Block::MINECRAFT_INVALID_SPAWN_INSIDE) {
+    // DismountHelper.findSafeDismountLocation for a standing player.
+    fn find_respawn_pos(
+        world: &Arc<World>,
+        pos: &BlockPos,
+        check_dangerous: bool,
+    ) -> Option<Vector3<f64>> {
+        // WorldBorder.isWithinBounds(AABB) excludes the upper face's epsilon.
+        const BORDER_EPSILON: f64 = 1.0e-5;
+
+        if check_dangerous && Self::respawn_block_is_dangerous(world, pos) {
             return None;
         }
-
-        // Check if block above is also invalid
-        let above_block = world.get_block(&pos.up());
-        if above_block.has_tag(&tag::Block::MINECRAFT_INVALID_SPAWN_INSIDE) {
+        let shape_height = |position: &BlockPos| {
+            let (block, state) = world.get_block_and_state(position);
+            if block.has_tag(&tag::Block::MINECRAFT_CLIMBABLE)
+                || (block.has_tag(&tag::Block::MINECRAFT_TRAPDOORS)
+                    && pumpkin_data::block_properties::OakTrapdoorLikeProperties::from_state_id(
+                        state.id,
+                    )
+                    .open)
+            {
+                f64::NEG_INFINITY
+            } else {
+                state
+                    .get_block_collision_shapes_at(position)
+                    .map(|shape| shape.max.y)
+                    .fold(f64::NEG_INFINITY, f64::max)
+            }
+        };
+        let mut floor_height = shape_height(pos);
+        if floor_height == f64::NEG_INFINITY {
+            let below_height = shape_height(&pos.down());
+            if below_height >= 1.0 {
+                floor_height = below_height - 1.0;
+            }
+        }
+        if !floor_height.is_finite()
+            || floor_height >= 1.0
+            || (check_dangerous
+                && floor_height <= 0.0
+                && Self::respawn_block_is_dangerous(world, &pos.down()))
+            || world
+                .get_block(pos)
+                .has_tag(&tag::Block::MINECRAFT_INVALID_SPAWN_INSIDE)
+            || world
+                .get_block(&pos.up())
+                .has_tag(&tag::Block::MINECRAFT_INVALID_SPAWN_INSIDE)
+        {
             return None;
         }
-
-        // Need solid floor below or at position
-        let has_floor = below_state.is_solid() || state.is_solid();
-        if !has_floor {
-            return None;
-        }
-
-        // Position must not be inside a solid block
-        if state.is_solid() && !state.is_air() {
-            return None;
-        }
-
-        // Create player-sized bounding box at this position
-        let x = f64::from(pos.0.x) + 0.5;
-        let y = f64::from(pos.0.y) + 0.1;
-        let z = f64::from(pos.0.z) + 0.5;
-        let spawn_pos = Vector3::new(x, y, z);
-
-        // Player dimensions: 0.6 wide, 1.8 tall
-        let half_width = 0.3;
-        let height = 1.8;
-        let player_box = BoundingBox::new(
-            Vector3::new(x - half_width, y, z - half_width),
-            Vector3::new(x + half_width, y + height, z + half_width),
+        let position = Vector3::new(
+            f64::from(pos.0.x) + 0.5,
+            f64::from(pos.0.y) + floor_height,
+            f64::from(pos.0.z) + 0.5,
         );
-
-        // Check if the space is empty (no block collisions)
-        if !world.is_space_empty(player_box) {
+        let dimensions = Entity::type_dimensions(&EntityType::PLAYER);
+        let half_width = f64::from(dimensions.width) / 2.0;
+        let bounds = BoundingBox::new(
+            position.add_raw(-half_width, 0.0, -half_width),
+            position.add_raw(half_width, f64::from(dimensions.height), half_width),
+        );
+        if !world.is_space_empty(bounds) {
             return None;
         }
-
-        Some(spawn_pos)
+        let border = world
+            .worldborder
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !border.contains(bounds.min.x, bounds.min.z)
+            || !border.contains(bounds.max.x - BORDER_EPSILON, bounds.max.z - BORDER_EPSILON)
+        {
+            return None;
+        }
+        Some(position)
     }
 
     pub fn sleep(&self, bed_head_pos: BlockPos) {
@@ -4030,11 +4180,12 @@ impl Player {
     }
 
     pub async fn unload_watched_chunks(&self, world: &World) {
-        let radial_chunks = self.watched_section.load().all_chunks_within();
         let level = &world.level;
-        let chunks_to_clean = level.mark_chunks_as_not_watched(radial_chunks).await;
+        let chunks_to_clean = world.release_player_entity_chunks(self).await;
         if !chunks_to_clean.is_empty() {
-            world.remove_entities_in_chunks(&chunks_to_clean).await;
+            world
+                .remove_unwatched_entities_in_chunks(&chunks_to_clean)
+                .await;
             level.clean_entity_chunks(&chunks_to_clean);
         }
         for chunk in &chunks_to_clean {
@@ -4079,7 +4230,12 @@ impl Player {
 
             'after: {
                 // TODO: this is duplicate code from world
-                let position = event.position;
+                let Some(position) = self.approve_teleport(event.position) else {
+                    return;
+                };
+                if !self.get_entity().dismount_before_teleport() {
+                    return;
+                }
                 let yaw = event.yaw;
                 let pitch = event.pitch;
                 let new_world = event.new_world;
@@ -4178,10 +4334,11 @@ impl Player {
 
                 self.send_health();
 
-                new_world.send_world_info(&player);
+                new_world.send_world_info(&player).await;
                 new_world.send_center_chunk(&player).await;
 
-                player.request_teleport(position, yaw, pitch);
+                player.apply_teleport(position, yaw, pitch);
+                new_world.refresh_player_entity_chunks(&player);
 
                 let mut changed_world_event = crate::plugin::api::events::player::player_changed_world::PlayerChangedWorldEvent {
                     player: player.clone(),
@@ -4198,12 +4355,13 @@ impl Player {
     /// Rarly used, for example when waking up the player from a bed or their first time spawn. Otherwise, the `teleport` method should be used.
     /// The player should respond with the `SConfirmTeleport` packet.
     pub fn request_teleport(&self, position: Vector3<f64>, yaw: f32, pitch: f32) {
-        // This is the ultra special magic code used to create the teleport id
-        // This returns the old value
-        // This operation wraps around on overflow.
-        let Some(server) = self.world().server.upgrade() else {
-            return;
-        };
+        if let Some(position) = self.approve_teleport(position) {
+            self.apply_teleport(position, yaw, pitch);
+        }
+    }
+
+    fn approve_teleport(&self, position: Vector3<f64>) -> Option<Vector3<f64>> {
+        let server = self.world().server.upgrade()?;
         if let Some(player_arc) = self.world().get_player_by_uuid(self.gameprofile.id) {
             let mut event = PlayerTeleportEvent {
                 player: player_arc,
@@ -4213,10 +4371,15 @@ impl Player {
             };
             server.plugin_manager.fire_blocking(&server, &mut event);
             if event.cancelled {
-                return;
+                return None;
             }
+            return Some(event.to);
         }
+        Some(position)
+    }
 
+    fn apply_teleport(&self, position: Vector3<f64>, yaw: f32, pitch: f32) {
+        // Allocate only after approval; login restoration uses this without dismounting.
         let i = self.teleport_id_count.fetch_add(1, Ordering::Relaxed);
         self.chunk_send_epoch.fetch_add(1, Ordering::Relaxed);
         let teleport_id = i + 1;
@@ -6913,7 +7076,13 @@ impl EntityBase for Player {
             // Same world
             let yaw = yaw.unwrap_or_else(|| self.living_entity.entity.yaw.load());
             let pitch = pitch.unwrap_or_else(|| self.living_entity.entity.pitch.load());
-            self.request_teleport(position, yaw, pitch);
+            let Some(position) = self.approve_teleport(position) else {
+                return;
+            };
+            if !self.get_entity().dismount_before_teleport() {
+                return;
+            }
+            self.apply_teleport(position, yaw, pitch);
             let entity = self.get_entity();
             let chunk_pos = entity.chunk_pos.load();
             entity.world.load().broadcast_to_chunk_except(
@@ -7090,41 +7259,26 @@ impl EntityBase for Player {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
         {
-            nbt.put_int("SpawnX", respawn.position.0.x);
-            nbt.put_int("SpawnY", respawn.position.0.y);
-            nbt.put_int("SpawnZ", respawn.position.0.z);
-            nbt.put_string(
-                "SpawnDimension",
-                respawn.dimension.minecraft_name.to_owned(),
-            );
-            nbt.put_bool("SpawnForced", respawn.force);
-
-            let mut respawn_compound = NbtCompound::new();
-            respawn_compound.put_string("dimension", respawn.dimension.minecraft_name.to_string());
-            respawn_compound.put(
-                "pos",
-                NbtTag::IntArray(vec![
-                    respawn.position.0.x,
-                    respawn.position.0.y,
-                    respawn.position.0.z,
-                ]),
-            );
-            respawn_compound.put_float("angle", respawn.yaw);
-            respawn_compound.put_bool("forced", respawn.force);
-            nbt.put_compound("respawn", respawn_compound);
+            respawn.write_nbt(nbt);
         }
 
-        let vehicle_uuid = self
-            .living_entity
-            .entity
-            .vehicle
+        if let Some(vehicle) = self.get_entity().get_vehicle() {
+            if let Some(mut snapshot) = crate::world::entity_storage::save_player_vehicle(&vehicle)
+            {
+                bind_vehicle_snapshot(&mut snapshot, &vehicle.get_entity().world.load());
+                nbt.put_compound("RootVehicle", snapshot);
+            }
+        } else if let Some(pending) = self.pending_root_vehicle() {
+            // Failed/unsupported imports remain recoverable until a mount succeeds.
+            nbt.put_compound("RootVehicle", pending);
+        }
+        if let Some(retained) = self
+            .retained_root_vehicle
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
-            .map(|vehicle| vehicle.get_entity().entity_uuid)
-            .or_else(|| self.root_vehicle_uuid.load());
-        if let Some(vehicle_uuid) = vehicle_uuid {
-            write_root_vehicle(nbt, vehicle_uuid);
+        {
+            nbt.put(RETAINED_ROOT_VEHICLE, retained.clone());
         }
         self.stats
             .lock()
@@ -7245,8 +7399,8 @@ impl EntityBase for Player {
         self.hunger_manager.read_nbt_non_mut(nbt);
 
         if let Some(air) = nbt
-            .get_short("Air")
-            .map(i32::from)
+            .get_int("Air")
+            .or_else(|| nbt.get_short("Air").map(i32::from))
             .or_else(|| nbt.get_int("AirSupply"))
         {
             self.breath_manager
@@ -7260,51 +7414,30 @@ impl EntityBase for Player {
             );
         }
 
-        // Load any saved spawnpoint data (both vanilla "respawn" compound and legacy SpawnX/SpawnY/SpawnZ)
-        if let Some(respawn_compound) = nbt.get_compound("respawn") {
-            let dim = respawn_compound
-                .get_string("dimension")
-                .and_then(|s| Dimension::from_name(s).cloned())
-                .unwrap_or_else(|| self.world().dimension.clone());
-            let pos = if let Some(pos_array) = respawn_compound.get_int_array("pos")
-                && pos_array.len() >= 3
-            {
-                BlockPos(Vector3::new(pos_array[0], pos_array[1], pos_array[2]))
-            } else {
-                BlockPos(Vector3::new(0, 0, 0))
-            };
-            let yaw = respawn_compound.get_float("angle").unwrap_or(0.0);
-            let force = respawn_compound.get_bool("forced").unwrap_or(false);
-            *self
-                .respawn_point
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(RespawnPoint {
-                dimension: dim,
-                position: pos,
-                yaw,
-                force,
+        *self
+            .respawn_point
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = RespawnPoint::from_nbt(nbt);
+        *self
+            .retained_root_vehicle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            nbt.get(RETAINED_ROOT_VEHICLE).cloned();
+        *self
+            .pending_root_vehicle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            nbt.get_compound("RootVehicle").cloned().map(|mut root| {
+                if let Some(attach) = read_root_vehicle(nbt) {
+                    root.put_uuid("Attach", attach);
+                }
+                let world = self.world();
+                let dimension = nbt
+                    .get_string("Dimension")
+                    .unwrap_or(world.dimension.minecraft_name);
+                bind_root_vehicle_origin(&mut root, dimension, &vehicle_world_key(&world));
+                root
             });
-        } else if let (Some(x), Some(y), Some(z)) = (
-            nbt.get_int("SpawnX"),
-            nbt.get_int("SpawnY"),
-            nbt.get_int("SpawnZ"),
-        ) {
-            let dim = nbt
-                .get_string("SpawnDimension")
-                .and_then(|s| Dimension::from_name(s).cloned())
-                .unwrap_or_else(|| self.world().dimension.clone());
-            let force = nbt.get_bool("SpawnForced").unwrap_or(false);
-            *self
-                .respawn_point
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(RespawnPoint {
-                dimension: dim,
-                position: BlockPos(Vector3::new(x, y, z)),
-                yaw: 0.0,
-                force,
-            });
-        }
-        self.root_vehicle_uuid.store(read_root_vehicle(nbt));
         self.stats
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -7437,7 +7570,139 @@ pub struct RespawnPoint {
     pub dimension: Dimension,
     pub position: BlockPos,
     pub yaw: f32,
+    pub pitch: f32,
     pub force: bool,
+}
+
+impl RespawnPoint {
+    async fn find_respawn_and_use_spawn_block(
+        &self,
+        world: &Arc<World>,
+        consume_spawn_block: bool,
+    ) -> Option<CalculatedRespawnPoint> {
+        type BedProperties = pumpkin_data::block_properties::WhiteBedLikeProperties;
+        type AnchorProperties = pumpkin_data::block_properties::RespawnAnchorLikeProperties;
+        let pos = &self.position;
+
+        // Ensure chunks around the spawn position are fetched
+        let min_chunk_x = (pos.0.x - 2) >> 4;
+        let max_chunk_x = (pos.0.x + 2) >> 4;
+        let min_chunk_z = (pos.0.z - 2) >> 4;
+        let max_chunk_z = (pos.0.z + 2) >> 4;
+        for cx in min_chunk_x..=max_chunk_x {
+            for cz in min_chunk_z..=max_chunk_z {
+                world
+                    .level
+                    .get_or_fetch_chunk(Vector2::new(cx, cz), |_| ())
+                    .await;
+            }
+        }
+
+        let (block, state_id) = world.get_block_and_state_id(pos);
+
+        // ServerPlayer.findRespawnAndUseSpawnBlock: beds and anchors take precedence
+        // over a forced position. Returning from the End must not spend a charge.
+        if block == &Block::RESPAWN_ANCHOR && world.dimension.respawn_anchor_works {
+            let mut properties = AnchorProperties::from_state_id(state_id);
+            if self.force || properties.charges > 0 {
+                let position = Player::find_anchor_spawn_position(world, pos)?;
+                if !self.force && consume_spawn_block {
+                    properties.charges -= 1;
+                    world.set_block_state(
+                        pos,
+                        properties.to_state_id(block),
+                        pumpkin_world::world::BlockFlags::NOTIFY_ALL,
+                    );
+                }
+                return Some(CalculatedRespawnPoint::looking_at(position, self));
+            }
+        }
+        if block.has_tag(&tag::Block::MINECRAFT_BEDS)
+            && world
+                .dimension
+                .bed_rule
+                .can_set_spawn(world.is_dark_outside())
+        {
+            let properties = BedProperties::from_state_id(state_id);
+            let position =
+                Player::find_bed_spawn_position(world, pos, properties.facing, self.yaw)?;
+            return Some(CalculatedRespawnPoint::looking_at(position, self));
+        }
+        if self.force {
+            let bottom = world.get_block_state(pos);
+            let top = world.get_block_state(&pos.up());
+            if !bottom.is_solid() && !bottom.is_liquid() && !top.is_solid() && !top.is_liquid() {
+                return Some(CalculatedRespawnPoint {
+                    position: Vector3::new(
+                        f64::from(pos.0.x) + 0.5,
+                        f64::from(pos.0.y) + 0.1,
+                        f64::from(pos.0.z) + 0.5,
+                    ),
+                    yaw: self.yaw,
+                    pitch: self.pitch,
+                    dimension: self.dimension.clone(),
+                });
+            }
+        }
+        None
+    }
+
+    fn from_nbt(nbt: &NbtCompound) -> Option<Self> {
+        if let Some(respawn) = nbt.get_compound("respawn") {
+            let [x, y, z] = respawn.get_int_array("pos")? else {
+                return None;
+            };
+            Some(Self {
+                dimension: Dimension::from_name(respawn.get_string("dimension")?)?.clone(),
+                position: BlockPos::new(*x, *y, *z),
+                yaw: respawn
+                    .get_float("yaw")
+                    .or_else(|| respawn.get_float("angle"))
+                    .unwrap_or(0.0),
+                pitch: respawn.get_float("pitch").unwrap_or(0.0),
+                force: respawn.get_bool("forced").unwrap_or(false),
+            })
+        } else {
+            Some(Self {
+                dimension: Dimension::from_name(
+                    nbt.get_string("SpawnDimension")
+                        .unwrap_or("minecraft:overworld"),
+                )?
+                .clone(),
+                position: BlockPos::new(
+                    nbt.get_int("SpawnX")?,
+                    nbt.get_int("SpawnY")?,
+                    nbt.get_int("SpawnZ")?,
+                ),
+                yaw: nbt.get_float("SpawnAngle").unwrap_or(0.0),
+                pitch: 0.0,
+                force: nbt.get_bool("SpawnForced").unwrap_or(false),
+            })
+        }
+    }
+
+    fn write_nbt(&self, nbt: &mut NbtCompound) {
+        nbt.put_int("SpawnX", self.position.0.x);
+        nbt.put_int("SpawnY", self.position.0.y);
+        nbt.put_int("SpawnZ", self.position.0.z);
+        nbt.put_string("SpawnDimension", self.dimension.minecraft_name.to_owned());
+        nbt.put_float("SpawnAngle", self.yaw);
+        nbt.put_bool("SpawnForced", self.force);
+        let mut respawn = NbtCompound::new();
+        respawn.put_string("dimension", self.dimension.minecraft_name.to_owned());
+        respawn.put(
+            "pos",
+            NbtTag::IntArray(vec![
+                self.position.0.x,
+                self.position.0.y,
+                self.position.0.z,
+            ]),
+        );
+        respawn.put_float("yaw", self.yaw);
+        respawn.put_float("pitch", self.pitch);
+        respawn.put_bool("forced", self.force);
+        nbt.put_compound("respawn", respawn);
+    }
 }
 
 pub struct CalculatedRespawnPoint {
@@ -7449,6 +7714,19 @@ pub struct CalculatedRespawnPoint {
     pub pitch: f32,
     /// The dimension to spawn in.
     pub dimension: Dimension,
+}
+
+impl CalculatedRespawnPoint {
+    fn looking_at(position: Vector3<f64>, respawn: &RespawnPoint) -> Self {
+        let dx = f64::from(respawn.position.0.x) + 0.5 - position.x;
+        let dz = f64::from(respawn.position.0.z) + 0.5 - position.z;
+        Self {
+            position,
+            yaw: pumpkin_util::math::wrap_degrees((dz.atan2(dx).to_degrees() - 90.0) as f32),
+            pitch: 0.0,
+            dimension: respawn.dimension.clone(),
+        }
+    }
 }
 
 /// Represents the player's chat mode settings.
@@ -8144,6 +8422,255 @@ mod tests {
     use uuid::Uuid;
 
     #[test]
+    fn respawn_rotation_migrates_without_losing_unknown_fields_or_reviving_cleared_points() {
+        use super::RespawnPoint;
+        let mut original = NbtCompound::new();
+        let mut respawn = NbtCompound::new();
+        respawn.put_string("dimension", "minecraft:overworld".to_owned());
+        respawn.put("pos", NbtTag::IntArray(vec![23, 71, -40]));
+        respawn.put_float("yaw", -123.5);
+        respawn.put_float("pitch", 37.25);
+        respawn.put_float("angle", 80.0);
+        respawn.put_string("plugin:marker", "keep".to_owned());
+        original.put_compound("respawn", respawn);
+        let point = RespawnPoint::from_nbt(&original).unwrap();
+        assert_eq!((point.yaw, point.pitch), (-123.5, 37.25));
+        let mut modeled = NbtCompound::new();
+        point.write_nbt(&mut modeled);
+        let saved = merge_player_nbt(&original, modeled);
+        let saved_point = saved.get_compound("respawn").unwrap();
+        assert_eq!(saved_point.get_float("yaw"), Some(-123.5));
+        assert_eq!(saved_point.get_float("pitch"), Some(37.25));
+        assert_eq!(saved_point.get_string("plugin:marker"), Some("keep"));
+        assert!(saved_point.get("angle").is_none());
+        assert_eq!(saved.get_float("SpawnAngle"), Some(-123.5));
+        let mut legacy = saved.clone();
+        legacy.child_tags.remove("respawn");
+        assert_eq!(RespawnPoint::from_nbt(&legacy).unwrap().yaw, -123.5);
+        assert_eq!(RespawnPoint::from_nbt(&legacy).unwrap().pitch, 0.0);
+        let cleared = merge_player_nbt(&saved, NbtCompound::new());
+        assert!(cleared.get("respawn").is_none());
+        assert!(RespawnPoint::from_nbt(&cleared).is_none());
+        assert!(cleared.get("SpawnAngle").is_none());
+    }
+
+    fn respawn_test_world(
+        path: &std::path::Path,
+        dimension: pumpkin_data::dimension::Dimension,
+    ) -> std::sync::Arc<crate::world::World> {
+        use arc_swap::ArcSwap;
+        use pumpkin_config::world::LevelConfig;
+        use pumpkin_util::{math::vector2::Vector2, world_seed::Seed};
+        use pumpkin_world::{
+            chunk::{ChunkData, ChunkSections},
+            level::Level,
+            world_info::LevelData,
+        };
+        use std::sync::{Arc, Weak};
+        let level = Level::from_root_folder(
+            &LevelConfig::default(),
+            path.to_path_buf(),
+            0,
+            dimension.clone(),
+        )
+        .unwrap();
+        // These tests exercise respawn rules against known blocks, not terrain
+        // generation. Preload a full chunk so the production get_or_fetch_chunk
+        // path reads this canonical fixture without generating its neighbours.
+        let mut chunk = ChunkData::empty(0, 0);
+        chunk.section = ChunkSections::new((dimension.height / 16) as usize, dimension.min_y);
+        for x in 4..=12 {
+            for z in 4..=12 {
+                chunk.set_block_absolute_y(x, 224, z, pumpkin_data::Block::STONE.default_state.id);
+            }
+        }
+        level
+            .loaded_chunks
+            .insert(Vector2::new(0, 0), Arc::new(chunk));
+        Arc::new(
+            crate::world::World::load(
+                level,
+                Arc::new(ArcSwap::from_pointee(LevelData::default(Seed(0)))),
+                dimension,
+                Arc::new(crate::block::registry::BlockRegistry::default()),
+                Weak::new(),
+            )
+            .unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn beds_choose_safe_positions_and_forced_spawn_retains_pitch() {
+        use super::{Player, RespawnPoint};
+        use pumpkin_data::{
+            Block,
+            block_properties::{BedPart, HorizontalFacing, WhiteBedLikeProperties},
+            dimension::Dimension,
+        };
+        use pumpkin_util::math::position::BlockPos;
+        use pumpkin_world::world::BlockFlags;
+        let directory = tempfile::tempdir().unwrap();
+        let world = respawn_test_world(directory.path(), Dimension::OVERWORLD);
+        let pos = BlockPos::new(8, 225, 8);
+        let mut bed = WhiteBedLikeProperties::default(&Block::WHITE_BED);
+        bed.facing = HorizontalFacing::North;
+        bed.part = BedPart::Head;
+        world.set_block_state(
+            &pos,
+            bed.to_state_id(&Block::WHITE_BED),
+            BlockFlags::FORCE_STATE,
+        );
+        bed.part = BedPart::Foot;
+        world.set_block_state(
+            &BlockPos::new(8, 225, 9),
+            bed.to_state_id(&Block::WHITE_BED),
+            BlockFlags::FORCE_STATE,
+        );
+        let mut point = RespawnPoint {
+            dimension: Dimension::OVERWORLD,
+            position: pos,
+            yaw: 0.0,
+            pitch: 37.0,
+            force: false,
+        };
+        let spawn = point
+            .find_respawn_and_use_spawn_block(&world, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            spawn.position,
+            pumpkin_util::math::vector3::Vector3::new(9.5, 225.0, 8.5)
+        );
+        assert_eq!((spawn.yaw, spawn.pitch), (90.0, 0.0));
+        point.yaw = -90.0;
+        assert_eq!(
+            point
+                .find_respawn_and_use_spawn_block(&world, false)
+                .await
+                .unwrap()
+                .position
+                .x,
+            7.5
+        );
+        // A floor surface is used exactly, without the previous +0.1 air gap.
+        assert_eq!(
+            Player::find_respawn_pos(&world, &BlockPos::new(6, 225, 6), true)
+                .unwrap()
+                .y,
+            225.0
+        );
+        world.set_block_state(&pos, Block::AIR.default_state.id, BlockFlags::FORCE_STATE);
+        assert!(
+            point
+                .find_respawn_and_use_spawn_block(&world, true)
+                .await
+                .is_none()
+        );
+        point.force = true;
+        let forced = point
+            .find_respawn_and_use_spawn_block(&world, false)
+            .await
+            .unwrap();
+        assert_eq!((forced.yaw, forced.pitch), (-90.0, 37.0));
+        world.set_block_state(
+            &pos.up(),
+            Block::STONE.default_state.id,
+            BlockFlags::FORCE_STATE,
+        );
+        assert!(
+            point
+                .find_respawn_and_use_spawn_block(&world, false)
+                .await
+                .is_none()
+        );
+        world.level.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn anchor_end_return_keeps_charge_and_forced_spawn_accepts_empty_anchor() {
+        use super::RespawnPoint;
+        use pumpkin_data::{
+            Block, block_properties::RespawnAnchorLikeProperties, dimension::Dimension,
+        };
+        use pumpkin_util::math::position::BlockPos;
+        use pumpkin_world::world::BlockFlags;
+        let directory = tempfile::tempdir().unwrap();
+        let world = respawn_test_world(directory.path(), Dimension::THE_NETHER);
+        let pos = BlockPos::new(8, 225, 8);
+        let mut properties = RespawnAnchorLikeProperties::default(&Block::RESPAWN_ANCHOR);
+        properties.charges = 2;
+        world.set_block_state(
+            &pos,
+            properties.to_state_id(&Block::RESPAWN_ANCHOR),
+            BlockFlags::FORCE_STATE,
+        );
+        let mut point = RespawnPoint {
+            dimension: Dimension::THE_NETHER,
+            position: pos,
+            yaw: 61.0,
+            pitch: -13.0,
+            force: false,
+        };
+        assert!(
+            point
+                .find_respawn_and_use_spawn_block(&world, false)
+                .await
+                .is_some()
+        );
+        assert_eq!(
+            RespawnAnchorLikeProperties::from_state_id(world.get_block_state_id(&pos)).charges,
+            2
+        );
+        assert!(
+            point
+                .find_respawn_and_use_spawn_block(&world, true)
+                .await
+                .is_some()
+        );
+        assert_eq!(
+            RespawnAnchorLikeProperties::from_state_id(world.get_block_state_id(&pos)).charges,
+            1
+        );
+        properties.charges = 0;
+        world.set_block_state(
+            &pos,
+            properties.to_state_id(&Block::RESPAWN_ANCHOR),
+            BlockFlags::FORCE_STATE,
+        );
+        assert!(
+            point
+                .find_respawn_and_use_spawn_block(&world, false)
+                .await
+                .is_none()
+        );
+        point.force = true;
+        assert!(
+            point
+                .find_respawn_and_use_spawn_block(&world, true)
+                .await
+                .is_some()
+        );
+        assert_eq!(
+            RespawnAnchorLikeProperties::from_state_id(world.get_block_state_id(&pos)).charges,
+            0
+        );
+        world.set_block_state(
+            &pos,
+            Block::WHITE_BED.default_state.id,
+            BlockFlags::FORCE_STATE,
+        );
+        point.force = false;
+        assert!(
+            point
+                .find_respawn_and_use_spawn_block(&world, false)
+                .await
+                .is_none(),
+            "Nether beds cannot provide respawns"
+        );
+        world.level.shutdown().await;
+    }
+
+    #[test]
     fn unmapped_player_root_data_survives_storage_and_modeled_fields_are_removed() {
         use pumpkin_world::data::player_data::PlayerDataStorage;
         let temp = tempfile::tempdir().unwrap();
@@ -8227,6 +8754,121 @@ mod tests {
         assert_eq!(bedrock_inventory_slot(44), Some(8));
         assert_eq!(bedrock_inventory_slot(8), None);
         assert_eq!(bedrock_inventory_slot(45), None);
+    }
+
+    #[test]
+    fn pending_vehicle_origin_survives_transfer_save_and_custom_world_restart() {
+        use super::{ROOT_VEHICLE_ORIGIN, bind_root_vehicle_origin, root_vehicle_origin_matches};
+        use pumpkin_world::data::player_data::PlayerDataStorage;
+        let temp = tempfile::tempdir().unwrap();
+        let storage = PlayerDataStorage::new(temp.path(), true);
+        let player = Uuid::new_v4();
+        let mut original = NbtCompound::new();
+        write_root_vehicle(&mut original, Uuid::new_v4());
+        original.put_string("Dimension", "minecraft:the_end".to_owned());
+        let mut root = original.get_compound("RootVehicle").unwrap().clone();
+        let mut entity = NbtCompound::new();
+        entity.put_string("id", "plugin:unsupported_vehicle".to_owned());
+        entity.put_int("opaque_data", 27);
+        root.put_compound("Entity", entity.clone());
+        bind_root_vehicle_origin(&mut root, "minecraft:the_end", "custom/arena");
+        let mut modeled = NbtCompound::new();
+        modeled.put_string("Dimension", "minecraft:overworld".to_owned());
+        modeled.put_compound("RootVehicle", root.clone());
+        storage
+            .save_player_data(&player, merge_player_nbt(&original, modeled))
+            .unwrap();
+        let saved = storage.load_player_data(&player).unwrap().1;
+        let mut loaded = saved.get_compound("RootVehicle").unwrap().clone();
+        bind_root_vehicle_origin(&mut loaded, "minecraft:overworld", ".");
+        assert_eq!(loaded, root);
+        assert_eq!(loaded.get_compound("Entity"), Some(&entity));
+        assert!(root_vehicle_origin_matches(
+            &loaded,
+            "minecraft:the_end",
+            "custom/arena"
+        ));
+        assert!(!root_vehicle_origin_matches(
+            &loaded,
+            "minecraft:overworld",
+            "custom/arena"
+        ));
+        assert!(!root_vehicle_origin_matches(
+            &loaded,
+            "minecraft:the_end",
+            "."
+        ));
+
+        loaded.put_string(ROOT_VEHICLE_ORIGIN, "future origin encoding".to_owned());
+        let malformed = loaded.clone();
+        bind_root_vehicle_origin(&mut loaded, "minecraft:overworld", ".");
+        assert_eq!(loaded, malformed);
+        assert!(!root_vehicle_origin_matches(
+            &loaded,
+            "minecraft:overworld",
+            "."
+        ));
+    }
+
+    #[test]
+    fn unrelated_mount_preserves_pending_vehicle_and_archives_overflow() {
+        use super::{
+            RETAINED_ROOT_VEHICLE, ROOT_VEHICLE_ARCHIVE, archive_root_vehicle,
+            bind_root_vehicle_origin, prepare_root_vehicle_mount,
+        };
+        let make_root = |id, dimension| {
+            let mut root = NbtCompound::new();
+            root.put_uuid("Attach", Uuid::from_u128(id));
+            bind_root_vehicle_origin(&mut root, dimension, ".");
+            root
+        };
+        let source = make_root(1, "minecraft:the_end");
+        let destination = make_root(2, "minecraft:overworld");
+        let mut pending = Some(source.clone());
+        let mut retained = None;
+        assert!(prepare_root_vehicle_mount(&mut pending, &mut retained, |_| false).is_none());
+        assert!(pending.is_none());
+        assert_eq!(retained, Some(NbtTag::Compound(source.clone())));
+
+        let mut modeled = NbtCompound::new();
+        modeled.put_compound("RootVehicle", destination.clone());
+        modeled.put(RETAINED_ROOT_VEHICLE, retained.clone().unwrap());
+        let saved = merge_player_nbt(&NbtCompound::new(), modeled);
+        pending = saved.get_compound("RootVehicle").cloned();
+        retained = saved.get(RETAINED_ROOT_VEHICLE).cloned();
+        let overflow = prepare_root_vehicle_mount(&mut pending, &mut retained, |_| false).unwrap();
+        assert_eq!(overflow, NbtTag::Compound(source.clone()));
+        assert!(pending.is_none());
+        assert_eq!(retained, Some(NbtTag::Compound(destination.clone())));
+        let mut original = saved;
+        archive_root_vehicle(&mut original, overflow);
+        let resaved = merge_player_nbt(&original, NbtCompound::new());
+        let archived = resaved.get_list(ROOT_VEHICLE_ARCHIVE).unwrap();
+        assert_eq!(
+            archived[0]
+                .extract_compound()
+                .unwrap()
+                .get_compound("record"),
+            Some(&source)
+        );
+        assert!(resaved.get(RETAINED_ROOT_VEHICLE).is_none());
+        let directory = tempfile::tempdir().unwrap();
+        let storage =
+            pumpkin_world::data::player_data::PlayerDataStorage::new(directory.path(), true);
+        let player = Uuid::new_v4();
+        storage.save_player_data(&player, resaved.clone()).unwrap();
+        assert_eq!(storage.load_player_data(&player).unwrap().1, resaved);
+
+        // Return to the source: consume its automatic archive, retaining the
+        // other unresolved tree before the restored source's next live save.
+        pending = Some(destination.clone());
+        retained = Some(NbtTag::Compound(source.clone()));
+        assert!(
+            prepare_root_vehicle_mount(&mut pending, &mut retained, |root| root == &source)
+                .is_none()
+        );
+        assert!(pending.is_none());
+        assert_eq!(retained, Some(NbtTag::Compound(destination)));
     }
 
     #[test]

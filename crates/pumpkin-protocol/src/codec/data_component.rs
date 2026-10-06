@@ -2698,15 +2698,39 @@ impl DataComponentCodec<Self> for BaseColorImpl {
 
 impl DataComponentCodec<Self> for PotDecorationsImpl {
     fn serialize(&self, seq: &mut impl NetworkWriteExt) -> Result<(), WritingError> {
-        seq.write_var_int(&VarInt(0))
+        use crate::codec::item_stack_seralizer::ItemStackTemplateSerializer;
+        for name in Self::SIDES {
+            let side = self.decorations.as_ref().and_then(|data| data.get(name));
+            seq.write_bool(side.is_some())?;
+            if let Some(side) = side {
+                let stack = side
+                    .extract_compound()
+                    .and_then(pumpkin_data::item_stack::ItemStack::read_item_stack)
+                    .filter(|stack| !stack.is_empty())
+                    .ok_or_else(|| {
+                        WritingError::Message("Invalid pot decoration item template".into())
+                    })?;
+                ItemStackTemplateSerializer::from(stack).write(seq)?;
+            }
+        }
+        Ok(())
     }
 
     fn deserialize(seq: &mut impl NetworkReadExt) -> Result<Self, ReadingError> {
-        let len = seq.get_var_int()?.0 as usize;
-        for _ in 0..len {
-            let _ = seq.get_var_int()?;
+        use crate::codec::item_stack_seralizer::ItemStackSerializer;
+        let mut decorations = pumpkin_nbt::compound::NbtCompound::new();
+        for name in Self::SIDES {
+            if seq.get_bool()? {
+                let stack =
+                    ItemStackSerializer::read_template0(seq, &JavaMinecraftVersion::V_26_3)?.0;
+                let mut side = pumpkin_nbt::compound::NbtCompound::new();
+                stack.write_item_stack(&mut side);
+                decorations.put_compound(name, side);
+            }
         }
-        Ok(Self)
+        Ok(Self {
+            decorations: Some(decorations),
+        })
     }
 }
 
@@ -2827,6 +2851,31 @@ impl DataComponentCodec<Self> for BreakSoundImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pot_decorations_wire_uses_four_optional_item_templates() {
+        let mut bytes = Vec::new();
+        PotDecorationsImpl::EMPTY.serialize(&mut bytes).unwrap();
+        assert_eq!(bytes, [0, 0, 0, 0]);
+        let mut decorations = pumpkin_nbt::compound::NbtCompound::new();
+        let mut side = pumpkin_nbt::compound::NbtCompound::new();
+        side.put_string("id", "minecraft:brick".into());
+        decorations.put_compound("back", side);
+        let value = PotDecorationsImpl {
+            decorations: Some(decorations),
+        };
+        let mut bytes = Vec::new();
+        value.serialize(&mut bytes).unwrap();
+        assert_eq!(bytes[0], 1);
+        assert_eq!(&bytes[bytes.len() - 3..], &[0, 0, 0]);
+        let decoded = PotDecorationsImpl::deserialize(&mut bytes.as_slice()).unwrap();
+        let stack = decoded.decorations.unwrap();
+        assert_eq!(
+            stack.get_compound("back").unwrap().get_string("id"),
+            Some("minecraft:brick")
+        );
+        assert!(PotDecorationsImpl::deserialize(&mut [0u8].as_slice()).is_err());
+    }
 
     fn textured_profile() -> ProfileImpl {
         ProfileImpl {

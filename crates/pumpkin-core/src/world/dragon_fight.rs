@@ -4,6 +4,9 @@
 //! Matches vanilla `net.minecraft.world.level.dimension.end.EnderDragonFight` behaviour
 //! and `DragonRespawnStage`.
 
+mod arena;
+mod data;
+
 use std::sync::{Arc, Mutex};
 use tracing::{debug, info};
 use uuid::Uuid;
@@ -65,6 +68,9 @@ pub struct DragonFight {
     pub origin: BlockPos,
     pub gateways: Vec<i32>,
     pub respawn_crystals: Vec<Uuid>,
+    saved_data: pumpkin_nbt::compound::NbtCompound,
+    legacy_respawn_pending: bool,
+    arena_load_cancel: Option<tokio_util::sync::CancellationToken>,
 
     // ── Transient counters & testing flags ────────────────────────────────────
     pub skip_arena_loaded_check: bool,
@@ -92,20 +98,7 @@ impl DragonFight {
 
     #[must_use]
     pub fn new_with_seed(seed: u64, origin: BlockPos) -> Self {
-        let mut gateways: Vec<i32> = (0..(GATEWAY_COUNT as i32)).collect();
-        // Shuffle gateways with seed or thread-local rng
-        if seed != 0 {
-            use rand::SeedableRng;
-            use rand::seq::SliceRandom;
-            let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-            gateways.shuffle(&mut rng);
-        } else {
-            use rand::seq::SliceRandom;
-            let mut rng = rand::rng();
-            gateways.shuffle(&mut rng);
-        }
-
-        Self {
+        let mut fight = Self {
             needs_state_scanning: true,
             dragon_killed: false,
             previously_killed: false,
@@ -114,8 +107,11 @@ impl DragonFight {
             dragon_uuid: None,
             exit_portal_location: None,
             origin,
-            gateways,
+            gateways: Vec::new(),
             respawn_crystals: Vec::new(),
+            saved_data: pumpkin_nbt::compound::NbtCompound::new(),
+            legacy_respawn_pending: false,
+            arena_load_cancel: None,
             skip_arena_loaded_check: false,
             alive_crystals: 0,
             ticks_since_dragon_seen: 0,
@@ -124,19 +120,23 @@ impl DragonFight {
             ticks_since_last_player_scan: TIME_BETWEEN_PLAYER_SCANS + 1,
             bossbar_uuid: Uuid::new_v4(),
             bossbar_players: Vec::new(),
-        }
+        };
+        fight.init(seed, origin);
+        fight
     }
 
     pub fn init(&mut self, seed: u64, origin: BlockPos) {
-        use rand::SeedableRng;
-        use rand::seq::SliceRandom;
+        use pumpkin_util::random::{RandomImpl, legacy_rand::LegacyRand};
 
         self.origin = origin;
+        // Vanilla 26.3 initializes an empty persisted queue at startup too.
         if self.gateways.is_empty() {
-            let mut new_gateways: Vec<i32> = (0..(GATEWAY_COUNT as i32)).collect();
-            let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-            new_gateways.shuffle(&mut rng);
-            self.gateways = new_gateways;
+            self.gateways = (0..GATEWAY_COUNT as i32).collect();
+            let mut random = LegacyRand::from_seed(seed);
+            for i in (2..=self.gateways.len()).rev() {
+                self.gateways
+                    .swap(i - 1, random.next_bounded_i32(i as i32) as usize);
+            }
         }
     }
 
@@ -145,8 +145,8 @@ impl DragonFight {
     }
 
     #[must_use]
-    pub fn get_spikes() -> [EndSpike; 10] {
-        pumpkin_world::generation::feature::features::end_spike::EndSpikeFeature::get_spikes_for_seed(0)
+    pub fn get_spikes(seed: u64) -> [EndSpike; 10] {
+        pumpkin_world::generation::feature::features::end_spike::EndSpikeFeature::get_spikes_for_seed(seed)
     }
 
     // ── Main tick ─────────────────────────────────────────────────────────────
@@ -163,12 +163,22 @@ impl DragonFight {
             fight.ticks_since_last_player_scan = 0;
         }
 
+        let has_players = !fight.bossbar_players.is_empty();
+        fight.update_arena_loading(world, has_players);
         // Nothing to do without nearby players
-        if fight.bossbar_players.is_empty() {
+        if !has_players {
             return;
         }
 
+        // The receiver and unload paths publish entity membership under this guard.
+        let Ok(_admission_guard) = world.entity_storage_lock.try_lock() else {
+            return;
+        };
         if !fight.is_arena_loaded(world) {
+            return;
+        }
+
+        if fight.legacy_respawn_pending && !fight.recover_legacy_respawn(world) {
             return;
         }
 
@@ -179,9 +189,8 @@ impl DragonFight {
         }
 
         // 3. Respawn sequence
-        if let Some(stage) = fight.respawn_stage {
-            fight.tick_respawn_stage(world, stage);
-            fight.respawn_time += 1;
+        if fight.respawn_stage.is_some() {
+            fight.tick_respawn(world);
             return;
         }
 
@@ -394,6 +403,15 @@ impl DragonFight {
                 }
             }
         }
+        for cp in self.arena_entity_chunks() {
+            if !world
+                .level
+                .get_entity_chunk_sync(&cp)
+                .is_some_and(|chunk| chunk.live.load(std::sync::atomic::Ordering::Acquire))
+            {
+                return false;
+            }
+        }
         true
     }
 
@@ -520,7 +538,7 @@ impl DragonFight {
         self.ticks_since_crystals_scanned = 0;
         self.alive_crystals = 0;
 
-        let spikes = Self::get_spikes();
+        let spikes = Self::get_spikes(world.level.seed.0);
         let entities = world.entities.load();
 
         for spike in &spikes {
@@ -557,6 +575,7 @@ impl DragonFight {
     pub fn abort_respawn_sequence(&mut self, world: &Arc<World>) {
         debug!("Aborting dragon respawn sequence.");
         self.respawn_stage = None;
+        self.legacy_respawn_pending = false;
         self.respawn_time = 0;
         self.reset_spike_crystals(world);
         self.spawn_exit_portal(world, true);
@@ -586,38 +605,60 @@ impl DragonFight {
             return;
         };
 
-        let center = BlockPos::new(portal_loc.0.x, portal_loc.0.y + 1, portal_loc.0.z);
-        let offsets = [
-            (0, -3), // North
-            (0, 3),  // South
-            (-3, 0), // West
-            (3, 0),  // East
-        ];
-
-        let entities = world.entities.load();
-        let mut crystals = Vec::new();
-
-        for (dx, dz) in offsets {
-            let target_pos = BlockPos::new(center.0.x + dx, center.0.y, center.0.z + dz);
-            let found = entities.iter().find(|e| {
-                if e.get_entity().entity_type != &EntityType::END_CRYSTAL {
-                    return false;
-                }
-                let pos = e.get_entity().pos.load();
-                (pos.x - (target_pos.0.x as f64 + 0.5)).abs() < 1.5
-                    && (pos.y - target_pos.0.y as f64).abs() < 1.5
-                    && (pos.z - (target_pos.0.z as f64 + 0.5)).abs() < 1.5
-            });
-
-            if let Some(crystal) = found {
-                crystals.push(crystal.get_entity().entity_uuid);
-            } else {
-                return;
-            }
-        }
+        let Some(crystals) = Self::find_respawn_crystals(world, portal_loc) else {
+            return;
+        };
 
         debug!("Found all crystals, respawning dragon.");
         self.respawn_dragon(world, crystals);
+    }
+
+    fn find_respawn_crystals(world: &Arc<World>, portal: BlockPos) -> Option<Vec<Uuid>> {
+        use pumpkin_util::math::boundingbox::BoundingBox;
+        let entities = world.entities.load();
+        let mut crystals = Vec::new();
+        // EnderDragonFight.tryRespawn queries all crystals intersecting each ritual block.
+        for (dx, dz) in [(0, -3), (3, 0), (0, 3), (-3, 0)] {
+            let min = Vector3::new(
+                (portal.0.x + dx) as f64,
+                (portal.0.y + 1) as f64,
+                (portal.0.z + dz) as f64,
+            );
+            let bounds = BoundingBox::new(min, min + Vector3::new(1.0, 1.0, 1.0));
+            let found = entities
+                .iter()
+                .filter(|entity| {
+                    entity.get_entity().entity_type == &EntityType::END_CRYSTAL
+                        && entity.get_entity().is_alive()
+                        && entity.get_entity().bounding_box.load().intersects(&bounds)
+                })
+                .map(|entity| entity.get_entity().entity_uuid)
+                .collect::<Vec<_>>();
+            if found.is_empty() {
+                return None;
+            }
+            crystals.extend(found);
+        }
+        Some(crystals)
+    }
+
+    fn recover_legacy_respawn(&mut self, world: &Arc<World>) -> bool {
+        if !self.dragon_killed {
+            return false;
+        }
+        let Some(portal) = self
+            .exit_portal_location
+            .or_else(|| self.find_exit_portal(world))
+        else {
+            return false;
+        };
+        let Some(crystals) = Self::find_respawn_crystals(world, portal) else {
+            return false;
+        };
+        self.legacy_respawn_pending = false;
+        self.respawn_stage = None;
+        self.respawn_dragon(world, crystals);
+        true
     }
 
     pub fn respawn_dragon(&mut self, world: &Arc<World>, crystals: Vec<Uuid>) {
@@ -665,9 +706,16 @@ impl DragonFight {
         }
     }
 
+    fn tick_respawn(&mut self, world: &Arc<World>) {
+        if let Some(stage) = self.respawn_stage {
+            let time = self.respawn_time;
+            self.respawn_time = self.respawn_time.wrapping_add(1);
+            self.tick_respawn_stage(world, stage, time);
+        }
+    }
+
     #[expect(clippy::too_many_lines)]
-    fn tick_respawn_stage(&mut self, world: &Arc<World>, stage: DragonRespawnStage) {
-        let time = self.respawn_time;
+    fn tick_respawn_stage(&mut self, world: &Arc<World>, stage: DragonRespawnStage, time: i32) {
         let origin_y = self.origin.0.y + DRAGON_SPAWN_Y;
         let origin_target = BlockPos::new(self.origin.0.x, origin_y, self.origin.0.z);
 
@@ -712,7 +760,7 @@ impl DragonFight {
                 let flag = time % 40 == 0;
                 let flag1 = time % 40 == 39;
                 if flag || flag1 {
-                    let spikes = Self::get_spikes();
+                    let spikes = Self::get_spikes(world.level.seed.0);
                     let j = (time / 40) as usize;
                     if j < spikes.len() {
                         let spike = &spikes[j];
@@ -775,7 +823,7 @@ impl DragonFight {
                 } else if time >= 80 {
                     world.sync_world_event(WorldEvent::AnimationDragonSummonRoar, origin_target, 0);
                 } else if time == 0 {
-                    let spikes = Self::get_spikes();
+                    let spikes = Self::get_spikes(world.level.seed.0);
                     for spike in &spikes {
                         let (min_x, min_y, min_z, max_x, max_y, max_z) = spike.top_bounding_box();
                         for entity in entities.iter() {
@@ -871,7 +919,7 @@ impl DragonFight {
     }
 
     pub fn reset_spike_crystals(&self, world: &Arc<World>) {
-        let spikes = Self::get_spikes();
+        let spikes = Self::get_spikes(world.level.seed.0);
         let entities = world.entities.load();
 
         for spike in &spikes {
@@ -902,15 +950,6 @@ impl DragonFight {
     }
 
     pub fn spawn_new_gateway(&mut self, world: &Arc<World>) {
-        use rand::seq::SliceRandom;
-
-        if self.gateways.is_empty() {
-            let mut new_gateways: Vec<i32> = (0..(GATEWAY_COUNT as i32)).collect();
-            let mut rng = rand::rng();
-            new_gateways.shuffle(&mut rng);
-            self.gateways = new_gateways;
-        }
-
         if let Some(gateway) = self.gateways.pop() {
             let angle =
                 2.0 * (-std::f64::consts::PI + (std::f64::consts::PI / 20.0) * gateway as f64);
@@ -967,7 +1006,7 @@ impl DragonFight {
     // ── Crystal spawning ──────────────────────────────────────────────────────
 
     pub fn spawn_crystals(&mut self, world: &Arc<World>) {
-        let spikes = Self::get_spikes();
+        let spikes = Self::get_spikes(world.level.seed.0);
         let entities = world.entities.load();
         for spike in &spikes {
             let bb = spike.top_bounding_box();
@@ -1134,5 +1173,155 @@ impl DragonFight {
     #[must_use]
     pub const fn dragon_uuid(&self) -> Option<Uuid> {
         self.dragon_uuid
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::block::registry::BlockRegistry;
+    use arc_swap::ArcSwap;
+    use pumpkin_config::world::LevelConfig;
+    use pumpkin_data::dimension::Dimension;
+    use pumpkin_util::world_seed::Seed;
+    use pumpkin_world::{chunk::ChunkData, level::Level, world_info::LevelData};
+    use std::sync::Weak;
+
+    fn world(path: &std::path::Path) -> Arc<World> {
+        let level = Level::from_root_folder(
+            &LevelConfig::default(),
+            path.to_path_buf(),
+            0,
+            Dimension::THE_END,
+        )
+        .unwrap();
+        Arc::new(
+            World::load(
+                level,
+                Arc::new(ArcSwap::from_pointee(LevelData::default(Seed(0)))),
+                Dimension::THE_END,
+                Arc::new(BlockRegistry::default()),
+                Weak::new(),
+            )
+            .unwrap(),
+        )
+    }
+
+    fn crystal(world: &Arc<World>, position: Vector3<f64>) -> Arc<EndCrystalEntity> {
+        let crystal = Arc::new(EndCrystalEntity::new(Entity::new(
+            world.clone(),
+            position,
+            &EntityType::END_CRYSTAL,
+        )));
+        world.add_entity_silent(crystal.clone());
+        crystal
+    }
+
+    #[tokio::test]
+    async fn arena_waits_for_live_entity_admission_before_ticking() {
+        let directory = tempfile::tempdir().unwrap();
+        let world = world(directory.path());
+        let fight = DragonFight::new();
+        for x in -3..=3 {
+            for z in -3..=3 {
+                world
+                    .level
+                    .loaded_chunks
+                    .insert(Vector2::new(x, z), Arc::new(ChunkData::empty(x, z)));
+            }
+        }
+        assert!(!fight.is_arena_loaded(&world));
+        let admission_guard = world.entity_storage_lock.lock().await;
+        for pos in fight.arena_entity_chunks() {
+            let chunk = world.level.get_entity_chunk(pos).await;
+            assert!(!chunk.live.load(std::sync::atomic::Ordering::Acquire));
+            world.load_entity_chunk(&chunk, None);
+        }
+        assert!(fight.is_arena_loaded(&world));
+        drop(admission_guard);
+        world.level.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn respawn_transition_dispatches_new_stage_at_time_zero() {
+        let directory = tempfile::tempdir().unwrap();
+        let world = world(directory.path());
+        let ritual = crystal(&world, Vector3::new(0.5, 65.0, 3.5));
+        let spike = &DragonFight::get_spikes(world.level.seed.0)[0];
+        let spike_crystal = crystal(
+            &world,
+            Vector3::new(
+                spike.center_x as f64 + 0.5,
+                (spike.height + 1) as f64,
+                spike.center_z as f64 + 0.5,
+            ),
+        );
+        let mut fight = DragonFight::new();
+        fight.respawn_stage = Some(DragonRespawnStage::SummoningPillars);
+        fight.respawn_time = 400;
+        fight.respawn_crystals = vec![ritual.get_entity().entity_uuid];
+        fight.tick_respawn(&world);
+        assert_eq!(
+            fight.respawn_stage,
+            Some(DragonRespawnStage::SummoningDragon)
+        );
+        assert_eq!(fight.respawn_time, 0);
+        assert_eq!(spike_crystal.beam_target(), None);
+        fight.tick_respawn(&world);
+        assert_eq!(fight.respawn_time, 1);
+        assert_eq!(spike_crystal.beam_target(), Some(BlockPos::new(0, 128, 0)));
+        world.level.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn legacy_respawn_reacquires_all_ritual_crystals_before_restarting() {
+        let directory = tempfile::tempdir().unwrap();
+        let world = world(directory.path());
+        for x in -3..=3 {
+            for z in -3..=3 {
+                world
+                    .level
+                    .loaded_chunks
+                    .insert(Vector2::new(x, z), Arc::new(ChunkData::empty(x, z)));
+            }
+        }
+        let portal = BlockPos::new(0, 64, 0);
+        let mut fight = DragonFight::new();
+        fight.needs_state_scanning = false;
+        fight.dragon_killed = true;
+        fight.previously_killed = true;
+        fight.exit_portal_location = Some(portal);
+        fight.respawn_stage = Some(DragonRespawnStage::Start);
+        fight.legacy_respawn_pending = true;
+        let before = fight.saved_data();
+        assert!(!fight.recover_legacy_respawn(&world));
+        assert_eq!(fight.saved_data(), before);
+        let mut ritual = Vec::new();
+        for (x, z) in [(0, -3), (3, 0), (0, 3), (-3, 0)] {
+            ritual.push(crystal(
+                &world,
+                Vector3::new(x as f64 + 0.5, 65.0, z as f64 + 0.5),
+            ));
+        }
+        let extra = crystal(&world, Vector3::new(0.75, 65.0, -2.75));
+        assert!(fight.recover_legacy_respawn(&world));
+        assert_eq!(fight.respawn_stage, Some(DragonRespawnStage::Start));
+        assert!(!fight.legacy_respawn_pending);
+        assert_eq!(fight.respawn_crystals.len(), 5);
+        assert!(
+            fight
+                .respawn_crystals
+                .contains(&extra.get_entity().entity_uuid)
+        );
+        fight.tick_respawn(&world);
+        assert_eq!(
+            fight.respawn_stage,
+            Some(DragonRespawnStage::PreparingToSummonPillars)
+        );
+        assert_eq!(fight.respawn_time, 0);
+        for crystal in ritual {
+            assert_eq!(crystal.beam_target(), Some(BlockPos::new(0, 128, 0)));
+        }
+        world.level.shutdown().await;
     }
 }

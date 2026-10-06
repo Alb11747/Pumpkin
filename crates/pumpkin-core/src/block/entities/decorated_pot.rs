@@ -1,4 +1,5 @@
 use super::BlockEntity;
+use pumpkin_data::data_component_impl::{DataComponentImpl, PotDecorationsImpl};
 use pumpkin_data::item_stack::ItemStack;
 use pumpkin_nbt::compound::NbtCompound;
 use pumpkin_nbt::tag::NbtTag;
@@ -7,7 +8,7 @@ use std::sync::Mutex;
 
 pub struct DecoratedPotBlockEntity {
     pub position: BlockPos,
-    pub sherds: Mutex<Option<Vec<NbtTag>>>,
+    pub sherds: Mutex<Option<NbtTag>>,
     pub item: Mutex<Option<ItemStack>>,
 }
 
@@ -24,7 +25,15 @@ impl BlockEntity for DecoratedPotBlockEntity {
     where
         Self: Sized,
     {
-        let sherds = nbt.get_list("sherds").map(<[_]>::to_vec);
+        let sherds = nbt.get("sherds").map(|data| {
+            PotDecorationsImpl::read_data(data).map_or_else(
+                || {
+                    tracing::warn!("Cannot decode decorated pot sherds");
+                    data.clone()
+                },
+                |decorations| decorations.write_data(),
+            )
+        });
         let item = nbt
             .get_compound("item")
             .and_then(ItemStack::read_item_stack);
@@ -39,7 +48,7 @@ impl BlockEntity for DecoratedPotBlockEntity {
         if let Ok(sherds) = self.sherds.lock()
             && let Some(sh) = sherds.as_ref()
         {
-            nbt.put_list("sherds", sh.clone());
+            nbt.put("sherds", sh.clone());
         }
         if let Ok(item) = self.item.lock()
             && let Some(it) = item.as_ref()
@@ -55,7 +64,7 @@ impl BlockEntity for DecoratedPotBlockEntity {
         if let Ok(sherds) = self.sherds.try_lock()
             && let Some(ref sh) = *sherds
         {
-            nbt.put_list("sherds", sh.clone());
+            nbt.put("sherds", sh.clone());
         }
         if let Ok(item) = self.item.try_lock()
             && let Some(ref it) = *item
@@ -144,5 +153,50 @@ impl DecoratedPotBlockEntity {
                     1 + (filled * 14.0).floor() as u8
                 }
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pot_block_entity_preserves_modern_sides_and_upgrades_legacy_sherds() {
+        let mut side = NbtCompound::new();
+        side.put_string("id", "minecraft:angler_pottery_sherd".into());
+        side.put_long("example:unknown", 9);
+        let mut sherds = NbtCompound::new();
+        sherds.put_compound("front", side);
+        let mut nbt = NbtCompound::new();
+        nbt.put_compound("sherds", sherds.clone());
+        let pot = DecoratedPotBlockEntity::from_nbt(&nbt, BlockPos::new(0, 64, 0));
+        let mut saved = NbtCompound::new();
+        pot.write_nbt(&mut saved);
+        assert_eq!(saved.get_compound("sherds"), Some(&sherds));
+        assert_eq!(
+            pot.chunk_data_nbt().unwrap().get_compound("sherds"),
+            Some(&sherds)
+        );
+        nbt.put_list(
+            "sherds",
+            vec![NbtTag::String("minecraft:angler_pottery_sherd".into())],
+        );
+        let pot = DecoratedPotBlockEntity::from_nbt(&nbt, BlockPos::new(0, 64, 0));
+        let saved = pot.chunk_data_nbt().unwrap();
+        let sides = saved.get_compound("sherds").unwrap();
+        assert_eq!(
+            sides.get_compound("back").unwrap().get_string("id"),
+            Some("minecraft:angler_pottery_sherd")
+        );
+        assert_eq!(
+            sides.get_compound("front").unwrap().get_string("id"),
+            Some("minecraft:brick")
+        );
+        nbt.put_int("sherds", 17);
+        let malformed = DecoratedPotBlockEntity::from_nbt(&nbt, BlockPos::new(0, 64, 0));
+        assert_eq!(
+            malformed.chunk_data_nbt().unwrap().get_int("sherds"),
+            Some(17)
+        );
     }
 }

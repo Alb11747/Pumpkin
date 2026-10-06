@@ -46,6 +46,10 @@ impl BlockEntity for BrushableBlockBlockEntity {
         }
     }
 
+    fn nbt_aliases(&self) -> &'static [(&'static str, &'static str)] {
+        &[("direction", "hit_direction")]
+    }
+
     fn write_nbt(&self, nbt: &mut NbtCompound) {
         if let Ok(loot_table) = self.loot_table.lock()
             && let Some(table) = loot_table.as_ref()
