@@ -1681,7 +1681,8 @@ impl World {
                     let entity_bb = entity_inner.bounding_box.load();
 
                     for (player, player_pos, player_bb, player_chunk) in &players_cache {
-                        if (player_chunk.x - entity_chunk.x).abs() <= 1
+                        if !player.is_viewing_end_credits()
+                            && (player_chunk.x - entity_chunk.x).abs() <= 1
                             && (player_chunk.y - entity_chunk.y).abs() <= 1
                             && (player_pos.x - entity_pos.x).abs() < 5.0
                             && (player_pos.y - entity_pos.y).abs() < 5.0
@@ -3833,7 +3834,7 @@ impl World {
         chunker::update_position_and_wait(player).await;
         // Update commands
 
-        player.set_health(20.0);
+        player.send_health();
     }
 
     pub fn explode(

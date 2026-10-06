@@ -719,6 +719,27 @@ impl JavaClient {
         self.close_token.is_cancelled()
     }
 
+    fn end_credits_allows_packet(packet_id: i32) -> bool {
+        let version = CURRENT_MC_VERSION;
+        [
+            SClientCommand::to_id(version),
+            pumpkin_protocol::java::server::play::SKeepAlive::to_id(version),
+            SPlayPong::to_id(version),
+            SPlayPingRequest::to_id(version),
+            SConfirmTeleport::to_id(version),
+            SClientInformationPlay::to_id(version),
+            SChunkBatch::to_id(version),
+            SPlayerLoaded::to_id(version),
+            SPlayResourcePack::to_id(version),
+            SPCookieResponse::to_id(version),
+            SConfigurationAcknowledged::to_id(version),
+            SChatAck::to_id(version),
+            SPlayerSession::to_id(version),
+            SClientTickEnd::to_id(version),
+        ]
+        .contains(&packet_id)
+    }
+
     #[expect(clippy::too_many_lines)]
     pub fn handle_play_packet(
         &self,
@@ -736,6 +757,12 @@ impl JavaClient {
         );
         server.plugin_manager.fire_blocking(server, &mut event);
         if event.cancelled {
+            return Ok(());
+        }
+
+        // Keep protocol acknowledgements alive while the registered player waits
+        // for credits completion; no movement or inventory/world interactions.
+        if player.is_viewing_end_credits() && !Self::end_credits_allows_packet(event.packet_id) {
             return Ok(());
         }
 
@@ -1214,5 +1241,43 @@ impl JavaClient {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod end_credits_tests {
+    use super::*;
+
+    #[test]
+    fn credits_pause_admits_completion_and_transport_but_no_gameplay() {
+        let version = CURRENT_MC_VERSION;
+        for packet in [
+            SClientCommand::to_id(version),
+            pumpkin_protocol::java::server::play::SKeepAlive::to_id(version),
+            SConfirmTeleport::to_id(version),
+            SChunkBatch::to_id(version),
+            SPlayerLoaded::to_id(version),
+            SPlayPong::to_id(version),
+        ] {
+            assert!(JavaClient::end_credits_allows_packet(packet));
+        }
+        for packet in [
+            SPlayerPosition::to_id(version),
+            SPlayerPositionRotation::to_id(version),
+            SPlayerRotation::to_id(version),
+            SSetPlayerGround::to_id(version),
+            SPlayerInput::to_id(version),
+            SMoveVehicle::to_id(version),
+            SPaddleBoat::to_id(version),
+            SAttack::to_id(version),
+            SInteract::to_id(version),
+            SPlayerAction::to_id(version),
+            SUseItemOn::to_id(version),
+            SUseItem::to_id(version),
+            SClickSlot::to_id(version),
+            SChatCommand::to_id(version),
+        ] {
+            assert!(!JavaClient::end_credits_allows_packet(packet));
+        }
     }
 }

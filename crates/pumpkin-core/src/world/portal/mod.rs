@@ -68,6 +68,56 @@ impl PortalType {
         }
     }
 
+    pub(crate) async fn end_exit_destination(
+        current_level: &World,
+        dest_world: Arc<World>,
+        player: Option<&crate::entity::player::Player>,
+    ) -> Option<TeleportTransition> {
+        // EndPortalBlock uses the player's respawn block without consuming it.
+        if let Some(player) = player {
+            if let Some(respawn) = player.calculate_respawn_point(false).await {
+                let new_world = current_level
+                    .server
+                    .upgrade()?
+                    .worlds
+                    .load()
+                    .iter()
+                    .find(|world| world.dimension == respawn.dimension)?
+                    .clone();
+                return Some(TeleportTransition {
+                    new_world,
+                    position: respawn.position,
+                    yaw: Some(respawn.yaw),
+                    pitch: Some(respawn.pitch),
+                });
+            }
+            if player
+                .respawn_point
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_some()
+            {
+                player.try_send_client_packet(
+                    &pumpkin_protocol::java::client::play::CGameEvent::new(
+                        pumpkin_protocol::java::client::play::GameEvent::NoRespawnBlockAvailable,
+                        0.0,
+                    ),
+                );
+            }
+        }
+        let info = dest_world.level_info.load();
+        Some(TeleportTransition {
+            new_world: dest_world,
+            position: Vector3::new(
+                f64::from(info.spawn_x) + 0.5,
+                f64::from(info.spawn_y),
+                f64::from(info.spawn_z) + 0.5,
+            ),
+            yaw: Some(info.spawn_yaw),
+            pitch: Some(info.spawn_pitch),
+        })
+    }
+
     #[expect(clippy::too_many_lines)]
     pub fn get_portal_destination(
         &self,
@@ -135,77 +185,18 @@ impl PortalType {
                             pitch: None,
                         })
                     } else {
-                        // EndPortalBlock uses the player's respawn block without consuming it.
-                        if let Some(player) =
-                            current_level.get_player_by_id(caller.get_entity().entity_id)
+                        if let Some(player) = caller.get_player()
+                            && player.show_end_credits()
                         {
-                            match player.client.as_ref() {
-                                crate::net::ClientPlatform::Java(client) => {
-                                    if let Ok(data) = client.serialize_packet(&pumpkin_protocol::java::client::play::CGameEvent::new(
-                                        pumpkin_protocol::java::client::play::GameEvent::WinGame,
-                                        1.0,
-                                    )) {
-                                        client.try_enqueue_packet(data);
-                                    }
-                                }
-                                crate::net::ClientPlatform::Bedrock(client) => {
-                                    if let Ok(data) = client.serialize_packet(
-                                        &pumpkin_protocol::bedrock::client::CShowCredits {
-                                            player_runtime_id: (caller.get_entity().entity_id
-                                                as u64)
-                                                .into(),
-                                            credits_state: 0.into(),
-                                        },
-                                    ) {
-                                        client.try_enqueue_packet(data);
-                                    }
-                                }
-                            }
+                            return None;
                         }
-
-                        if let Some(player) = caller.get_player() {
-                            let handle = tokio::runtime::Handle::try_current().ok()?;
-                            let respawn = tokio::task::block_in_place(|| {
-                                handle.block_on(player.calculate_respawn_point(false))
-                            });
-                            if let Some(respawn) = respawn {
-                                let new_world = current_level
-                                    .server
-                                    .upgrade()?
-                                    .worlds
-                                    .load()
-                                    .iter()
-                                    .find(|world| world.dimension == respawn.dimension)?
-                                    .clone();
-                                return Some(TeleportTransition {
-                                    new_world,
-                                    position: respawn.position,
-                                    yaw: Some(respawn.yaw),
-                                    pitch: Some(respawn.pitch),
-                                });
-                            }
-                            if player
-                                .respawn_point
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .is_some()
-                            {
-                                player.try_send_client_packet(&pumpkin_protocol::java::client::play::CGameEvent::new(
-                                    pumpkin_protocol::java::client::play::GameEvent::NoRespawnBlockAvailable, 0.0,
-                                ));
-                            }
-                        }
-
-                        let info = dest_world.level_info.load();
-                        Some(TeleportTransition {
-                            new_world: dest_world,
-                            position: Vector3::new(
-                                f64::from(info.spawn_x) + 0.5,
-                                f64::from(info.spawn_y),
-                                f64::from(info.spawn_z) + 0.5,
-                            ),
-                            yaw: Some(info.spawn_yaw),
-                            pitch: Some(info.spawn_pitch),
+                        let handle = tokio::runtime::Handle::try_current().ok()?;
+                        tokio::task::block_in_place(|| {
+                            handle.block_on(Self::end_exit_destination(
+                                current_level,
+                                dest_world,
+                                caller.get_player(),
+                            ))
                         })
                     }
                 } else {

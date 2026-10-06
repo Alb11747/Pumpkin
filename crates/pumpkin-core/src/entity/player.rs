@@ -682,12 +682,77 @@ pub struct Player {
     pub fishing_bobber: AtomicI32,
     pub bedrock_skin: arc_swap::ArcSwap<pumpkin_protocol::bedrock::client::Skin>,
     pub seen_credits: AtomicBool,
+    end_credits: Arc<EndCreditsState>,
     pub warden_spawn_tracker: std::sync::Mutex<WardenSpawnTracker>,
     pub score: AtomicI32,
     pub spawn_extra_particles_on_fall: AtomicBool,
     pub post_effects: std::sync::Mutex<Vec<String>>,
     /// Inbound packets waiting to be processed during player tick.
     pub inbound_packets: SegQueue<RawPacket>,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum EndCreditsPhase {
+    #[default]
+    Playing,
+    Preparing,
+    Showing,
+    Returning,
+}
+
+#[derive(Default)]
+struct EndCreditsState {
+    phase: AtomicCell<EndCreditsPhase>,
+}
+
+#[derive(PartialEq, Eq, Debug)]
+enum EndCreditsStart {
+    AlreadySeen,
+    Waiting,
+    Show,
+}
+
+impl EndCreditsState {
+    fn start(&self, seen: &AtomicBool, dismount: impl FnOnce() -> bool) -> EndCreditsStart {
+        if self.phase.load() != EndCreditsPhase::Playing {
+            return EndCreditsStart::Waiting;
+        }
+        if self
+            .phase
+            .compare_exchange(EndCreditsPhase::Playing, EndCreditsPhase::Preparing)
+            .is_err()
+        {
+            return EndCreditsStart::Waiting;
+        }
+        if seen.load(Ordering::Acquire) {
+            self.phase.store(EndCreditsPhase::Playing);
+            return EndCreditsStart::AlreadySeen;
+        }
+        if !dismount() {
+            self.phase.store(EndCreditsPhase::Playing);
+            return EndCreditsStart::Waiting;
+        }
+        seen.store(true, Ordering::Release);
+        self.phase.store(EndCreditsPhase::Showing);
+        EndCreditsStart::Show
+    }
+
+    fn begin_return(self: &Arc<Self>) -> Option<EndCreditsReturn> {
+        self.phase
+            .compare_exchange(EndCreditsPhase::Showing, EndCreditsPhase::Returning)
+            .ok()?;
+        Some(EndCreditsReturn(self.clone()))
+    }
+}
+
+// A queued or running return can be dropped when the client disconnects or a task
+// is cancelled. Its transient pause must never survive that future.
+struct EndCreditsReturn(Arc<EndCreditsState>);
+
+impl Drop for EndCreditsReturn {
+    fn drop(&mut self) {
+        self.0.phase.store(EndCreditsPhase::Playing);
+    }
 }
 
 use base64::prelude::*;
@@ -989,6 +1054,7 @@ impl Player {
             fishing_bobber: AtomicI32::new(-1),
             bedrock_skin: ArcSwap::new(Arc::new(bedrock_skin)),
             seen_credits: AtomicBool::new(false),
+            end_credits: Arc::new(EndCreditsState::default()),
             warden_spawn_tracker: std::sync::Mutex::new(WardenSpawnTracker::default()),
             score: AtomicI32::new(0),
             spawn_extra_particles_on_fall: AtomicBool::new(false),
@@ -1334,6 +1400,7 @@ impl Player {
 
     /// Removes the [`Player`] out of the current [`World`].
     pub async fn remove(self: &Arc<Self>) {
+        self.end_credits.phase.store(EndCreditsPhase::Playing);
         if !self
             .current_screen_handler
             .lock()
@@ -2912,6 +2979,9 @@ impl Player {
     #[expect(clippy::too_many_lines)]
     pub fn tick<'a>(&'a self, server: &'a Server) {
         self.process_inbound_packets();
+        if self.is_viewing_end_credits() {
+            return;
+        }
 
         if self.is_spectator() {
             self.living_entity
@@ -4199,8 +4269,109 @@ impl Player {
         ));
     }
 
+    /// Keeps gameplay paused while the client displays or completes End credits.
+    #[must_use]
+    pub(crate) fn is_viewing_end_credits(&self) -> bool {
+        self.end_credits.phase.load() != EndCreditsPhase::Playing
+    }
+
+    // ServerPlayer.showEndCredits removes the vanilla player from the level. Keep
+    // Pumpkin's player registered instead: inbound packets and disconnect saving
+    // require that registration. Tick, gameplay packets and damage are paused.
+    #[must_use]
+    pub(crate) fn show_end_credits(&self) -> bool {
+        if self.client.closed() || self.living_entity.health.load() <= 0.0 {
+            return true;
+        }
+        match self.end_credits.start(&self.seen_credits, || {
+            self.get_entity().dismount_before_teleport()
+        }) {
+            EndCreditsStart::AlreadySeen => false,
+            EndCreditsStart::Waiting => true,
+            EndCreditsStart::Show => match self.client.as_ref() {
+                ClientPlatform::Java(client) => {
+                    client.try_send_packet(&CGameEvent::new(GameEvent::WinGame, 0.0));
+                    true
+                }
+                ClientPlatform::Bedrock(client) => {
+                    if let Ok(data) =
+                        client.serialize_packet(&pumpkin_protocol::bedrock::client::CShowCredits {
+                            player_runtime_id: (self.entity_id() as u64).into(),
+                            credits_state: 0.into(),
+                        })
+                    {
+                        client.try_enqueue_packet(data);
+                    }
+                    // Bedrock has no credits-completion handler yet. Keep its
+                    // immediate return, but display credits only once.
+                    self.end_credits.phase.store(EndCreditsPhase::Playing);
+                    false
+                }
+            },
+        }
+    }
+
+    pub(crate) fn finish_end_credits(
+        self: &Arc<Self>,
+    ) -> Option<impl Future<Output = ()> + Send + 'static + use<>> {
+        // Claim before spawning so duplicate client actions cannot transfer twice.
+        let returning = self.end_credits.begin_return()?;
+        let player = self.clone();
+        Some(async move {
+            let _returning = returning;
+            let world = player.world();
+            let destination = world
+                .server
+                .upgrade()
+                .map(|server| server.get_world_from_dimension(&Dimension::OVERWORLD));
+            if let Some(destination) = destination {
+                let transition = tokio::select! {
+                    () = player.client.await_close_interrupt() => return,
+                    transition = crate::world::portal::PortalType::end_exit_destination(
+                        &world,
+                        destination,
+                        Some(player.as_ref()),
+                    ) => transition,
+                };
+                // Once transfer starts, let the existing client task tracker wait
+                // for it before disconnect removal. Do not cancel halfway through
+                // detaching from one world and registering in the other.
+                if !player.client.closed()
+                    && let Some(transition) = transition
+                    && player
+                        .try_teleport_world(
+                            transition.new_world,
+                            transition.position,
+                            transition.yaw,
+                            transition.pitch,
+                        )
+                        .await
+                {
+                    return;
+                }
+            }
+            if player.client.closed() {
+                return;
+            }
+
+            // A plugin can cancel the return. Reopen the current world without
+            // mutating registration, inventory, stats or the approved position.
+            let world = player.world();
+            player.send_java_respawn(&world).await;
+            player.send_permission_lvl_update();
+            player.send_abilities_update();
+            player
+                .player_screen_handler
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .sync_state();
+            player.send_health();
+            let entity = player.get_entity();
+            player.apply_teleport(entity.pos.load(), entity.yaw.load(), entity.pitch.load());
+        })
+    }
+
     /// Teleports the player to a different world or dimension with an optional position, yaw, and pitch.
-    #[expect(clippy::too_many_lines)]
     pub async fn teleport_world(
         self: &Arc<Self>,
         new_world: Arc<World>,
@@ -4208,12 +4379,24 @@ impl Player {
         yaw: Option<f32>,
         pitch: Option<f32>,
     ) {
+        self.try_teleport_world(new_world, position, yaw, pitch)
+            .await;
+    }
+
+    #[expect(clippy::too_many_lines)]
+    async fn try_teleport_world(
+        self: &Arc<Self>,
+        new_world: Arc<World>,
+        position: Vector3<f64>,
+        yaw: Option<f32>,
+        pitch: Option<f32>,
+    ) -> bool {
         let current_world = self.living_entity.entity.world.load_full();
         let yaw = yaw.unwrap_or(new_world.level_info.load().spawn_yaw);
         let pitch = pitch.unwrap_or(new_world.level_info.load().spawn_pitch);
 
         let Some(server) = new_world.server.upgrade() else {
-            return;
+            return false;
         };
 
         send_cancellable! {{
@@ -4231,10 +4414,10 @@ impl Player {
             'after: {
                 // TODO: this is duplicate code from world
                 let Some(position) = self.approve_teleport(event.position) else {
-                    return;
+                    return false;
                 };
                 if !self.get_entity().dismount_before_teleport() {
-                    return;
+                    return false;
                 }
                 let yaw = event.yaw;
                 let pitch = event.pitch;
@@ -4242,7 +4425,7 @@ impl Player {
 
                 self.set_client_loaded(false);
                 let Some(player) = current_world.remove_player(self, false).await else {
-                    return;
+                    return false;
                 };
                new_world.players.rcu(|current_list| {
                     let mut new_list = (**current_list).clone();
@@ -4264,32 +4447,9 @@ impl Player {
                     });
                 }
 
-                let last_pos = self.living_entity.entity.last_pos.load();
-                let death_dimension = ResourceLocation::from(self.world().dimension.minecraft_name);
-                let death_location = BlockPos(Vector3::new(
-                    last_pos.x.round() as i32,
-                    last_pos.y.round() as i32,
-                    last_pos.z.round() as i32,
-                ));
                 match self.client.as_ref() {
-                    ClientPlatform::Java(java) => {
-                        let packet = CRespawn::new(
-                            PlayerSpawnData::new(
-                                new_world.dimension.clone(),
-                                biome::hash_seed(new_world.level.seed.0), // seed
-                                self.gamemode.load() as u8,
-                                self.previous_gamemode.load().unwrap_or(self.gamemode.load()) as i8,
-                                false,
-                                false,
-                                Some((death_dimension, death_location)),
-                                VarInt(self.get_entity().portal_cooldown.load(Ordering::Relaxed) as i32),
-                                new_world.sea_level.into(),
-                            ),
-                            CRespawn::KEEP_ALL_DATA,
-                        );
-                        if let Ok(data) = java.serialize_packet(&packet) {
-                            java.send_packet_now(data).await;
-                        }
+                    ClientPlatform::Java(_) => {
+                        self.send_java_respawn(&new_world).await;
                     }
                     ClientPlatform::Bedrock(bedrock) => {
                         let bedrock_dimension = if new_world.dimension == Dimension::OVERWORLD {
@@ -4347,8 +4507,10 @@ impl Player {
                     cancelled: false,
                 };
                 server.plugin_manager.fire(&server, &mut changed_world_event).await;
+                return true;
             }
         }}
+        false
     }
 
     /// `yaw` and `pitch` are in degrees.
@@ -4357,6 +4519,38 @@ impl Player {
     pub fn request_teleport(&self, position: Vector3<f64>, yaw: f32, pitch: f32) {
         if let Some(position) = self.approve_teleport(position) {
             self.apply_teleport(position, yaw, pitch);
+        }
+    }
+
+    async fn send_java_respawn(&self, world: &World) {
+        let ClientPlatform::Java(java) = self.client.as_ref() else {
+            return;
+        };
+        let last_pos = self.living_entity.entity.last_pos.load();
+        let death_dimension = ResourceLocation::from(self.world().dimension.minecraft_name);
+        let death_location = BlockPos(Vector3::new(
+            last_pos.x.round() as i32,
+            last_pos.y.round() as i32,
+            last_pos.z.round() as i32,
+        ));
+        let packet = CRespawn::new(
+            PlayerSpawnData::new(
+                world.dimension.clone(),
+                biome::hash_seed(world.level.seed.0), // seed
+                self.gamemode.load() as u8,
+                self.previous_gamemode
+                    .load()
+                    .unwrap_or(self.gamemode.load()) as i8,
+                false,
+                false,
+                Some((death_dimension, death_location)),
+                VarInt(self.get_entity().portal_cooldown.load(Ordering::Relaxed) as i32),
+                world.sea_level.into(),
+            ),
+            CRespawn::KEEP_ALL_DATA,
+        );
+        if let Ok(data) = java.serialize_packet(&packet) {
+            java.send_packet_now(data).await;
         }
     }
 
@@ -7143,6 +7337,9 @@ impl EntityBase for Player {
     }
 
     fn set_on_fire_for_ticks(&self, ticks: u32) {
+        if self.is_viewing_end_credits() {
+            return;
+        }
         let entity = self.get_entity();
         let ticks = if entity.invulnerable.load(Ordering::Relaxed) {
             1
@@ -7155,7 +7352,13 @@ impl EntityBase for Player {
     }
 
     fn is_pushable(&self) -> bool {
-        self.gamemode.load() != GameMode::Spectator && self.gamemode.load() != GameMode::Creative
+        !self.is_viewing_end_credits()
+            && self.gamemode.load() != GameMode::Spectator
+            && self.gamemode.load() != GameMode::Creative
+    }
+
+    fn is_immune_to_explosion(&self) -> bool {
+        self.is_viewing_end_credits()
     }
 
     fn get_name(&self) -> TextComponent {
@@ -8420,6 +8623,88 @@ mod tests {
     use super::{bedrock_inventory_slot, merge_player_nbt, read_root_vehicle, write_root_vehicle};
     use pumpkin_nbt::{compound::NbtCompound, tag::NbtTag};
     use uuid::Uuid;
+
+    #[test]
+    fn end_credits_respects_imported_history_cancelled_dismount_and_single_completion() {
+        use super::{EndCreditsPhase, EndCreditsStart, EndCreditsState};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        let seen = AtomicBool::new(true);
+        let state = Arc::new(EndCreditsState::default());
+        assert_eq!(
+            state.start(&seen, || panic!("already-seen credits must not dismount")),
+            EndCreditsStart::AlreadySeen
+        );
+        assert!(state.begin_return().is_none());
+
+        seen.store(false, Ordering::Relaxed);
+        assert_eq!(state.start(&seen, || false), EndCreditsStart::Waiting);
+        assert!(!seen.load(Ordering::Relaxed));
+        assert!(state.phase.load() == EndCreditsPhase::Playing);
+        assert!(state.begin_return().is_none());
+
+        assert_eq!(state.start(&seen, || true), EndCreditsStart::Show);
+        assert!(seen.load(Ordering::Relaxed));
+        assert_eq!(
+            state.start(&seen, || panic!("repeated portal collision")),
+            EndCreditsStart::Waiting
+        );
+        let returning = state.begin_return().unwrap();
+        assert!(
+            state.begin_return().is_none(),
+            "duplicate completion must not teleport twice"
+        );
+        assert_eq!(
+            state.start(&seen, || panic!("return is already running")),
+            EndCreditsStart::Waiting
+        );
+        drop(returning);
+        assert!(state.phase.load() == EndCreditsPhase::Playing);
+
+        // Reconnect has no transient phase; the saved seenCredits flag still
+        // bypasses the credits path and goes straight to the normal End return.
+        let mut saved = NbtCompound::new();
+        saved.put_bool("seenCredits", seen.load(Ordering::Relaxed));
+        let reloaded_seen = AtomicBool::new(saved.get_bool("seenCredits").unwrap());
+        let reloaded = EndCreditsState::default();
+        assert_eq!(
+            reloaded.start(&reloaded_seen, || panic!("credits already completed")),
+            EndCreditsStart::AlreadySeen
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_end_credits_return_before_or_during_poll_releases_pause() {
+        use super::{EndCreditsPhase, EndCreditsStart, EndCreditsState};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        for poll_first in [false, true] {
+            let seen = AtomicBool::new(false);
+            let state = Arc::new(EndCreditsState::default());
+            assert_eq!(state.start(&seen, || true), EndCreditsStart::Show);
+            let returning = state.begin_return().unwrap();
+            let mut future = Box::pin(async move {
+                let _returning = returning;
+                std::future::pending::<()>().await;
+            });
+            if poll_first {
+                assert!(futures::poll!(&mut future).is_pending());
+            }
+            drop(future);
+            assert!(state.phase.load() == EndCreditsPhase::Playing);
+            assert!(seen.load(Ordering::Relaxed));
+            assert_eq!(
+                state.start(&seen, || panic!("must not replay credits")),
+                EndCreditsStart::AlreadySeen
+            );
+        }
+    }
 
     #[test]
     fn respawn_rotation_migrates_without_losing_unknown_fields_or_reviving_cleared_points() {

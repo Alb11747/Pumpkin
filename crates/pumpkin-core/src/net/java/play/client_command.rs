@@ -8,8 +8,13 @@ impl JavaClient {
         player.update_last_action_time();
         match client_status.action_id.0 {
             SClientCommand::PERFORM_RESPAWN => {
-                // Perform respawn
-                if player.living_entity.health.load() > 0.0 {
+                // Vanilla handles wonGame before the health check. End return is
+                // an alive teleport, not a death reset of inventory, hunger or XP.
+                if let Some(return_to_game) = player.finish_end_credits() {
+                    player.spawn_task(return_to_game);
+                    return;
+                }
+                if player.is_viewing_end_credits() || player.living_entity.health.load() > 0.0 {
                     return;
                 }
                 let player_c = player.clone();

@@ -2938,6 +2938,12 @@ impl LivingEntity {
         source: Option<&dyn EntityBase>,
         cause: Option<&dyn EntityBase>,
     ) -> bool {
+        if caller
+            .get_player()
+            .is_some_and(crate::entity::player::Player::is_viewing_end_credits)
+        {
+            return false;
+        }
         let mut amount = amount;
 
         // Check invulnerability before applying damage
