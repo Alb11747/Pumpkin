@@ -1,0 +1,34 @@
+[package]
+name = "fobbitmc-bluemap"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+authors = ["FobbitMC Contributors"]
+description = "Pumpkin native live-player snapshots for BlueMap CLI"
+license = "GPL-3.0-only"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["native"]
+native = ["dep:pumpkin", "dep:pumpkin-util", "dep:tracing-subscriber"]
+
+[dependencies]
+# Native Rust plugins must use the exact server revision, toolchain and target.
+pumpkin = { git = "https://github.com/Alb11747/Pumpkin.git", rev = "f028d0a1c8ffa0ba885287507388f08515b78b59", package = "pumpkin-core", optional = true }
+pumpkin-util = { git = "https://github.com/Alb11747/Pumpkin.git", rev = "f028d0a1c8ffa0ba885287507388f08515b78b59", package = "pumpkin-util", optional = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = false
+codegen-units = 16
+
+[profile.dev]
+debug = false

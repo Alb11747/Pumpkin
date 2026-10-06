@@ -1,0 +1,5 @@
+/target/
+__pycache__/
+visibility.json
+live-players.json
+live-players.json.tmp
