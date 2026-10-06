@@ -15,6 +15,8 @@ use pumpkin_nbt::{serializer::NbtWriteHelperJava, tag::NbtTag};
 use pumpkin_util::version::JavaMinecraftVersion;
 
 const MAX_STATUS_EFFECTS: usize = 128;
+// ChargedProjectiles.STREAM_CODEC uses ItemStackTemplate + ByteBufCodecs.list(1024).
+const MAX_CHARGED_PROJECTILES: usize = 1024;
 
 #[must_use]
 pub fn data_to_proto_sound(id_or: &IdOr<SoundEvent>) -> crate::IdOr<crate::SoundEvent> {
@@ -2214,22 +2216,41 @@ impl DataComponentCodec<Self> for MapPostProcessingImpl {
 
 impl DataComponentCodec<Self> for ChargedProjectilesImpl {
     fn serialize(&self, seq: &mut impl NetworkWriteExt) -> Result<(), WritingError> {
+        use crate::codec::item_stack_seralizer::ItemStackTemplateSerializer;
+        use pumpkin_data::item_stack::ItemStack;
+
+        if self.projectiles.len() > MAX_CHARGED_PROJECTILES {
+            return Err(WritingError::Message("Too many charged projectiles".into()));
+        }
         seq.write_var_int(&VarInt::from(self.projectiles.len() as i32))?;
-        for _ in &self.projectiles {
-            seq.write_var_int(&VarInt(0))?;
-            seq.write_var_int(&VarInt(0))?;
-            seq.write_var_int(&VarInt(0))?;
-            seq.write_var_int(&VarInt(0))?;
+        for projectile in &self.projectiles {
+            let stack = ItemStack::read_item_stack(projectile)
+                .filter(|stack| !stack.is_empty())
+                .ok_or_else(|| {
+                    WritingError::Message("Invalid charged projectile item template".into())
+                })?;
+            // Vanilla uses required ItemStackTemplate entries, not empty slots.
+            ItemStackTemplateSerializer::from(stack).write(seq)?;
         }
         Ok(())
     }
 
     fn deserialize(seq: &mut impl NetworkReadExt) -> Result<Self, ReadingError> {
-        let len = seq.get_var_int()?.0 as usize;
+        use crate::codec::item_stack_seralizer::ItemStackSerializer;
+
+        let len = seq.get_var_int()?.0;
+        if !(0..=MAX_CHARGED_PROJECTILES as i32).contains(&len) {
+            return Err(ReadingError::Message(
+                "Charged projectile count out of bounds".into(),
+            ));
+        }
+        let len = len as usize;
         let mut projectiles = Vec::with_capacity(len);
         for _ in 0..len {
-            let _ = deserialize_item_stack_template(seq)?;
-            projectiles.push(pumpkin_nbt::compound::NbtCompound::new());
+            let stack = ItemStackSerializer::read_template0(seq, &JavaMinecraftVersion::V_26_3)?.0;
+            let mut projectile = pumpkin_nbt::compound::NbtCompound::new();
+            stack.write_item_stack(&mut projectile);
+            projectiles.push(projectile);
         }
         Ok(Self { projectiles })
     }
@@ -2851,6 +2872,62 @@ impl DataComponentCodec<Self> for BreakSoundImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn charged_projectiles_preserve_count_components_and_saved_nbt() {
+        let mut projectile = pumpkin_nbt::compound::NbtCompound::new();
+        projectile.put_string("id", "minecraft:arrow".into());
+        projectile.put_int("count", 2);
+        let mut custom = pumpkin_nbt::compound::NbtCompound::new();
+        custom.put_int("test_payload", 7);
+        let mut components = pumpkin_nbt::compound::NbtCompound::new();
+        components.put_compound("minecraft:custom_data", custom);
+        projectile.put_compound("components", components);
+        let value = ChargedProjectilesImpl {
+            projectiles: vec![projectile],
+        };
+        let saved = value.write_data();
+        let mut bytes = Vec::new();
+        value.serialize(&mut bytes).unwrap();
+        let mut input = bytes.as_slice();
+        let decoded = ChargedProjectilesImpl::deserialize(&mut input).unwrap();
+        assert_eq!(decoded, value);
+        assert!(input.is_empty());
+        assert_eq!(value.write_data(), saved);
+    }
+
+    #[test]
+    fn charged_projectiles_reject_empty_templates_and_invalid_lengths() {
+        for bytes in [
+            &[1, 0, 0, 0, 0][..],
+            &[1][..],
+            &[0x81, 0x08][..],
+            &[0xff, 0xff, 0xff, 0xff, 0x0f][..],
+        ] {
+            let mut input = bytes;
+            assert!(ChargedProjectilesImpl::deserialize(&mut input).is_err());
+        }
+        let mut air = pumpkin_nbt::compound::NbtCompound::new();
+        air.put_string("id", "minecraft:air".into());
+        air.put_int("count", 1);
+        assert!(
+            ChargedProjectilesImpl {
+                projectiles: vec![air]
+            }
+            .serialize(&mut Vec::new())
+            .is_err()
+        );
+        assert!(
+            ChargedProjectilesImpl {
+                projectiles: vec![
+                    pumpkin_nbt::compound::NbtCompound::new();
+                    MAX_CHARGED_PROJECTILES + 1
+                ],
+            }
+            .serialize(&mut Vec::new())
+            .is_err()
+        );
+    }
 
     #[test]
     fn pot_decorations_wire_uses_four_optional_item_templates() {

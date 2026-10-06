@@ -202,4 +202,52 @@ mod tests {
         let version = JavaMinecraftVersion::V_26_2;
         assert_armor_payload(&encoded_armor(version), version);
     }
+
+    #[test]
+    fn charged_crossbow_equipment_uses_nonempty_item_templates_for_26_3() {
+        use crate::ServerPacket;
+        use pumpkin_data::data_component::DataComponent;
+        use pumpkin_data::data_component_impl::{ChargedProjectilesImpl, DataComponentImpl};
+
+        let mut arrow = pumpkin_nbt::compound::NbtCompound::new();
+        arrow.put_string("id", "minecraft:arrow".into());
+        arrow.put_int("count", 1);
+        let crossbow = ItemStack::new_with_component(
+            1,
+            &Item::CROSSBOW,
+            vec![(
+                DataComponent::ChargedProjectiles,
+                Some(
+                    ChargedProjectilesImpl {
+                        projectiles: vec![arrow],
+                    }
+                    .to_dyn(),
+                ),
+            )],
+        );
+        let packet = CSetEquipment::new(VarInt(42), vec![(0, ItemStackSerializer::from(crossbow))]);
+        let mut bytes = Vec::new();
+        packet
+            .write_packet_data(&mut bytes, &JavaMinecraftVersion::V_26_3)
+            .unwrap();
+        // Official 26.3: crossbow ID1491, component51, arrow ID1009; the
+        // required nested template is item ID, count, then component patch.
+        assert_eq!(
+            bytes,
+            [42, 0, 1, 0xd3, 0x0b, 1, 0, 51, 1, 0xf1, 0x07, 1, 0, 0]
+        );
+        let mut input = bytes.as_slice();
+        let decoded = CSetEquipment::read(&mut input, &JavaMinecraftVersion::V_26_3).unwrap();
+        let projectiles = decoded.equipment[0]
+            .1
+            .0
+            .get_data_component::<ChargedProjectilesImpl>()
+            .unwrap();
+        assert_eq!(
+            projectiles.projectiles[0].get_string("id"),
+            Some("minecraft:arrow")
+        );
+        assert_eq!(projectiles.projectiles[0].get_int("count"), Some(1));
+        assert!(input.is_empty());
+    }
 }
