@@ -628,7 +628,8 @@ mod test {
     fn reports_writer_io_errors_as_io_errors() {
         let temp_dir = TempDir::new().unwrap();
         let level_folder = temp_dir.path().join("world");
-        File::create(&level_folder).unwrap();
+        let original_contents = b"existing file";
+        std::fs::write(&level_folder, original_contents).unwrap();
 
         let error = AnvilLevelInfo
             .write_world_info(&LevelData::default(Seed(42)), &level_folder)
@@ -637,7 +638,15 @@ mod test {
         let WorldInfoError::IoError(error) = error else {
             panic!("expected writer I/O error");
         };
-        assert_eq!(error.kind(), ErrorKind::AlreadyExists);
+        // A file at the directory path produces different errors across platforms.
+        assert!(
+            matches!(
+                error.kind(),
+                ErrorKind::AlreadyExists | ErrorKind::NotADirectory
+            ),
+            "expected a world-directory path conflict, got {error}"
+        );
+        assert_eq!(std::fs::read(&level_folder).unwrap(), original_contents);
     }
 
     #[test]
