@@ -154,6 +154,62 @@ async fn load(manager: &ChunkFileManager<TestSerializer>, folder: &LevelFolder) 
     chunk.value.load(Relaxed)
 }
 
+#[test]
+fn anvil_entity_save_and_reload_fit_on_a_one_mib_stack() {
+    // Windows' main thread has a 1 MiB stack. Test on an explicit stack so
+    // libtest's larger stack cannot mask overflowing region-loader frames.
+    std::thread::Builder::new()
+        .stack_size(1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    use crate::chunk::{ChunkEntityData, format::anvil::AnvilChunkFile};
+                    use pumpkin_config::chunk::AnvilChunkConfig;
+                    use pumpkin_nbt::compound::NbtCompound;
+
+                    let directory = tempfile::tempdir().unwrap();
+                    let folder = folder(directory.path());
+                    let manager = ChunkFileManager::<AnvilChunkFile<ChunkEntityData>>::new(
+                        AnvilChunkConfig::default(),
+                    );
+                    let position = Vector2::new(0, 0);
+                    let mut entity = NbtCompound::new();
+                    entity.put_string("id", "minecraft:armor_stand".into());
+                    let chunk = Arc::new(ChunkEntityData {
+                        x: 0,
+                        z: 0,
+                        data: std::sync::Mutex::new(vec![entity.clone()]),
+                        preserved_tags: std::sync::Mutex::new(NbtCompound::new()),
+                        live: AtomicBool::new(false),
+                        dirty: AtomicBool::new(true),
+                    });
+                    manager
+                        .save_chunks(&folder, vec![(position, chunk.clone())])
+                        .await
+                        .unwrap();
+                    assert!(manager.file_locks.read().await.is_empty());
+                    // Shutdown saves even clean snapshots, reloading a region
+                    // after its earlier save evicted the unwatched serializer.
+                    manager
+                        .save_chunks(&folder, vec![(position, chunk)])
+                        .await
+                        .unwrap();
+                    let (send, mut recv) = mpsc::channel(1);
+                    manager.fetch_chunks(&folder, &[position], send).await;
+                    let Some(LoadedData::Loaded(reloaded)) = recv.recv().await else {
+                        panic!("expected saved entity chunk");
+                    };
+                    assert_eq!(*reloaded.data.lock().unwrap(), vec![entity]);
+                });
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
 #[tokio::test]
 async fn watched_save_is_on_disk_before_unwatch_and_eviction() {
     let directory = tempfile::tempdir().unwrap();
