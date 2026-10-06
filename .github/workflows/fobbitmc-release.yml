@@ -1,0 +1,151 @@
+name: FobbitMC pinned release artifacts
+
+on:
+  workflow_dispatch:
+    inputs:
+      engine_sha:
+        description: Exact 40-character Alb11747/Pumpkin commit
+        required: true
+        type: string
+      bridge_sha:
+        description: Exact 40-character Alb11747/PatchBukkit commit pinned to engine_sha
+        required: true
+        type: string
+      build_exporter:
+        description: Build reviewed code-only exporter vendored in the selected workflow commit
+        default: false
+        type: boolean
+      exporter_sha:
+        description: Exact original exporter commit recorded in vendored source provenance
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fobbitmc-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: 2
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_RELEASE_OPT_LEVEL: 3
+  CARGO_PROFILE_RELEASE_LTO: "false"
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: 16
+  CARGO_PROFILE_RELEASE_DEBUG: 0
+  CARGO_PROFILE_RELEASE_STRIP: debuginfo
+  RUSTFLAGS: ""
+  RUST_TOOLCHAIN: 1.99.0
+  ENGINE_SHA: ${{ inputs.engine_sha }}
+  BRIDGE_SHA: ${{ inputs.bridge_sha }}
+  EXPORTER_SHA: ${{ inputs.exporter_sha }}
+  BUILD_EXPORTER: ${{ inputs.build_exporter }}
+
+jobs:
+  release:
+    if: github.repository == 'Alb11747/Pumpkin'
+    name: Matched release (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Keep checked-out source bytes identical on both runner platforms
+        run: git config --global core.autocrlf false
+      - name: Validate immutable inputs
+        run: |
+          [[ "$ENGINE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$BRIDGE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          if [[ "$BUILD_EXPORTER" == true ]]; then
+            [[ "$EXPORTER_SHA" =~ ^[0-9a-f]{40}$ ]]
+          fi
+      - name: Checkout workflow and verification helper
+        uses: actions/checkout@v7
+        with:
+          path: build-control
+          persist-credentials: false
+      - name: Checkout exact engine
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.engine_sha }}
+          path: engine
+          persist-credentials: false
+          submodules: recursive
+      - name: Checkout exact bridge
+        uses: actions/checkout@v7
+        with:
+          repository: Alb11747/PatchBukkit
+          ref: ${{ inputs.bridge_sha }}
+          path: bridge
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install exact shared Rust toolchain
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --target '${{ matrix.target }}'
+          rustup default "$RUST_TOOLCHAIN"
+          rustc +"$RUST_TOOLCHAIN" -Vv
+      - name: Set up JDK 25
+        uses: actions/setup-java@v5
+        with:
+          java-version: "25"
+          distribution: zulu
+      - name: Verify sources, engine pins and native API; prepare optional exporter
+        run: python build-control/.github/scripts/fobbitmc_release.py prepare '${{ matrix.target }}'
+      - name: Build optimized engine
+        working-directory: engine
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/fobbitmc-release-target
+        run: cargo +"$RUST_TOOLCHAIN" build --locked --release --target '${{ matrix.target }}' -p pumpkin
+      - name: Retain engine and release its temporary Cargo products
+        run: python build-control/.github/scripts/fobbitmc_release.py collect engine '${{ matrix.target }}'
+      - name: Build bridge JAR before embedding it in the native library
+        working-directory: bridge/java
+        run: bash ./gradlew --no-daemon :patchbukkit:jar
+      - name: Build optimized native bridge
+        working-directory: bridge/rust
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/fobbitmc-release-target
+        run: cargo +"$RUST_TOOLCHAIN" build --locked --release --target '${{ matrix.target }}' --lib
+      - name: Test native bridge library in the matching release profile
+        working-directory: bridge/rust
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/fobbitmc-release-target
+        run: cargo +"$RUST_TOOLCHAIN" test --locked --release --target '${{ matrix.target }}' --lib
+      - name: Retain bridge and embedded JAR; release temporary Cargo products
+        run: python build-control/.github/scripts/fobbitmc_release.py collect bridge '${{ matrix.target }}'
+      - name: Build optimized native exporter
+        if: inputs.build_exporter
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/fobbitmc-release-target
+        run: cargo +"$RUST_TOOLCHAIN" build --manifest-path "$RUNNER_TEMP/fobbitmc-bluemap/Cargo.toml" --locked --release --target '${{ matrix.target }}' --lib
+      - name: Test native exporter library in the matching release profile
+        if: inputs.build_exporter
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/fobbitmc-release-target
+        run: cargo +"$RUST_TOOLCHAIN" test --manifest-path "$RUNNER_TEMP/fobbitmc-bluemap/Cargo.toml" --locked --release --target '${{ matrix.target }}' --lib
+      - name: Retain exporter and release temporary Cargo products
+        if: inputs.build_exporter
+        run: python build-control/.github/scripts/fobbitmc_release.py collect exporter '${{ matrix.target }}'
+      - name: Verify Linux glibc ceiling and write artifact manifest
+        run: python build-control/.github/scripts/fobbitmc_release.py manifest '${{ matrix.target }}'
+      - name: Upload matched artifacts and provenance
+        uses: actions/upload-artifact@v7
+        with:
+          name: fobbitmc-${{ matrix.target }}-${{ inputs.engine_sha }}
+          path: dist/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
