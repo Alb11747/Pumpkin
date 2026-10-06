@@ -565,7 +565,9 @@ impl Server {
     pub fn save_world_info(&self) -> Result<(), WorldInfoError> {
         // Serialize snapshots and renames so an older concurrent write cannot win last.
         static WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _write_lock = WRITE_LOCK.lock().unwrap();
+        let _write_lock = WRITE_LOCK
+            .lock()
+            .map_err(|_| std::io::Error::other("World metadata save lock is poisoned"))?;
         let mut level_data = (**self.level_info.load()).clone();
         if let Some(overworld) = self
             .worlds

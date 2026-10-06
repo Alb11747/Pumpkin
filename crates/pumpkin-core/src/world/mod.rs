@@ -2000,10 +2000,10 @@ impl World {
                             {
                                 Ok(Ok(())) => {}
                                 Ok(Err(error)) => {
-                                    error!("Failed to autosave world metadata: {error}")
+                                    error!("Failed to autosave world metadata: {error}");
                                 }
                                 Err(error) => {
-                                    error!("World metadata autosave task failed: {error}")
+                                    error!("World metadata autosave task failed: {error}");
                                 }
                             }
                         }
