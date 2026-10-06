@@ -19,6 +19,10 @@ on:
         description: Exact original exporter commit recorded in vendored source provenance
         required: false
         type: string
+      autosave_baseline_sha:
+        description: Optional exact test-only engine commit expected to fail the autosave regression
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -42,6 +46,7 @@ env:
   BRIDGE_SHA: ${{ inputs.bridge_sha }}
   EXPORTER_SHA: ${{ inputs.exporter_sha }}
   BUILD_EXPORTER: ${{ inputs.build_exporter }}
+  AUTOSAVE_BASELINE_SHA: ${{ inputs.autosave_baseline_sha }}
 
 jobs:
   release:
@@ -67,6 +72,9 @@ jobs:
         run: |
           [[ "$ENGINE_SHA" =~ ^[0-9a-f]{40}$ ]]
           [[ "$BRIDGE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          if [[ -n "$AUTOSAVE_BASELINE_SHA" ]]; then
+            [[ "$AUTOSAVE_BASELINE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          fi
           if [[ "$BUILD_EXPORTER" == true ]]; then
             [[ "$EXPORTER_SHA" =~ ^[0-9a-f]{40}$ ]]
           fi
@@ -94,7 +102,7 @@ jobs:
           python-version: "3.12"
       - name: Install exact shared Rust toolchain
         run: |
-          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --target '${{ matrix.target }}'
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component clippy --target '${{ matrix.target }}'
           rustup default "$RUST_TOOLCHAIN"
           rustc +"$RUST_TOOLCHAIN" -Vv
       - name: Set up JDK 25
@@ -104,11 +112,48 @@ jobs:
           distribution: zulu
       - name: Verify sources, engine pins and native API; prepare optional exporter
         run: python build-control/.github/scripts/fobbitmc_release.py prepare '${{ matrix.target }}'
+      - name: Prove the test-only baseline fails on the autosave assertion
+        if: inputs.autosave_baseline_sha != ''
+        working-directory: engine
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/fobbitmc-release-target
+        run: |
+          git fetch --depth=1 origin "$AUTOSAVE_BASELINE_SHA"
+          git checkout --detach "$AUTOSAVE_BASELINE_SHA"
+          TEST='world::tests::automatic_save_persists_live_clock_and_rules_only_when_enabled'
+          LOG="$RUNNER_TEMP/autosave-negative-${{ matrix.target }}.log"
+          set +e
+          cargo +"$RUST_TOOLCHAIN" test --locked --release --target '${{ matrix.target }}' -p pumpkin-core "$TEST" -- --exact --color never > "$LOG" 2>&1
+          STATUS=$?
+          set -e
+          cat "$LOG"
+          [[ "$STATUS" -eq 101 ]]
+          grep -Fx 'running 1 test' "$LOG"
+          grep -Fx "test $TEST ... FAILED" "$LOG"
+          grep -F 'autosave must commit live metadata before shutdown' "$LOG"
+          grep -E '^test result: FAILED\. 0 passed; 1 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$LOG"
+          cd ..
+          python build-control/.github/scripts/fobbitmc_release.py autosave_negative
+      - name: Restore and verify the exact engine source after the negative gate
+        if: always() && inputs.autosave_baseline_sha != ''
+        run: |
+          git -C engine checkout --detach "$ENGINE_SHA"
+          python build-control/.github/scripts/fobbitmc_release.py verify_engine
       - name: Build optimized engine
         working-directory: engine
         env:
           CARGO_TARGET_DIR: ${{ runner.temp }}/fobbitmc-release-target
         run: cargo +"$RUST_TOOLCHAIN" build --locked --release --target '${{ matrix.target }}' -p pumpkin
+      - name: Test all workspace libraries in the matching release profile
+        working-directory: engine
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/fobbitmc-release-target
+        run: cargo +"$RUST_TOOLCHAIN" test --locked --release --target '${{ matrix.target }}' --workspace --lib
+      - name: Check every core target and feature with release Clippy
+        working-directory: engine
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/fobbitmc-release-target
+        run: cargo +"$RUST_TOOLCHAIN" clippy --locked --release --target '${{ matrix.target }}' -p pumpkin-core --all-targets --all-features -- -D warnings
       - name: Retain engine and release its temporary Cargo products
         run: python build-control/.github/scripts/fobbitmc_release.py collect engine '${{ matrix.target }}'
       - name: Build bridge JAR before embedding it in the native library

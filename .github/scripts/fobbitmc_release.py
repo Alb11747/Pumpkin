@@ -89,6 +89,19 @@ def prepare(target):
     DIST.mkdir()
 
 
+def autosave_negative():
+    state = json.loads(STATE.read_text(encoding="utf-8"))
+    state["autosaveNegative"] = git_source(ROOT / "engine", os.environ["AUTOSAVE_BASELINE_SHA"])
+    state["autosaveNegative"]["assertion"] = "autosave must commit live metadata before shutdown"
+    STATE.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8", newline="\n")
+
+
+def verify_engine():
+    state = json.loads(STATE.read_text(encoding="utf-8"))
+    if git_source(ROOT / "engine", os.environ["ENGINE_SHA"]) != state["engine"]:
+        raise ValueError("Restored engine source differs from verified release source")
+
+
 def collect(component, target):
     windows = target.endswith("windows-msvc")
     filenames = {
@@ -125,4 +138,5 @@ def manifest(target):
 
 if __name__ == "__main__":
     mode, *args = sys.argv[1:]
-    {"prepare": prepare, "collect": collect, "manifest": manifest}[mode](*args)
+    {"prepare": prepare, "autosave_negative": autosave_negative, "verify_engine": verify_engine,
+     "collect": collect, "manifest": manifest}[mode](*args)
