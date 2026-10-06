@@ -7864,6 +7864,93 @@ mod tests {
     use pumpkin_util::math::position::BlockPos;
     use uuid::Uuid;
 
+    #[tokio::test]
+    async fn automatic_save_persists_live_clock_and_rules_only_when_enabled() {
+        use crate::{data::VanillaData, server::Server};
+        use pumpkin_config::{AdvancedConfiguration, BasicConfiguration, TelemetryConfig};
+        use pumpkin_data::{
+            dimension::Dimension,
+            game_rules::{GameRule, GameRuleValue},
+        };
+        use pumpkin_util::world_seed::Seed;
+        use pumpkin_world::world_info::{WorldInfoReader, anvil::AnvilLevelInfo};
+        use std::{sync::atomic::Ordering::Relaxed, time::Duration};
+
+        let directory = tempfile::tempdir().unwrap();
+        let make_server = || async {
+            let basic = BasicConfiguration {
+                default_level_name: directory.path().to_string_lossy().into_owned(),
+                seed: Seed(0),
+                allow_nether: false,
+                allow_end: false,
+                ..BasicConfiguration::default()
+            };
+            let mut advanced = AdvancedConfiguration::default();
+            advanced.world.autosave_ticks = 2;
+            advanced.plugins.enabled = false;
+            advanced.networking.bedrock.online_mode = false;
+            advanced.networking.java.online_mode = false;
+            let data = VanillaData {
+                banned_ip_list: std::sync::RwLock::default(),
+                banned_player_list: std::sync::RwLock::default(),
+                operator_config: std::sync::RwLock::default(),
+                user_cache: std::sync::RwLock::default(),
+                whitelist_config: std::sync::RwLock::default(),
+            };
+            Server::new(
+                basic,
+                advanced,
+                TelemetryConfig::default(),
+                data,
+                Vec::new(),
+            )
+            .await
+            .unwrap()
+        };
+        let server = make_server().await;
+        let world = server.get_world_from_dimension(&Dimension::OVERWORLD);
+        let clocks = directory.path().join("data/minecraft/world_clocks.dat");
+        let rules = directory.path().join("data/minecraft/game_rules.dat");
+        let original_clocks = std::fs::read(&clocks).unwrap();
+        let original_rules = std::fs::read(&rules).unwrap();
+        world.set_game_rule(&GameRule::AdvanceTime, GameRuleValue::Bool(false));
+        world.set_time_of_day(42_424);
+        world.level.save_enabled.store(false, Relaxed);
+        world.level_time.lock().unwrap().world_age = 1;
+        world.tick_environment();
+        tokio::task::yield_now().await;
+        assert_eq!(std::fs::read(&clocks).unwrap(), original_clocks);
+        assert_eq!(std::fs::read(&rules).unwrap(), original_rules);
+
+        world.level.save_enabled.store(true, Relaxed);
+        world.level_time.lock().unwrap().world_age = 3;
+        world.tick_environment();
+        // Observe the committed files before shutdown, which has a separate save path.
+        let committed = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let saved = AnvilLevelInfo.read_world_info(directory.path()).unwrap();
+                if saved.day_time == 42_424 && !saved.game_rules.advance_time {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        server.shutdown().await;
+        assert!(
+            committed.is_ok(),
+            "autosave must commit live metadata before shutdown"
+        );
+        let restarted = make_server().await;
+        let restored = restarted.get_world_from_dimension(&Dimension::OVERWORLD);
+        let restored_clock = restored.get_time_of_day();
+        restarted.shutdown().await;
+        assert_eq!(
+            restored_clock, 42_424,
+            "restart must load the autosaved clock"
+        );
+    }
+
     use super::{
         World, bedrock_block_breaking_rate, bedrock_chest_block_actor, merge_entity_records,
     };
