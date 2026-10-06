@@ -368,6 +368,55 @@ mod tests {
         )
     }
 
+    #[tokio::test]
+    async fn loaded_farm_mobs_keep_vanilla_distance_policy_and_survive_without_players() {
+        let directory = tempfile::tempdir().unwrap();
+        let world = test_world(directory.path());
+        assert!(world.players.load().is_empty());
+        let mut outcomes = Vec::new();
+        for (id, uuid, from_bucket, expected_far_despawn) in [
+            ("villager", 701, false, false),
+            ("frog", 702, false, false),
+            ("cow", 703, false, false),
+            ("zombie", 704, false, true),
+            ("axolotl", 705, false, true),
+            ("axolotl", 706, true, false),
+        ] {
+            let mut fixture = NbtCompound::new();
+            fixture.put_string("id", format!("minecraft:{id}"));
+            fixture.put_uuid("UUID", Uuid::from_u128(uuid));
+            fixture.put_list("Pos", vec![0.5.into(), 64.0.into(), 0.5.into()]);
+            fixture.put_bool("PersistenceRequired", false);
+            fixture.put_bool("FromBucket", from_bucket);
+            let loaded = load_entity_tree(&fixture, &world).unwrap();
+            let mob = loaded[0].get_mob().unwrap();
+            let actual_far_despawn = mob.remove_when_far_away(130.0 * 130.0);
+            mob.get_mob_entity().check_despawn(mob);
+            let saved_uuid = save_entity_tree(&loaded[0]).and_then(|saved| saved.get_uuid("UUID"));
+            outcomes.push((
+                id,
+                uuid,
+                expected_far_despawn,
+                actual_far_despawn,
+                loaded[0].get_entity().is_removed(),
+                saved_uuid,
+            ));
+        }
+        world.level.shutdown().await;
+        for (id, uuid, expected_far_despawn, actual_far_despawn, removed, saved_uuid) in outcomes {
+            assert_eq!(
+                actual_far_despawn, expected_far_despawn,
+                "{id} far-away policy"
+            );
+            assert!(!removed, "unattended {id}");
+            assert_eq!(
+                saved_uuid,
+                Some(Uuid::from_u128(uuid)),
+                "{id} must remain saveable"
+            );
+        }
+    }
+
     // Vanilla Entity.saveWithoutId/EntityType.loadPassengersRecursive shape,
     // including the persistent named endermite used in the migrated End farm.
     fn minecart_fixture() -> NbtCompound {

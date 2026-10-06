@@ -1890,6 +1890,10 @@ impl VillagerEntity {
 }
 
 impl Mob for VillagerEntity {
+    fn remove_when_far_away(&self, _distance_sq: f64) -> bool {
+        false
+    }
+
     fn mob_nbt_aliases(&self) -> &'static [(&'static str, &'static str)] {
         &[("BedX", "HomeX"), ("BedY", "HomeY"), ("BedZ", "HomeZ")]
     }
