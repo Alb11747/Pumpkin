@@ -1,6 +1,6 @@
 use std::{
     fs::{self, File},
-    io::ErrorKind,
+    io::{self, ErrorKind},
     path::Path,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -11,18 +11,18 @@ use pumpkin_nbt::{
     nbt_compress::{read_gzip_compound_tag, write_gzip_compound_tag},
     tag::NbtTag,
 };
-use pumpkin_util::{Difficulty, world_seed::Seed};
+use pumpkin_util::{Difficulty, atomic_file::atomic_write, world_seed::Seed};
 use serde::{Deserialize, Serialize};
 
 use crate::world_info::{
     DataPacks, MAXIMUM_SUPPORTED_LEVEL_VERSION, MAXIMUM_SUPPORTED_WORLD_DATA_VERSION,
     MINIMUM_SUPPORTED_LEVEL_VERSION, MINIMUM_SUPPORTED_WORLD_DATA_VERSION, WorldVersion,
     data_files::{
-        minecraft_data_dir, read_game_rules, read_wandering_trader, read_weather,
-        read_world_clocks, read_world_gen_settings, write_custom_boss_events_stub,
-        write_game_rules, write_random_sequences_stub, write_scheduled_events_stub,
-        write_scoreboard_stub, write_stopwatches_stub, write_wandering_trader, write_weather,
-        write_world_clocks, write_world_gen_settings,
+        read_game_rules, read_wandering_trader, read_weather, read_world_clocks,
+        read_world_gen_settings, write_custom_boss_events_stub, write_game_rules,
+        write_random_sequences_stub, write_scheduled_events_stub, write_scoreboard_stub,
+        write_stopwatches_stub, write_wandering_trader, write_weather, write_world_clocks,
+        write_world_gen_settings,
     },
     default_data_packs,
 };
@@ -390,32 +390,20 @@ impl WorldInfoReader for AnvilLevelInfo {
             level_data.world_gen_settings = wgs;
         }
 
-        // game_rules.dat – prefer the new file; fall back to level.dat values
-        if minecraft_data_dir(level_folder)
-            .join("game_rules.dat")
-            .exists()
-        {
-            level_data.game_rules = read_game_rules(level_folder);
+        // Optional split files override legacy level.dat values only when present.
+        if let Some(rules) = read_game_rules(level_folder)? {
+            level_data.game_rules = rules;
         }
-
-        if minecraft_data_dir(level_folder)
-            .join("world_clocks.dat")
-            .exists()
+        if let Some(clocks) = read_world_clocks(level_folder)?
+            && let Some(overworld) = clocks.clocks.get("minecraft:overworld")
         {
-            let clocks = read_world_clocks(level_folder);
-            if let Some(overworld) = clocks.clocks.get("minecraft:overworld") {
-                level_data.day_time = overworld.total_ticks;
-            }
+            level_data.day_time = overworld.total_ticks;
         }
-
-        // weather.dat
-        if minecraft_data_dir(level_folder)
-            .join("weather.dat")
-            .exists()
-        {
-            let weather = read_weather(level_folder);
+        if let Some(weather) = read_weather(level_folder)? {
             level_data.clear_weather_time = weather.clear_weather_time;
         }
+        // Validate retained trader metadata even though it is not stored in LevelData.
+        let _ = read_wandering_trader(level_folder)?;
 
         Ok(level_data)
     }
@@ -427,6 +415,11 @@ impl WorldInfoWriter for AnvilLevelInfo {
         info: &LevelData,
         level_folder: &Path,
     ) -> Result<(), WorldInfoError> {
+        // Reject damaged retained metadata before committing any replacement.
+        let _ = read_game_rules(level_folder)?;
+        let mut clocks = read_world_clocks(level_folder)?.unwrap_or_default();
+        let mut weather = read_weather(level_folder)?.unwrap_or_default();
+        let mut wandering_trader = read_wandering_trader(level_folder)?.unwrap_or_default();
         fs::create_dir_all(level_folder)?;
 
         let start = SystemTime::now();
@@ -437,7 +430,6 @@ impl WorldInfoWriter for AnvilLevelInfo {
 
         // ── Write level.dat ───────────────────────────────────────────────────
         let path = level_folder.join(LEVEL_DAT_FILE_NAME);
-        let path_new = level_folder.join("level.dat_new");
         let path_old = level_folder.join(LEVEL_DAT_BACKUP_FILE_NAME);
 
         let mut root = existing_level_dat_root(&path)?;
@@ -448,32 +440,29 @@ impl WorldInfoWriter for AnvilLevelInfo {
         level_data_to_nbt(&level_data, &mut data_comp);
         root.put_compound(LEVEL_DATA_TAG, data_comp);
 
-        write_gzip_compound_tag(root, File::create(&path_new)?)
-            .map_err(|e| WorldInfoError::SerializationError(e.to_string()))?;
-
-        if path.exists() {
-            fs::copy(&path, &path_old)?;
-        }
-        fs::rename(&path_new, &path)?;
+        atomic_write(&path, |file| -> Result<(), WorldInfoError> {
+            write_gzip_compound_tag(root, file)
+                .map_err(|e| WorldInfoError::SerializationError(e.to_string()))?;
+            if path.exists() {
+                atomic_write(&path_old, |backup| -> io::Result<()> {
+                    io::copy(&mut File::open(&path)?, backup)?;
+                    Ok(())
+                })?;
+            }
+            Ok(())
+        })?;
 
         let data_version = level_data.data_version;
 
         // ── Write data/minecraft/*.dat files ─────────────────────────────────
 
         // game_rules.dat
-        if let Err(e) = write_game_rules(level_folder, &info.game_rules, data_version) {
-            error!("Failed to write game_rules.dat: {e}");
-        }
+        write_game_rules(level_folder, &info.game_rules, data_version)?;
 
         // world_gen_settings.dat
-        if let Err(e) =
-            write_world_gen_settings(level_folder, &info.world_gen_settings, data_version)
-        {
-            error!("Failed to write world_gen_settings.dat: {e}");
-        }
+        write_world_gen_settings(level_folder, &info.world_gen_settings, data_version)?;
 
         // world_clocks.dat – persist the overworld day_time; preserve other
-        let mut clocks = read_world_clocks(level_folder);
         clocks.data_version = data_version;
         clocks
             .clocks
@@ -483,49 +472,31 @@ impl WorldInfoWriter for AnvilLevelInfo {
                 total_ticks: info.day_time,
             });
 
-        if let Err(e) = write_world_clocks(level_folder, &clocks) {
-            error!("Failed to write world_clocks.dat: {e}");
-        }
+        write_world_clocks(level_folder, &clocks)?;
 
         // weather.dat
-        let mut weather = read_weather(level_folder);
         weather.clear_weather_time = info.clear_weather_time;
         weather.data_version = data_version;
-        if let Err(e) = write_weather(level_folder, &weather) {
-            error!("Failed to write weather.dat: {e}");
-        }
+        write_weather(level_folder, &weather)?;
 
         // wandering_trader.dat (stub / load-save)
-        let mut wandering_trader = read_wandering_trader(level_folder);
         wandering_trader.data_version = data_version;
-        if let Err(e) = write_wandering_trader(level_folder, &wandering_trader) {
-            error!("Failed to write wandering_trader.dat: {e}");
-        }
+        write_wandering_trader(level_folder, &wandering_trader)?;
 
         // custom_boss_events.dat
-        if let Err(e) = write_custom_boss_events_stub(level_folder, data_version) {
-            error!("Failed to write custom_boss_events.dat: {e}");
-        }
+        write_custom_boss_events_stub(level_folder, data_version)?;
 
         // scheduled_events.dat
-        if let Err(e) = write_scheduled_events_stub(level_folder, data_version) {
-            error!("Failed to write scheduled_events.dat: {e}");
-        }
+        write_scheduled_events_stub(level_folder, data_version)?;
 
         // random_sequences.dat
-        if let Err(e) = write_random_sequences_stub(level_folder, data_version) {
-            error!("Failed to write random_sequences.dat: {e}");
-        }
+        write_random_sequences_stub(level_folder, data_version)?;
 
         // scoreboard.dat
-        if let Err(e) = write_scoreboard_stub(level_folder, data_version) {
-            error!("Failed to write scoreboard.dat: {e}");
-        }
+        write_scoreboard_stub(level_folder, data_version)?;
 
         // stopwatches.dat
-        if let Err(e) = write_stopwatches_stub(level_folder, data_version) {
-            error!("Failed to write stopwatches.dat: {e}");
-        }
+        write_stopwatches_stub(level_folder, data_version)?;
 
         Ok(())
     }
@@ -693,6 +664,152 @@ mod test {
         assert!(!data.world_version.snapshot);
         assert_eq!(data.data_packs.enabled, vec!["vanilla".to_string()]);
         assert!(data.data_packs.disabled.is_empty());
+    }
+
+    #[test]
+    fn level_backup_failure_preserves_canonical_metadata() {
+        let directory = TempDir::new().unwrap();
+        write_level_dat(directory.path(), converted_level_dat(Some(42)));
+        let original = fs::read(directory.path().join(LEVEL_DAT_FILE_NAME)).unwrap();
+        let backup = directory.path().join(super::LEVEL_DAT_BACKUP_FILE_NAME);
+        fs::create_dir(&backup).unwrap();
+
+        let result =
+            AnvilLevelInfo.write_world_info(&LevelData::default(Seed(123)), directory.path());
+
+        assert!(matches!(result, Err(WorldInfoError::IoError(_))));
+        assert_eq!(
+            fs::read(directory.path().join(LEVEL_DAT_FILE_NAME)).unwrap(),
+            original
+        );
+        assert_eq!(
+            read_level_dat(directory.path())
+                .get_compound("Data")
+                .unwrap()
+                .get_string("LevelName"),
+            Some(CONVERTED_LEVEL_NAME)
+        );
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn metadata_write_failure_is_returned_after_level_backup_commits() {
+        let directory = TempDir::new().unwrap();
+        write_level_dat(directory.path(), converted_level_dat(Some(42)));
+        let original = fs::read(directory.path().join(LEVEL_DAT_FILE_NAME)).unwrap();
+        // Fail an independent generation-metadata write after level.dat and its backup commit.
+        fs::create_dir_all(minecraft_data_dir(directory.path()).join("world_gen_settings.dat"))
+            .unwrap();
+
+        let result =
+            AnvilLevelInfo.write_world_info(&LevelData::default(Seed(123)), directory.path());
+
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read(directory.path().join(super::LEVEL_DAT_BACKUP_FILE_NAME)).unwrap(),
+            original
+        );
+        let current = read_level_dat(directory.path());
+        let data = current.get_compound("Data").unwrap();
+        assert_eq!(data.get_string("LevelName"), Some("world"));
+        assert_eq!(
+            data.get_compound("WorldGenSettings")
+                .unwrap()
+                .get_long("seed"),
+            Some(123)
+        );
+        assert_eq!(
+            fs::read_dir(minecraft_data_dir(directory.path()))
+                .unwrap()
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn damaged_optional_metadata_aborts_startup_and_save_without_replacements() {
+        for (name, field) in [
+            ("weather.dat", "rain_time"),
+            ("game_rules.dat", "minecraft:keep_inventory"),
+            ("world_clocks.dat", "minecraft:overworld"),
+            ("wandering_trader.dat", "spawn_delay"),
+        ] {
+            for invalid_gzip in [true, false] {
+                let directory = TempDir::new().unwrap();
+                let info = LevelData::default(Seed(42));
+                AnvilLevelInfo
+                    .write_world_info(&info, directory.path())
+                    .unwrap();
+                AnvilLevelInfo
+                    .write_world_info(&info, directory.path())
+                    .unwrap();
+                let path = minecraft_data_dir(directory.path()).join(name);
+                if invalid_gzip {
+                    fs::write(&path, b"damaged retained metadata").unwrap();
+                } else {
+                    let mut root = read_gzip_compound_tag(File::open(&path).unwrap()).unwrap();
+                    let mut data = root.get_compound("data").unwrap().clone();
+                    if name == "world_clocks.dat" {
+                        let mut clock = data.get_compound(field).unwrap().clone();
+                        clock.put_string("total_ticks", "invalid type".to_string());
+                        data.put_compound(field, clock);
+                    } else {
+                        data.put_string(field, "invalid type".to_string());
+                    }
+                    root.put_compound("data", data);
+                    write_gzip_compound_tag(root, File::create(&path).unwrap()).unwrap();
+                }
+                let mut paths = vec![
+                    directory.path().join(LEVEL_DAT_FILE_NAME),
+                    directory.path().join(super::LEVEL_DAT_BACKUP_FILE_NAME),
+                ];
+                paths.extend(
+                    fs::read_dir(minecraft_data_dir(directory.path()))
+                        .unwrap()
+                        .map(|entry| entry.unwrap().path()),
+                );
+                let before: Vec<_> = paths.iter().map(|path| fs::read(path).unwrap()).collect();
+
+                assert!(
+                    AnvilLevelInfo.read_world_info(directory.path()).is_err(),
+                    "loaded damaged {name}"
+                );
+                assert!(
+                    AnvilLevelInfo
+                        .write_world_info(&info, directory.path())
+                        .is_err(),
+                    "saved over damaged {name}"
+                );
+                for (path, original) in paths.iter().zip(before) {
+                    assert_eq!(
+                        fs::read(path).unwrap(),
+                        original,
+                        "replaced {}",
+                        path.display()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn missing_optional_metadata_keeps_legacy_values_and_allows_first_save() {
+        let directory = TempDir::new().unwrap();
+        let mut root = converted_level_dat(Some(42));
+        let mut data = root.get_compound("Data").unwrap().clone();
+        data.put_int("clearWeatherTime", 321);
+        root.put_compound("Data", data);
+        write_level_dat(directory.path(), root);
+
+        let info = AnvilLevelInfo.read_world_info(directory.path()).unwrap();
+        assert_eq!(info.day_time, 5000);
+        assert_eq!(info.clear_weather_time, 321);
+        AnvilLevelInfo
+            .write_world_info(&info, directory.path())
+            .unwrap();
+        let reloaded = AnvilLevelInfo.read_world_info(directory.path()).unwrap();
+        assert_eq!(reloaded.day_time, 5000);
+        assert_eq!(reloaded.clear_weather_time, 321);
     }
 
     #[test]
@@ -1137,11 +1254,15 @@ mod test {
         assert_eq!(loaded_wgs.seed, 9999);
 
         // Verify weather.dat read
-        let loaded_weather = crate::world_info::data_files::read_weather(temp_dir.path());
+        let loaded_weather = crate::world_info::data_files::read_weather(temp_dir.path())
+            .unwrap()
+            .unwrap();
         assert_eq!(loaded_weather.clear_weather_time, 100);
 
         // Verify world_clocks.dat read
-        let loaded_clocks = crate::world_info::data_files::read_world_clocks(temp_dir.path());
+        let loaded_clocks = crate::world_info::data_files::read_world_clocks(temp_dir.path())
+            .unwrap()
+            .unwrap();
         assert_eq!(
             loaded_clocks
                 .clocks
@@ -1152,7 +1273,9 @@ mod test {
         );
 
         // Verify wandering_trader.dat read
-        let loaded_wt = crate::world_info::data_files::read_wandering_trader(temp_dir.path());
+        let loaded_wt = crate::world_info::data_files::read_wandering_trader(temp_dir.path())
+            .unwrap()
+            .unwrap();
         assert_eq!(loaded_wt.spawn_delay, 24000);
         assert_eq!(loaded_wt.spawn_chance, 25);
     }

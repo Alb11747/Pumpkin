@@ -1,11 +1,12 @@
 use std::{
     fs::{self, File},
-    io::BufWriter,
+    io::ErrorKind,
     path::{Path, PathBuf},
 };
 
 use pumpkin_data::game_rules::{GameRule, GameRuleRegistry, GameRuleValue};
 use pumpkin_nbt::{compound::NbtCompound, nbt_compress::read_gzip_compound_tag, tag::NbtTag};
+use pumpkin_util::atomic_file::atomic_write;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
@@ -114,41 +115,123 @@ pub fn ensure_minecraft_data_dir(level_folder: &Path) -> Result<PathBuf, WorldIn
     Ok(dir)
 }
 
-pub fn read_weather(level_folder: &Path) -> WeatherData {
-    let path = minecraft_data_dir(level_folder).join("weather.dat");
-    if !path.exists() {
-        return WeatherData::default();
-    }
-    match File::open(&path) {
-        Ok(f) => match read_gzip_compound_tag(f) {
-            Ok(compound) => {
-                let data_compound = compound.get_compound("data");
-                let c = data_compound.as_ref().map_or(&compound, |v| v);
-                WeatherData {
-                    clear_weather_time: c.get_int("clear_weather_time").unwrap_or(0),
-                    rain_time: c.get_int("rain_time").unwrap_or(0),
-                    thunder_time: c.get_int("thunder_time").unwrap_or(0),
-                    raining: c.get_bool("raining").unwrap_or(false),
-                    thundering: c.get_bool("thundering").unwrap_or(false),
-                    data_version: c.get_int("DataVersion").unwrap_or(0),
-                }
-            }
-            Err(e) => {
-                warn!("Failed to deserialize weather.dat, using defaults: {e}");
-                WeatherData::default()
-            }
-        },
-        Err(e) => {
-            warn!("Failed to open weather.dat, using defaults: {e}");
-            WeatherData::default()
+fn read_optional_metadata(
+    level_folder: &Path,
+    name: &str,
+) -> Result<Option<NbtCompound>, WorldInfoError> {
+    let path = minecraft_data_dir(level_folder).join(name);
+    let file = match File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(
+                std::io::Error::new(error.kind(), format!("{}: {error}", path.display())).into(),
+            );
         }
+    };
+    read_gzip_compound_tag(file).map(Some).map_err(|error| {
+        WorldInfoError::DeserializationError(format!("{}: {error}", path.display()))
+    })
+}
+
+fn metadata_field<'a, T>(
+    compound: &'a NbtCompound,
+    name: &str,
+    file: &str,
+    extract: impl FnOnce(&'a NbtTag) -> Option<T>,
+) -> Result<Option<T>, WorldInfoError> {
+    compound.get(name).map_or_else(
+        || Ok(None),
+        |tag| {
+            extract(tag).map(Some).ok_or_else(|| {
+                WorldInfoError::DeserializationError(format!("{file}: invalid '{name}' tag type"))
+            })
+        },
+    )
+}
+
+fn required_metadata_field<'a, T>(
+    compound: &'a NbtCompound,
+    name: &str,
+    file: &str,
+    extract: impl FnOnce(&'a NbtTag) -> Option<T>,
+) -> Result<T, WorldInfoError> {
+    metadata_field(compound, name, file, extract)?.ok_or_else(|| {
+        WorldInfoError::DeserializationError(format!("{file}: missing '{name}' tag"))
+    })
+}
+
+// NbtOps numeric codecs use Number.intValue/longValue, and BOOL tests doubleValue != 0.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "Match Java Number.intValue"
+)]
+fn metadata_int(tag: &NbtTag) -> Option<i32> {
+    match tag {
+        NbtTag::Byte(value) => Some(i32::from(*value)),
+        NbtTag::Short(value) => Some(i32::from(*value)),
+        NbtTag::Int(value) => Some(*value),
+        NbtTag::Long(value) => Some(*value as i32),
+        NbtTag::Float(value) => Some(*value as i32),
+        NbtTag::Double(value) => Some(*value as i32),
+        _ => None,
     }
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "Match Java Number.longValue"
+)]
+fn metadata_long(tag: &NbtTag) -> Option<i64> {
+    match tag {
+        NbtTag::Byte(value) => Some(i64::from(*value)),
+        NbtTag::Short(value) => Some(i64::from(*value)),
+        NbtTag::Int(value) => Some(i64::from(*value)),
+        NbtTag::Long(value) => Some(*value),
+        NbtTag::Float(value) => Some(*value as i64),
+        NbtTag::Double(value) => Some(*value as i64),
+        _ => None,
+    }
+}
+
+fn metadata_bool(tag: &NbtTag) -> Option<bool> {
+    match tag {
+        NbtTag::Byte(value) => Some(*value != 0),
+        NbtTag::Short(value) => Some(*value != 0),
+        NbtTag::Int(value) => Some(*value != 0),
+        NbtTag::Long(value) => Some(*value != 0),
+        NbtTag::Float(value) => Some(*value != 0.0),
+        NbtTag::Double(value) => Some(*value != 0.0),
+        _ => None,
+    }
+}
+
+pub fn read_weather(level_folder: &Path) -> Result<Option<WeatherData>, WorldInfoError> {
+    const FILE: &str = "weather.dat";
+    let Some(root) = read_optional_metadata(level_folder, FILE)? else {
+        return Ok(None);
+    };
+    let compound = metadata_field(&root, "data", FILE, NbtTag::extract_compound)?.unwrap_or(&root);
+    Ok(Some(WeatherData {
+        clear_weather_time: required_metadata_field(
+            compound,
+            "clear_weather_time",
+            FILE,
+            metadata_int,
+        )?,
+        rain_time: required_metadata_field(compound, "rain_time", FILE, metadata_int)?,
+        thunder_time: required_metadata_field(compound, "thunder_time", FILE, metadata_int)?,
+        raining: required_metadata_field(compound, "raining", FILE, metadata_bool)?,
+        thundering: required_metadata_field(compound, "thundering", FILE, metadata_bool)?,
+        data_version: metadata_field(&root, "DataVersion", FILE, metadata_int)?
+            .or(metadata_field(compound, "DataVersion", FILE, metadata_int)?)
+            .unwrap_or(0),
+    }))
 }
 
 pub fn write_weather(level_folder: &Path, data: &WeatherData) -> Result<(), WorldInfoError> {
     let dir = ensure_minecraft_data_dir(level_folder)?;
     let path = dir.join("weather.dat");
-    let file = File::create(&path)?;
     let mut data_comp = NbtCompound::new();
     data_comp.put_int("clear_weather_time", data.clear_weather_time);
     data_comp.put_int("rain_time", data.rain_time);
@@ -158,8 +241,10 @@ pub fn write_weather(level_folder: &Path, data: &WeatherData) -> Result<(), Worl
     let mut root = NbtCompound::new();
     root.put_int("DataVersion", data.data_version);
     root.put_compound("data", data_comp);
-    pumpkin_nbt::nbt_compress::write_gzip_compound_tag(root, BufWriter::new(file))
-        .map_err(|e| WorldInfoError::SerializationError(e.to_string()))
+    atomic_write(&path, |file| {
+        pumpkin_nbt::nbt_compress::write_gzip_compound_tag(root, file)
+            .map_err(|e| WorldInfoError::SerializationError(e.to_string()))
+    })
 }
 
 #[must_use]
@@ -255,15 +340,7 @@ pub fn read_world_gen_settings_checked(
 
 // Codec.LONG reads NumericTag via Number.longValue; encoding still uses LongTag.
 pub(super) fn world_gen_settings_seed(settings: &NbtCompound) -> Option<i64> {
-    match settings.get("seed")? {
-        NbtTag::Byte(seed) => Some(i64::from(*seed)),
-        NbtTag::Short(seed) => Some(i64::from(*seed)),
-        NbtTag::Int(seed) => Some(i64::from(*seed)),
-        NbtTag::Long(seed) => Some(*seed),
-        NbtTag::Float(seed) => Some(*seed as i64),
-        NbtTag::Double(seed) => Some(*seed as i64),
-        _ => None,
-    }
+    metadata_long(settings.get("seed")?)
 }
 
 pub fn world_gen_settings_from_nbt(
@@ -477,14 +554,10 @@ pub fn write_world_gen_settings(
     inner.put_int("DataVersion", data_version);
 
     root.put_compound("data", inner);
-    let path_new = path.with_extension("dat_new");
-    pumpkin_nbt::nbt_compress::write_gzip_compound_tag(
-        root,
-        BufWriter::new(File::create(&path_new)?),
-    )
-    .map_err(|e| WorldInfoError::SerializationError(e.to_string()))?;
-    fs::rename(path_new, path)?;
-    Ok(())
+    atomic_write(&path, |file| {
+        pumpkin_nbt::nbt_compress::write_gzip_compound_tag(root, file)
+            .map_err(|e| WorldInfoError::SerializationError(e.to_string()))
+    })
 }
 
 /// Updates modeled generation fields while retaining unmodeled NBT tags.
@@ -581,52 +654,35 @@ pub fn game_rules_to_nbt(rules: &GameRuleRegistry, data_version: i32) -> NbtComp
     root
 }
 
-pub fn game_rules_from_nbt(root: &NbtCompound) -> GameRuleRegistry {
+pub fn game_rules_from_nbt(root: &NbtCompound) -> Result<GameRuleRegistry, WorldInfoError> {
+    const FILE: &str = "game_rules.dat";
     let mut registry = GameRuleRegistry::default();
-
-    let Some(inner) = root.get_compound("data") else {
-        warn!("game_rules.dat missing 'data' compound, using defaults");
-        return registry;
-    };
-
+    let inner = required_metadata_field(root, "data", FILE, NbtTag::extract_compound)?;
+    let _ = metadata_field(root, "DataVersion", FILE, metadata_int)?;
+    let _ = metadata_field(inner, "DataVersion", FILE, metadata_int)?;
     for rule in GameRule::all() {
         let key = format!("minecraft:{rule}");
         match registry.get_mut(rule) {
-            GameRuleValue::Bool(b) => {
-                if let Some(v) = inner.get_byte(&key) {
-                    *b = v != 0;
+            GameRuleValue::Bool(value) => {
+                if let Some(stored) = metadata_field(inner, &key, FILE, metadata_bool)? {
+                    *value = stored;
                 }
             }
-            GameRuleValue::Int(i) => {
-                if let Some(v) = inner.get_int(&key) {
-                    *i = i64::from(v);
+            GameRuleValue::Int(value) => {
+                if let Some(stored) = metadata_field(inner, &key, FILE, metadata_int)? {
+                    *value = i64::from(stored);
                 }
             }
         }
     }
-
-    registry
+    Ok(registry)
 }
 
-pub fn read_game_rules(level_folder: &Path) -> GameRuleRegistry {
-    let path = minecraft_data_dir(level_folder).join("game_rules.dat");
-    if !path.exists() {
-        return GameRuleRegistry::default();
-    }
-
-    match File::open(&path) {
-        Ok(f) => match read_gzip_compound_tag(f) {
-            Ok(compound) => game_rules_from_nbt(&compound),
-            Err(e) => {
-                warn!("Failed to parse game_rules.dat: {e}");
-                GameRuleRegistry::default()
-            }
-        },
-        Err(e) => {
-            warn!("Failed to open game_rules.dat: {e}");
-            GameRuleRegistry::default()
-        }
-    }
+pub fn read_game_rules(level_folder: &Path) -> Result<Option<GameRuleRegistry>, WorldInfoError> {
+    read_optional_metadata(level_folder, "game_rules.dat")?
+        .as_ref()
+        .map(game_rules_from_nbt)
+        .transpose()
 }
 
 pub fn write_game_rules(
@@ -638,55 +694,41 @@ pub fn write_game_rules(
     let path = dir.join("game_rules.dat");
 
     let compound = game_rules_to_nbt(rules, data_version);
-    let file = File::create(&path)?;
-
-    pumpkin_nbt::nbt_compress::write_gzip_compound_tag(compound, file)
-        .map_err(|e| WorldInfoError::SerializationError(e.to_string()))
+    atomic_write(&path, |file| {
+        pumpkin_nbt::nbt_compress::write_gzip_compound_tag(compound, file)
+            .map_err(|e| WorldInfoError::SerializationError(e.to_string()))
+    })
 }
 
-pub fn read_world_clocks(level_folder: &Path) -> WorldClocksData {
-    let path = minecraft_data_dir(level_folder).join("world_clocks.dat");
-    if !path.exists() {
-        return WorldClocksData::default();
-    }
-
-    match File::open(&path) {
-        Ok(f) => match read_gzip_compound_tag(f) {
-            Ok(compound) => world_clocks_from_nbt(&compound),
-            Err(e) => {
-                warn!("Failed to parse world_clocks.dat: {e}");
-                WorldClocksData::default()
-            }
-        },
-        Err(e) => {
-            warn!("Failed to open world_clocks.dat: {e}");
-            WorldClocksData::default()
-        }
-    }
+pub fn read_world_clocks(level_folder: &Path) -> Result<Option<WorldClocksData>, WorldInfoError> {
+    read_optional_metadata(level_folder, "world_clocks.dat")?
+        .as_ref()
+        .map(world_clocks_from_nbt)
+        .transpose()
 }
 
-fn world_clocks_from_nbt(root: &NbtCompound) -> WorldClocksData {
-    let mut result = WorldClocksData::default();
-
-    let Some(inner) = root.get_compound("data") else {
-        return result;
+fn world_clocks_from_nbt(root: &NbtCompound) -> Result<WorldClocksData, WorldInfoError> {
+    const FILE: &str = "world_clocks.dat";
+    let inner = required_metadata_field(root, "data", FILE, NbtTag::extract_compound)?;
+    let _ = metadata_field(root, "DataVersion", FILE, metadata_int)?;
+    let mut result = WorldClocksData {
+        data_version: metadata_field(inner, "DataVersion", FILE, metadata_int)?.unwrap_or(0),
+        ..WorldClocksData::default()
     };
-
-    result.data_version = inner.get_int("DataVersion").unwrap_or(0);
-
     for (key, tag) in &inner.child_tags {
         if key.as_ref() == "DataVersion" {
             continue;
         }
-        if let NbtTag::Compound(dim_compound) = tag {
-            let total_ticks = dim_compound.get_long("total_ticks").unwrap_or(0);
-            result
-                .clocks
-                .insert(key.to_string(), DimensionClock { total_ticks });
-        }
+        let dim_compound = tag.extract_compound().ok_or_else(|| {
+            WorldInfoError::DeserializationError(format!("{FILE}: invalid '{key}' clock compound"))
+        })?;
+        let total_ticks =
+            required_metadata_field(dim_compound, "total_ticks", FILE, metadata_long)?;
+        result
+            .clocks
+            .insert(key.to_string(), DimensionClock { total_ticks });
     }
-
-    result
+    Ok(result)
 }
 
 pub fn write_world_clocks(
@@ -707,48 +749,41 @@ pub fn write_world_clocks(
     let mut root = NbtCompound::new();
     root.put_compound("data", inner);
 
-    let file = File::create(&path)?;
-
-    pumpkin_nbt::nbt_compress::write_gzip_compound_tag(root, file)
-        .map_err(|e| WorldInfoError::SerializationError(e.to_string()))
+    atomic_write(&path, |file| {
+        pumpkin_nbt::nbt_compress::write_gzip_compound_tag(root, file)
+            .map_err(|e| WorldInfoError::SerializationError(e.to_string()))
+    })
 }
 
-pub fn read_wandering_trader(level_folder: &Path) -> WanderingTraderData {
-    let path = minecraft_data_dir(level_folder).join("wandering_trader.dat");
-    if !path.exists() {
-        return WanderingTraderData::default();
-    }
-    match File::open(&path) {
-        Ok(f) => match read_gzip_compound_tag(f) {
-            Ok(compound) => {
-                let data_compound = compound.get_compound("data");
-                let c = data_compound.as_ref().map_or(&compound, |v| v);
-                let data_version = compound
-                    .get_int("DataVersion")
-                    .or_else(|| c.get_int("DataVersion"))
-                    .unwrap_or(0);
-                WanderingTraderData {
-                    spawn_delay: c
-                        .get_int("spawn_delay")
-                        .or_else(|| c.get_int("WanderingTraderSpawnDelay"))
-                        .unwrap_or(24_000),
-                    spawn_chance: c
-                        .get_int("spawn_chance")
-                        .or_else(|| c.get_int("WanderingTraderSpawnChance"))
-                        .unwrap_or(25),
-                    data_version,
-                }
-            }
-            Err(e) => {
-                warn!("Failed to deserialize wandering_trader.dat, using defaults: {e}");
-                WanderingTraderData::default()
-            }
-        },
-        Err(e) => {
-            warn!("Failed to open wandering_trader.dat, using defaults: {e}");
-            WanderingTraderData::default()
-        }
-    }
+pub fn read_wandering_trader(
+    level_folder: &Path,
+) -> Result<Option<WanderingTraderData>, WorldInfoError> {
+    const FILE: &str = "wandering_trader.dat";
+    let Some(root) = read_optional_metadata(level_folder, FILE)? else {
+        return Ok(None);
+    };
+    let compound = metadata_field(&root, "data", FILE, NbtTag::extract_compound)?.unwrap_or(&root);
+    Ok(Some(WanderingTraderData {
+        spawn_delay: metadata_field(compound, "spawn_delay", FILE, metadata_int)?
+            .or(metadata_field(
+                compound,
+                "WanderingTraderSpawnDelay",
+                FILE,
+                metadata_int,
+            )?)
+            .unwrap_or_else(default_wandering_trader_delay),
+        spawn_chance: metadata_field(compound, "spawn_chance", FILE, metadata_int)?
+            .or(metadata_field(
+                compound,
+                "WanderingTraderSpawnChance",
+                FILE,
+                metadata_int,
+            )?)
+            .unwrap_or_else(default_wandering_trader_chance),
+        data_version: metadata_field(&root, "DataVersion", FILE, metadata_int)?
+            .or(metadata_field(compound, "DataVersion", FILE, metadata_int)?)
+            .unwrap_or(0),
+    }))
 }
 
 pub fn write_wandering_trader(
@@ -757,15 +792,16 @@ pub fn write_wandering_trader(
 ) -> Result<(), WorldInfoError> {
     let dir = ensure_minecraft_data_dir(level_folder)?;
     let path = dir.join("wandering_trader.dat");
-    let file = File::create(&path)?;
     let mut data_comp = NbtCompound::new();
     data_comp.put_int("spawn_delay", data.spawn_delay);
     data_comp.put_int("spawn_chance", data.spawn_chance);
     let mut root = NbtCompound::new();
     root.put_int("DataVersion", data.data_version);
     root.put_compound("data", data_comp);
-    pumpkin_nbt::nbt_compress::write_gzip_compound_tag(root, BufWriter::new(file))
-        .map_err(|e| WorldInfoError::SerializationError(e.to_string()))
+    atomic_write(&path, |file| {
+        pumpkin_nbt::nbt_compress::write_gzip_compound_tag(root, file)
+            .map_err(|e| WorldInfoError::SerializationError(e.to_string()))
+    })
 }
 
 pub fn write_custom_boss_events_stub(
@@ -782,9 +818,10 @@ pub fn write_custom_boss_events_stub(
     root.put_int("DataVersion", data_version);
     root.put_compound("data", NbtCompound::new());
 
-    let file = File::create(&path)?;
-    pumpkin_nbt::nbt_compress::write_gzip_compound_tag(root, file)
-        .map_err(|e| WorldInfoError::SerializationError(e.to_string()))
+    atomic_write(&path, |file| {
+        pumpkin_nbt::nbt_compress::write_gzip_compound_tag(root, file)
+            .map_err(|e| WorldInfoError::SerializationError(e.to_string()))
+    })
 }
 
 pub fn write_scheduled_events_stub(
@@ -803,9 +840,10 @@ pub fn write_scheduled_events_stub(
     root.put_int("DataVersion", data_version);
     root.put_compound("data", inner);
 
-    let file = File::create(&path)?;
-    pumpkin_nbt::nbt_compress::write_gzip_compound_tag(root, file)
-        .map_err(|e| WorldInfoError::SerializationError(e.to_string()))
+    atomic_write(&path, |file| {
+        pumpkin_nbt::nbt_compress::write_gzip_compound_tag(root, file)
+            .map_err(|e| WorldInfoError::SerializationError(e.to_string()))
+    })
 }
 
 pub fn write_random_sequences_stub(
@@ -825,9 +863,10 @@ pub fn write_random_sequences_stub(
     root.put_int("DataVersion", data_version);
     root.put_compound("data", inner);
 
-    let file = File::create(&path)?;
-    pumpkin_nbt::nbt_compress::write_gzip_compound_tag(root, file)
-        .map_err(|e| WorldInfoError::SerializationError(e.to_string()))
+    atomic_write(&path, |file| {
+        pumpkin_nbt::nbt_compress::write_gzip_compound_tag(root, file)
+            .map_err(|e| WorldInfoError::SerializationError(e.to_string()))
+    })
 }
 
 pub fn write_scoreboard_stub(level_folder: &Path, data_version: i32) -> Result<(), WorldInfoError> {
@@ -841,9 +880,10 @@ pub fn write_scoreboard_stub(level_folder: &Path, data_version: i32) -> Result<(
     root.put_int("DataVersion", data_version);
     root.put_compound("data", NbtCompound::new());
 
-    let file = File::create(&path)?;
-    pumpkin_nbt::nbt_compress::write_gzip_compound_tag(root, file)
-        .map_err(|e| WorldInfoError::SerializationError(e.to_string()))
+    atomic_write(&path, |file| {
+        pumpkin_nbt::nbt_compress::write_gzip_compound_tag(root, file)
+            .map_err(|e| WorldInfoError::SerializationError(e.to_string()))
+    })
 }
 
 pub fn write_stopwatches_stub(
@@ -862,9 +902,184 @@ pub fn write_stopwatches_stub(
     root.put_int("DataVersion", data_version);
     root.put_compound("data", inner);
 
-    let file = File::create(&path)?;
-    pumpkin_nbt::nbt_compress::write_gzip_compound_tag(root, file)
-        .map_err(|e| WorldInfoError::SerializationError(e.to_string()))
+    atomic_write(&path, |file| {
+        pumpkin_nbt::nbt_compress::write_gzip_compound_tag(root, file)
+            .map_err(|e| WorldInfoError::SerializationError(e.to_string()))
+    })
+}
+
+#[cfg(test)]
+mod atomic_metadata_tests {
+    use super::*;
+    use std::io::{self, Write};
+    use tempfile::TempDir;
+
+    #[test]
+    fn older_metadata_layouts_keep_numeric_codec_and_optional_field_defaults() {
+        let directory = TempDir::new().unwrap();
+        let data_dir = ensure_minecraft_data_dir(directory.path()).unwrap();
+        let mut weather = NbtCompound::new();
+        weather.put_byte("clear_weather_time", 10);
+        weather.put_short("rain_time", 20);
+        weather.put_long("thunder_time", 30);
+        weather.put_double("raining", 0.5);
+        weather.put_int("thundering", 0);
+        pumpkin_nbt::nbt_compress::write_gzip_compound_tag(
+            weather,
+            File::create(data_dir.join("weather.dat")).unwrap(),
+        )
+        .unwrap();
+        let weather = read_weather(directory.path()).unwrap().unwrap();
+        assert_eq!(weather.rain_time, 20);
+        assert_eq!(weather.thunder_time, 30);
+        assert!(weather.raining && !weather.thundering);
+
+        let mut trader = NbtCompound::new();
+        trader.put_long("WanderingTraderSpawnDelay", 99);
+        pumpkin_nbt::nbt_compress::write_gzip_compound_tag(
+            trader,
+            File::create(data_dir.join("wandering_trader.dat")).unwrap(),
+        )
+        .unwrap();
+        let trader = read_wandering_trader(directory.path()).unwrap().unwrap();
+        assert_eq!(trader.spawn_delay, 99);
+        assert_eq!(trader.spawn_chance, 25);
+
+        let mut root = NbtCompound::new();
+        root.put_compound("data", NbtCompound::new());
+        for name in ["game_rules.dat", "world_clocks.dat"] {
+            pumpkin_nbt::nbt_compress::write_gzip_compound_tag(
+                root.clone(),
+                File::create(data_dir.join(name)).unwrap(),
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            read_game_rules(directory.path()).unwrap().unwrap(),
+            GameRuleRegistry::default()
+        );
+        assert!(
+            read_world_clocks(directory.path())
+                .unwrap()
+                .unwrap()
+                .clocks
+                .is_empty()
+        );
+    }
+
+    struct FailAfterGzipHeader<'a> {
+        file: &'a mut File,
+        remaining: usize,
+    }
+
+    impl Write for FailAfterGzipHeader<'_> {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if self.remaining == 0 {
+                return Err(io::Error::other("injected compressed-output failure"));
+            }
+            let count = self.file.write(&bytes[..bytes.len().min(self.remaining)])?;
+            self.remaining -= count;
+            Ok(count)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.file.flush()
+        }
+    }
+
+    #[test]
+    fn failed_gzip_replacement_preserves_complete_old_metadata() {
+        let directory = TempDir::new().unwrap();
+        let weather = WeatherData {
+            rain_time: 100,
+            raining: true,
+            ..WeatherData::default()
+        };
+        write_weather(directory.path(), &weather).unwrap();
+        let path = minecraft_data_dir(directory.path()).join("weather.dat");
+        let original = fs::read(&path).unwrap();
+        let mut replacement = NbtCompound::new();
+        replacement.put_string("replacement", "must not be published".to_string());
+
+        let result = atomic_write(&path, |file| {
+            // Allow the fixed gzip header, then fail as compressed output is completed.
+            pumpkin_nbt::nbt_compress::write_gzip_compound_tag(
+                replacement,
+                FailAfterGzipHeader {
+                    file,
+                    remaining: 10,
+                },
+            )
+            .map_err(|e| WorldInfoError::SerializationError(e.to_string()))
+        });
+
+        assert!(matches!(result, Err(WorldInfoError::SerializationError(_))));
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert_eq!(
+            read_weather(directory.path()).unwrap().unwrap().rain_time,
+            100
+        );
+        assert_eq!(
+            fs::read_dir(minecraft_data_dir(directory.path()))
+                .unwrap()
+                .count(),
+            1,
+            "failed writes must remove their owned temporary file"
+        );
+    }
+
+    #[test]
+    fn weather_replacement_completes_gzip_stream() {
+        let directory = TempDir::new().unwrap();
+        write_weather(directory.path(), &WeatherData::default()).unwrap();
+        let replacement = WeatherData {
+            thunder_time: 700,
+            thundering: true,
+            data_version: 4903,
+            ..WeatherData::default()
+        };
+        write_weather(directory.path(), &replacement).unwrap();
+        let path = minecraft_data_dir(directory.path()).join("weather.dat");
+        let root = read_gzip_compound_tag(File::open(path).unwrap()).unwrap();
+        assert_eq!(root.get_int("DataVersion"), Some(4903));
+        let data = root.get_compound("data").unwrap();
+        assert_eq!(data.get_int("thunder_time"), Some(700));
+        assert_eq!(data.get_bool("thundering"), Some(true));
+    }
+
+    #[test]
+    fn existing_stub_metadata_is_not_replaced() {
+        let directory = TempDir::new().unwrap();
+        let stubs = [
+            write_custom_boss_events_stub as fn(&Path, i32) -> Result<(), WorldInfoError>,
+            write_scheduled_events_stub,
+            write_random_sequences_stub,
+            write_scoreboard_stub,
+            write_stopwatches_stub,
+        ];
+        let names = [
+            "custom_boss_events.dat",
+            "scheduled_events.dat",
+            "random_sequences.dat",
+            "scoreboard.dat",
+            "stopwatches.dat",
+        ];
+        for (write_stub, name) in stubs.into_iter().zip(names) {
+            write_stub(directory.path(), 4903).unwrap();
+            let path = minecraft_data_dir(directory.path()).join(name);
+            let mut root = read_gzip_compound_tag(File::open(&path).unwrap()).unwrap();
+            root.put_long("unmanaged", 987);
+            pumpkin_nbt::nbt_compress::write_gzip_compound_tag(root, File::create(&path).unwrap())
+                .unwrap();
+            let original = fs::read(&path).unwrap();
+            write_stub(directory.path(), 9999).unwrap();
+            assert_eq!(
+                fs::read(path).unwrap(),
+                original,
+                "replaced existing {name}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
