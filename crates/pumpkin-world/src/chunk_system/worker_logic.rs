@@ -15,12 +15,21 @@ use tracing::{debug, error, warn};
 
 pub enum RecvChunk {
     IO(Chunk),
+    ReadFailure {
+        error: String,
+    },
     Generation(Cache),
     GenerationFailure {
         pos: ChunkPos,
         stage: StagedChunkEnum,
         error: String,
     },
+}
+
+fn read_failure(level: &Level, pos: ChunkPos, cause: impl std::fmt::Display) -> RecvChunk {
+    let error = format!("Failed to read chunk {pos:?}: {cause}");
+    level.fail_chunk_system(error.clone());
+    RecvChunk::ReadFailure { error }
 }
 
 /// Checks if a chunk needs relighting based on the current lighting configuration
@@ -124,6 +133,7 @@ pub async fn io_read_work(
         let (t_send, mut t_recv) = tokio::sync::mpsc::channel(1000);
 
         let batch_len = batch.len();
+        let mut pending: super::HashSetType<_> = batch.iter().copied().collect();
         let level_clone = level.clone();
 
         let fetch_task = tokio::spawn(async move {
@@ -133,46 +143,60 @@ pub async fn io_read_work(
                 .await;
         });
 
+        let mut receiver_closed = false;
         for _ in 0..batch_len {
             let Some(data) = t_recv.recv().await else {
                 break;
             };
 
-            match data {
+            let received_pos = match &data {
+                Loaded(chunk) => ChunkPos::new(chunk.x, chunk.z),
+                LoadedData::Missing(pos) | LoadedData::Error((pos, _)) => *pos,
+            };
+            pending.remove(&received_pos);
+            let (pos, received) = match data {
+                LoadedData::Error((pos, cause)) => (pos, read_failure(&level, pos, cause)),
                 Loaded(chunk) => {
                     let pos = ChunkPos::new(chunk.x, chunk.z);
-                    let level = level.clone();
-                    let result = run_blocking(move || process_loaded_chunk(chunk, &level)).await;
+                    let level_for_processing = level.clone();
+                    let result =
+                        run_blocking(move || process_loaded_chunk(chunk, &level_for_processing))
+                            .await;
                     let received = match result {
                         Ok(processed) => RecvChunk::IO(processed),
-                        Err(err) => RecvChunk::GenerationFailure {
-                            pos,
-                            stage: StagedChunkEnum::Empty,
-                            error: err.to_string(),
-                        },
+                        Err(err) => read_failure(&level, pos, err),
                     };
-                    if send.send((pos, received)).is_err() {
-                        break;
-                    }
+                    (pos, received)
                 }
-                LoadedData::Missing(pos) | LoadedData::Error((pos, _)) => {
-                    if send
-                        .send((
-                            pos,
-                            RecvChunk::IO(Chunk::Proto(Box::new(ProtoChunk::new(
-                                pos.x,
-                                pos.y,
-                                &level.world_gen.load(),
-                            )))),
-                        ))
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
+                LoadedData::Missing(pos) => (
+                    pos,
+                    RecvChunk::IO(Chunk::Proto(Box::new(ProtoChunk::new(
+                        pos.x,
+                        pos.y,
+                        &level.world_gen.load(),
+                    )))),
+                ),
+            };
+            if send.send((pos, received)).is_err() {
+                receiver_closed = true;
+                break;
             }
         }
-        let _ = fetch_task.await;
+        // Let bounded serializer forwarding unwind if the scheduler has stopped.
+        drop(t_recv);
+        let fetch_result = fetch_task.await;
+        if receiver_closed {
+            break;
+        }
+        for pos in pending {
+            let cause = match &fetch_result {
+                Ok(()) => "Chunk loader closed without returning a result".to_string(),
+                Err(err) => format!("Chunk loader task failed: {err}"),
+            };
+            if send.send((pos, read_failure(&level, pos, cause))).is_err() {
+                break;
+            }
+        }
     }
     debug!("io read thread stop");
 }
@@ -301,5 +325,137 @@ pub fn run_generation(
                 error: msg.to_string(),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pumpkin_config::world::LevelConfig;
+    use pumpkin_data::dimension::Dimension;
+    use std::time::Duration;
+
+    async fn read_batch(
+        level: &Arc<Level>,
+        positions: Vec<ChunkPos>,
+    ) -> Vec<(ChunkPos, RecvChunk)> {
+        let (request, recv) = tokio::sync::mpsc::channel(1);
+        let (send, results) = crossbeam::channel::unbounded();
+        let lock = Arc::new((
+            std::sync::Mutex::new(super::super::HashMapType::default()),
+            tokio::sync::Notify::new(),
+        ));
+        request.send(positions).await.unwrap();
+        drop(request);
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            io_read_work(
+                Arc::new(tokio::sync::Mutex::new(recv)),
+                send,
+                level.clone(),
+                lock,
+            ),
+        )
+        .await
+        .unwrap();
+        results.try_iter().collect()
+    }
+
+    #[tokio::test]
+    async fn corrupt_region_is_not_generated_or_overwritten() {
+        for original in [b"unreadable existing region".as_slice(), b""] {
+            let directory = tempfile::tempdir().unwrap();
+            let level = Level::from_root_folder(
+                &LevelConfig::default(),
+                directory.path().to_path_buf(),
+                0,
+                Dimension::OVERWORLD,
+            );
+            let path = level.level_folder.region_folder.join("r.0.0.mca");
+            tokio::fs::write(&path, original).await.unwrap();
+            let positions = vec![ChunkPos::new(0, 0), ChunkPos::new(1, 0)];
+            let results = read_batch(&level, positions.clone()).await;
+            assert_eq!(
+                results.len(),
+                positions.len(),
+                "every request must receive a result"
+            );
+            for (pos, result) in results {
+                assert!(positions.contains(&pos));
+                let RecvChunk::ReadFailure { error } = result else {
+                    panic!("unreadable existing chunks must never enter generation");
+                };
+                assert!(error.contains(&format!("{pos:?}")));
+                assert!(error.contains("Failed reading region"));
+            }
+            assert!(level.shut_down_chunk_system.load(Relaxed));
+            tokio::time::timeout(Duration::from_secs(10), level.shutdown())
+                .await
+                .unwrap();
+            assert_eq!(tokio::fs::read(&path).await.unwrap(), original);
+            assert!(level.loaded_chunks.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn dropped_scheduler_unblocks_a_backpressured_read_batch() {
+        let directory = tempfile::tempdir().unwrap();
+        let level = Level::from_root_folder(
+            &LevelConfig::default(),
+            directory.path().to_path_buf(),
+            0,
+            Dimension::OVERWORLD,
+        );
+        let (request, recv) = tokio::sync::mpsc::channel(1);
+        let (send, results) = crossbeam::channel::unbounded();
+        drop(results);
+        let lock = Arc::new((
+            std::sync::Mutex::new(super::super::HashMapType::default()),
+            tokio::sync::Notify::new(),
+        ));
+        request
+            .send((0..2001).map(|x| ChunkPos::new(x, 0)).collect())
+            .await
+            .unwrap();
+        drop(request);
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            io_read_work(
+                Arc::new(tokio::sync::Mutex::new(recv)),
+                send,
+                level.clone(),
+                lock,
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(!level.shut_down_chunk_system.load(Relaxed));
+        tokio::time::timeout(Duration::from_secs(10), level.shutdown())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn absent_region_still_starts_chunk_generation() {
+        let directory = tempfile::tempdir().unwrap();
+        let level = Level::from_root_folder(
+            &LevelConfig::default(),
+            directory.path().to_path_buf(),
+            0,
+            Dimension::OVERWORLD,
+        );
+        let pos = ChunkPos::new(0, 0);
+        let results = read_batch(&level, vec![pos]).await;
+        assert_eq!(results.len(), 1);
+        let (received, result) = results.into_iter().next().unwrap();
+        assert_eq!(received, pos);
+        let RecvChunk::IO(Chunk::Proto(chunk)) = result else {
+            panic!("absent chunks must remain eligible for generation");
+        };
+        assert_eq!(chunk.stage, StagedChunkEnum::Empty);
+        assert!(!level.shut_down_chunk_system.load(Relaxed));
+        tokio::time::timeout(Duration::from_secs(10), level.shutdown())
+            .await
+            .unwrap();
     }
 }

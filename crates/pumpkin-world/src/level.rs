@@ -39,7 +39,6 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn};
 // use tokio::runtime::Handle;
 use tokio::{
-    select,
     sync::{
         mpsc::{self, Receiver},
         oneshot,
@@ -117,6 +116,7 @@ pub struct Level {
     /// Number of ticks between autosave checks. If 0, autosave is disabled.
     pub autosave_ticks: u64,
 
+    pending_entity_loads: DashMap<Vector2<i32>, Arc<tokio::sync::OnceCell<SyncEntityChunk>>>,
     pending_entity_generations: Arc<DashMap<Vector2<i32>, Vec<oneshot::Sender<SyncEntityChunk>>>>,
 
     pub level_channel: Arc<LevelChannel>,
@@ -292,6 +292,7 @@ impl Level {
             should_unload: AtomicBool::new(false),
             save_enabled: AtomicBool::new(true),
             autosave_ticks: level_config.autosave_ticks,
+            pending_entity_loads: DashMap::new(),
             pending_entity_generations,
             level_channel: level_channel.clone(),
             thread_tracker,
@@ -322,6 +323,13 @@ impl Level {
         self.world_gen.load_full()
     }
 
+    pub(crate) fn fail_chunk_system(&self, cause: String) {
+        error!("{cause}; stopping this world's chunk system");
+        self.shut_down_chunk_system.store(true, Ordering::Relaxed);
+        self.chunk_listener.stop(cause);
+        self.level_channel.notify();
+    }
+
     pub fn spawn_entity_generation(self: &Arc<Self>, pos: Vector2<i32>) {
         let level = self.clone();
         rayon::spawn(move || {
@@ -333,7 +341,11 @@ impl Level {
                 dirty: AtomicBool::new(false),
             });
 
-            level.loaded_entity_chunks.insert(pos, arc_chunk.clone());
+            let arc_chunk = level
+                .loaded_entity_chunks
+                .entry(pos)
+                .or_insert(arc_chunk)
+                .clone();
 
             if let Some((_, waiters)) = level.pending_entity_generations.remove(&pos) {
                 for tx in waiters {
@@ -418,6 +430,7 @@ impl Level {
             .map(|chunk| (*chunk.key(), chunk.value().clone()))
             .collect::<Vec<_>>();
         self.loaded_entity_chunks.clear();
+        self.pending_entity_loads.clear();
 
         // TODO: I think the chunk_saver should be at the server level
         self.entity_saver.clear_watched_chunks().await;
@@ -501,6 +514,7 @@ impl Level {
                 }
 
                 // Remove immediately to prevent race conditions
+                self.pending_entity_loads.remove(pos);
                 self.loaded_entity_chunks.remove(pos)
             })
             .collect();
@@ -675,9 +689,7 @@ impl Level {
             lock.send_change();
         };
 
-        let chunk = recv
-            .await
-            .unwrap_or_else(|_| ChunkData::empty_sync(pos.x, pos.y));
+        let chunk = recv.await;
 
         {
             let mut lock = self
@@ -688,7 +700,17 @@ impl Level {
             lock.send_change();
         };
 
-        chunk
+        // This API is infallible; abort the requesting task rather than publish
+        // an empty replacement for an unreadable existing chunk.
+        #[expect(
+            clippy::panic,
+            reason = "infallible fetch must fail closed on chunk load failure"
+        )]
+        match chunk {
+            Ok(Ok(chunk)) => chunk,
+            Ok(Err(cause)) => panic!("Cannot fetch chunk {pos:?}: {cause}"),
+            Err(cause) => panic!("Chunk listener closed for {pos:?}: {cause}"),
+        }
     }
 
     async fn load_single_entity_chunk(
@@ -703,7 +725,10 @@ impl Level {
         match rx.recv().await {
             Some(LoadedData::Loaded(chunk)) => Ok((chunk, false)),
             Some(LoadedData::Error((_, err))) => Err(err),
-            _ => Err(ChunkReadingError::ChunkNotExist),
+            Some(LoadedData::Missing(_)) => Err(ChunkReadingError::ChunkNotExist),
+            None => Err(ChunkReadingError::IoError(std::io::Error::other(format!(
+                "Entity chunk loader closed without a result for {pos:?}"
+            )))),
         }
     }
 
@@ -711,71 +736,33 @@ impl Level {
         self: &Arc<Self>,
         chunks: Vec<Vector2<i32>>,
     ) -> Receiver<(Weak<ChunkEntityData>, bool)> {
-        let (sender, receiver) = mpsc::channel(64);
+        use futures::StreamExt;
+        const LOAD_CONCURRENCY: usize = 64;
+        let (sender, receiver) = mpsc::channel(LOAD_CONCURRENCY);
         let level = self.clone();
-
         self.spawn_task(async move {
-            let cancel_notifier = level.cancel_token.cancelled();
-
-            let fetch_task = async {
-                let to_fetch: Vec<_> = chunks
-                    .iter()
-                    .filter(|pos| {
-                        level.loaded_entity_chunks.get(pos).is_none_or(|chunk| {
-                            let _ = sender.try_send((Arc::downgrade(chunk.value()), false));
-                            false // Don't fetch
-                        })
-                    })
-                    .copied()
-                    .collect();
-
-                if !to_fetch.is_empty() {
-                    let (tx, mut rx) = tokio::sync::mpsc::channel::<
-                        LoadedData<SyncEntityChunk, ChunkReadingError>,
-                    >(to_fetch.len());
-
-                    level
-                        .entity_saver
-                        .fetch_chunks(&level.level_folder, &to_fetch, tx)
-                        .await;
-
-                    while let Some(data) = rx.recv().await {
-                        match data {
-                            LoadedData::Loaded(chunk) => {
-                                let pos = Vector2::new(chunk.x, chunk.z);
-                                level.loaded_entity_chunks.insert(pos, chunk.clone());
-                                let _ = sender.send((Arc::downgrade(&chunk), true)).await;
-                            }
-                            LoadedData::Missing(pos) | LoadedData::Error((pos, _)) => {
-                                let (tx, rx) = oneshot::channel();
-                                match level.pending_entity_generations.entry(pos) {
-                                    dashmap::mapref::entry::Entry::Occupied(mut entry) => {
-                                        entry.get_mut().push(tx);
-                                    }
-                                    dashmap::mapref::entry::Entry::Vacant(entry) => {
-                                        entry.insert(vec![tx]);
-                                        level.spawn_entity_generation(pos);
-                                    }
-                                }
-                                let sender_clone = sender.clone();
-                                tokio::spawn(async move {
-                                    if let Ok(chunk) = rx.await {
-                                        let _ =
-                                            sender_clone.send((Arc::downgrade(&chunk), true)).await;
-                                    }
-                                });
-                            }
+            let fetch = async {
+                let mut loading = futures::stream::iter(chunks)
+                    .map(|position| {
+                        let level = level.clone();
+                        async move {
+                            let cached = level.get_entity_chunk_sync(&position).is_some();
+                            let chunk = level.get_entity_chunk(position).await;
+                            (Arc::downgrade(&chunk), !cached)
                         }
+                    })
+                    .buffer_unordered(LOAD_CONCURRENCY);
+                while let Some(chunk) = loading.next().await {
+                    if sender.send(chunk).await.is_err() {
+                        return;
                     }
                 }
             };
-
-            select! {
-                () = cancel_notifier => {},
-                () = fetch_task => {}
+            tokio::select! {
+                () = level.cancel_token.cancelled() => {},
+                () = fetch => {},
             }
         });
-
         receiver
     }
 
@@ -784,29 +771,59 @@ impl Level {
             return chunk.clone();
         }
 
-        if let Ok((chunk, _)) = self.load_single_entity_chunk(pos).await {
-            self.loaded_entity_chunks.insert(pos, chunk.clone());
-            chunk
-        } else {
-            let (tx, rx) = oneshot::channel();
-            match self.pending_entity_generations.entry(pos) {
-                dashmap::mapref::entry::Entry::Occupied(mut entry) => {
-                    entry.get_mut().push(tx);
+        // Concurrent uncached callers share the same decode and the same live
+        // flag. A second decoded snapshot must never replace an active chunk.
+        let pending = self
+            .pending_entity_loads
+            .entry(pos)
+            .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new()))
+            .clone();
+        let chunk = pending
+            .get_or_init(|| async {
+                if let Some(chunk) = self.get_entity_chunk_sync(&pos) {
+                    return chunk;
                 }
-                dashmap::mapref::entry::Entry::Vacant(entry) => {
-                    entry.insert(vec![tx]);
-                    self.spawn_entity_generation(pos);
+                let chunk = self.load_entity_chunk_uncached(pos).await;
+                self.loaded_entity_chunks
+                    .entry(pos)
+                    .or_insert(chunk)
+                    .clone()
+            })
+            .await
+            .clone();
+        self.pending_entity_loads
+            .remove_if(&pos, |_, current| Arc::ptr_eq(current, &pending));
+        chunk
+    }
+
+    #[expect(
+        clippy::panic,
+        reason = "infallible entity fetch must fail closed on read errors"
+    )]
+    async fn load_entity_chunk_uncached(self: &Arc<Self>, pos: Vector2<i32>) -> SyncEntityChunk {
+        match self.load_single_entity_chunk(pos).await {
+            Ok((chunk, _)) => chunk,
+            Err(ChunkReadingError::ChunkNotExist) => {
+                let (tx, rx) = oneshot::channel();
+                match self.pending_entity_generations.entry(pos) {
+                    dashmap::mapref::entry::Entry::Occupied(mut entry) => {
+                        entry.get_mut().push(tx);
+                    }
+                    dashmap::mapref::entry::Entry::Vacant(entry) => {
+                        entry.insert(vec![tx]);
+                        self.spawn_entity_generation(pos);
+                    }
+                }
+                match rx.await {
+                    Ok(chunk) => chunk,
+                    Err(cause) => panic!("Entity chunk generation closed for {pos:?}: {cause}"),
                 }
             }
-            rx.await.unwrap_or_else(|_| {
-                Arc::new(ChunkEntityData {
-                    x: pos.x,
-                    z: pos.y,
-                    data: std::sync::Mutex::new(Vec::new()),
-                    live: AtomicBool::new(false),
-                    dirty: AtomicBool::new(false),
-                })
-            })
+            Err(cause) => {
+                let error = format!("Failed to read entity chunk {pos:?}: {cause}");
+                self.fail_chunk_system(error.clone());
+                panic!("{error}");
+            }
         }
     }
 
@@ -1022,6 +1039,141 @@ mod tests {
     use super::*;
     use pumpkin_config::world::LevelConfig;
     use tempfile::TempDir;
+
+    fn region_with_unknown_registry_entry() -> Vec<u8> {
+        use pumpkin_nbt::{Nbt, compound::NbtCompound, tag::NbtTag};
+        const SECTOR_SIZE: usize = 4096;
+        let mut entry = NbtCompound::new();
+        entry.put_string("Name", "minecraft:removed_block".to_string());
+        let mut blocks = NbtCompound::new();
+        blocks.put("palette", NbtTag::List(vec![NbtTag::Compound(entry)]));
+        let mut section = NbtCompound::new();
+        section.put_int("Y", -4);
+        section.put_compound("block_states", blocks);
+        let mut root = NbtCompound::new();
+        root.put_int("xPos", 0);
+        root.put_int("zPos", 0);
+        root.put_int("yPos", -4);
+        root.put_string("Status", "minecraft:full".to_string());
+        root.put("sections", NbtTag::List(vec![NbtTag::Compound(section)]));
+        let bytes = Nbt::new(String::new(), root).write();
+        let data_offset = SECTOR_SIZE * 2;
+        let mut region = vec![0; SECTOR_SIZE * 3];
+        region[..4].copy_from_slice(&[0, 0, 2, 1]);
+        region[data_offset..data_offset + 4]
+            .copy_from_slice(&((bytes.len() + 1) as u32).to_be_bytes());
+        region[data_offset + 4] = 3; // Anvil's uncompressed NBT format.
+        region[data_offset + 5..data_offset + 5 + bytes.len()].copy_from_slice(&bytes);
+        region
+    }
+
+    #[tokio::test]
+    async fn unreadable_chunk_aborts_fetch_and_preserves_storage_after_shutdown() {
+        for (original, expected_cause) in [
+            (b"existing damaged region".to_vec(), "Failed reading region"),
+            (
+                region_with_unknown_registry_entry(),
+                "minecraft:removed_block",
+            ),
+        ] {
+            let directory = TempDir::new().unwrap();
+            let level = Level::from_root_folder(
+                &LevelConfig::default(),
+                directory.path().to_path_buf(),
+                0,
+                Dimension::OVERWORLD,
+            );
+            let path = level.level_folder.region_folder.join("r.0.0.mca");
+            tokio::fs::write(&path, &original).await.unwrap();
+            let pos = Vector2::new(0, 0);
+            let fetching_level = level.clone();
+            let fetch =
+                tokio::spawn(
+                    async move { fetching_level.get_or_fetch_chunk(pos, Clone::clone).await },
+                );
+            let failure = timeout(Duration::from_secs(10), fetch)
+                .await
+                .unwrap()
+                .err()
+                .unwrap();
+            assert!(
+                failure.is_panic(),
+                "infallible fetch must abort, never return an empty chunk"
+            );
+            let cause = failure.into_panic();
+            let message = cause.downcast_ref::<String>().unwrap();
+            assert!(message.contains("Vector2 { x: 0, y: 0 }"));
+            assert!(message.contains(expected_cause));
+            assert!(level.loaded_chunks.is_empty());
+            timeout(Duration::from_secs(10), level.shutdown())
+                .await
+                .unwrap();
+            assert_eq!(tokio::fs::read(path).await.unwrap(), original);
+        }
+    }
+
+    #[tokio::test]
+    async fn unreadable_entity_region_is_not_generated_or_overwritten() {
+        for streaming in [false, true] {
+            let directory = TempDir::new().unwrap();
+            let level = Level::from_root_folder(
+                &LevelConfig::default(),
+                directory.path().to_path_buf(),
+                0,
+                Dimension::OVERWORLD,
+            );
+            let path = level.level_folder.entities_folder.join("r.0.0.mca");
+            let original = b"unreadable existing entities";
+            tokio::fs::write(&path, original).await.unwrap();
+            let pos = Vector2::new(0, 0);
+            if streaming {
+                let mut chunks = level.receive_entity_chunks(vec![pos]);
+                assert!(
+                    timeout(Duration::from_secs(10), chunks.recv())
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+            } else {
+                let fetching_level = level.clone();
+                let result = timeout(
+                    Duration::from_secs(10),
+                    tokio::spawn(async move { fetching_level.get_entity_chunk(pos).await }),
+                )
+                .await
+                .unwrap();
+                assert!(result.err().unwrap().is_panic());
+            }
+            assert!(level.shut_down_chunk_system.load(Ordering::Relaxed));
+            assert!(level.loaded_entity_chunks.is_empty());
+            assert!(level.pending_entity_generations.is_empty());
+            timeout(Duration::from_secs(10), level.shutdown())
+                .await
+                .unwrap();
+            assert_eq!(tokio::fs::read(path).await.unwrap(), original);
+        }
+    }
+
+    #[tokio::test]
+    async fn absent_entity_chunk_still_generates() {
+        let directory = TempDir::new().unwrap();
+        let level = Level::from_root_folder(
+            &LevelConfig::default(),
+            directory.path().to_path_buf(),
+            0,
+            Dimension::OVERWORLD,
+        );
+        let pos = Vector2::new(0, 0);
+        let chunk = timeout(Duration::from_secs(10), level.get_entity_chunk(pos))
+            .await
+            .unwrap();
+        assert_eq!((chunk.x, chunk.z), (0, 0));
+        assert!(level.loaded_entity_chunks.contains_key(&pos));
+        assert!(!level.shut_down_chunk_system.load(Ordering::Relaxed));
+        timeout(Duration::from_secs(10), level.shutdown())
+            .await
+            .unwrap();
+    }
 
     #[tokio::test]
     async fn dimension_paths_26_2() {

@@ -1,7 +1,7 @@
 use rustc_hash::FxHashMap;
 use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
-use tracing::{info, warn};
+use tracing::info;
 
 use flate2::Compression;
 use flate2::read::ZlibDecoder;
@@ -349,19 +349,31 @@ impl PoiRegion {
     }
 
     pub fn load(path: &Path) -> std::io::Result<Self> {
-        if !path.exists() {
+        let file_data = match std::fs::read(path) {
+            Ok(data) => data,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Self::new()),
+            Err(err) => return Err(err),
+        };
+        // Vanilla RegionFile opens with CREATE before reading. Untouched POI
+        // regions can therefore remain zero bytes even after a clean close.
+        if file_data.is_empty() {
             return Ok(Self::new());
         }
-
-        let file_data = std::fs::read(path)?;
         if file_data.len() < HEADER_SIZE {
-            return Ok(Self::new());
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "POI region header is truncated",
+            ));
         }
 
         let mut region = Self::new();
-
-        // Parse location table
         for index in 0..CHUNK_COUNT {
+            let invalid = |cause: &str| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("Invalid POI chunk at index {index}: {cause}"),
+                )
+            };
             let offset = index * 4;
             let location = u32::from_be_bytes([
                 file_data[offset],
@@ -369,27 +381,21 @@ impl PoiRegion {
                 file_data[offset + 2],
                 file_data[offset + 3],
             ]);
-
             let sector_offset = (location >> 8) as usize;
             let sector_count = (location & 0xFF) as usize;
-
-            if sector_offset == 0 || sector_count == 0 {
+            if sector_offset == 0 && sector_count == 0 {
                 continue;
             }
-
+            if sector_offset < 2 || sector_count == 0 {
+                return Err(invalid("invalid sector location"));
+            }
             let byte_offset = sector_offset * SECTOR_SIZE;
             let byte_end = byte_offset + sector_count * SECTOR_SIZE;
-
             if byte_end > file_data.len() {
-                continue;
+                return Err(invalid("chunk sectors extend beyond the region file"));
             }
 
-            // Read chunk data
             let chunk_bytes = &file_data[byte_offset..byte_end];
-            if chunk_bytes.len() < 5 {
-                continue;
-            }
-
             let length = u32::from_be_bytes([
                 chunk_bytes[0],
                 chunk_bytes[1],
@@ -397,28 +403,21 @@ impl PoiRegion {
                 chunk_bytes[3],
             ]) as usize;
             let compression = chunk_bytes[4];
-
-            if compression != COMPRESSION_ZLIB || length < 1 || length > chunk_bytes.len() - 4 {
-                continue;
+            if compression != COMPRESSION_ZLIB {
+                return Err(invalid("unsupported compression"));
             }
-
+            if length < 1 || length > chunk_bytes.len() - 4 {
+                return Err(invalid("invalid chunk length"));
+            }
             let compressed = &chunk_bytes[5..5 + length - 1];
-
-            match Self::decompress_chunk_data(compressed) {
-                Ok(chunk_data) => {
-                    for (_section_key, section) in chunk_data.sections {
-                        for entry in section.records {
-                            let key = (entry.x, entry.y, entry.z);
-                            region.entries.insert(key, entry);
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!("Failed to parse POI chunk at index {index}: {e}");
+            let chunk_data = Self::decompress_chunk_data(compressed)
+                .map_err(|err| invalid(&format!("failed to decode chunk: {err}")))?;
+            for (_section_key, section) in chunk_data.sections {
+                for entry in section.records {
+                    region.entries.insert((entry.x, entry.y, entry.z), entry);
                 }
             }
         }
-
         region.dirty = false;
         Ok(region)
     }
@@ -451,14 +450,15 @@ impl PoiStorage {
         self.folder.join(format!("r.{rx}.{rz}.mca"))
     }
 
+    #[expect(
+        clippy::panic,
+        reason = "infallible POI access must not replace unreadable existing regions"
+    )]
     fn get_or_load_region(&mut self, rx: i32, rz: i32) -> &mut PoiRegion {
         let path = self.region_path(rx, rz);
         self.regions.entry((rx, rz)).or_insert_with(|| {
-            PoiRegion::load(&path).unwrap_or_else(|e| {
-                if path.exists() {
-                    warn!("Failed to load POI region {}: {}", path.display(), e);
-                }
-                PoiRegion::new()
+            PoiRegion::load(&path).unwrap_or_else(|cause| {
+                panic!("Failed to load POI region {}: {cause}", path.display());
             })
         })
     }
@@ -611,6 +611,63 @@ impl PoiStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vanilla_empty_poi_region_loads_without_rewriting_and_can_store_new_entries() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("r.0.0.mca");
+        std::fs::write(&path, []).unwrap();
+        let region = PoiRegion::load(&path).unwrap();
+        assert!(region.get_all().is_empty());
+        assert!(!region.is_dirty());
+
+        let mut storage = PoiStorage::new(directory.path().to_path_buf());
+        let portal = BlockPos::new(0, 64, 0);
+        assert!(
+            storage
+                .get_in_square(portal, 0, Some(POI_TYPE_NETHER_PORTAL))
+                .is_empty()
+        );
+        storage.save_all().unwrap();
+        assert!(std::fs::read(&path).unwrap().is_empty());
+
+        storage.add_portal(portal);
+        storage.save_all().unwrap();
+        let loaded = PoiRegion::load(&path).unwrap();
+        assert_eq!(loaded.get_all().len(), 1);
+        assert_eq!(loaded.get_all()[0].pos(), portal);
+        assert_eq!(loaded.get_all()[0].poi_type, POI_TYPE_NETHER_PORTAL);
+    }
+
+    #[test]
+    fn malformed_existing_poi_regions_never_become_saveable_replacements() {
+        let mut truncated = vec![0; HEADER_SIZE];
+        truncated[..4].copy_from_slice(&[0, 0, 2, 1]);
+        let mut corrupt_payload = vec![0; HEADER_SIZE + SECTOR_SIZE];
+        corrupt_payload[..4].copy_from_slice(&[0, 0, 2, 1]);
+        corrupt_payload[HEADER_SIZE..HEADER_SIZE + 4].copy_from_slice(&4u32.to_be_bytes());
+        corrupt_payload[HEADER_SIZE + 4] = COMPRESSION_ZLIB;
+        corrupt_payload[HEADER_SIZE + 5..HEADER_SIZE + 8].copy_from_slice(b"bad");
+        let mut unsupported = corrupt_payload.clone();
+        unsupported[HEADER_SIZE + 4] = 127;
+        for original in [vec![0], truncated, corrupt_payload, unsupported] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("r.0.0.mca");
+            std::fs::write(&path, &original).unwrap();
+            assert_eq!(
+                PoiRegion::load(&path).err().unwrap().kind(),
+                std::io::ErrorKind::InvalidData
+            );
+            let mut storage = PoiStorage::new(directory.path().to_path_buf());
+            let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                storage.add_portal(BlockPos::new(0, 64, 0));
+            }));
+            assert!(failure.is_err());
+            assert_eq!(storage.loaded_region_count(), 0);
+            storage.save_all().unwrap();
+            assert_eq!(std::fs::read(path).unwrap(), original);
+        }
+    }
 
     #[test]
     fn poi_entry() {

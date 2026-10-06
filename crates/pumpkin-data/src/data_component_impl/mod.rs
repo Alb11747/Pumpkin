@@ -555,7 +555,7 @@ pub use utility::*;
 
 #[must_use]
 pub fn read_data(id: DataComponent, data: &NbtTag) -> Option<Box<dyn DataComponentImpl>> {
-    match id {
+    let component = match id {
         DataComponent::MaxStackSize => Some(MaxStackSizeImpl::read_data(data)?.to_dyn()),
         DataComponent::CustomData => Some(CustomDataImpl::read_data(data)?.to_dyn()),
         DataComponent::Enchantments => Some(EnchantmentsImpl::read_data(data)?.to_dyn()),
@@ -709,7 +709,9 @@ pub fn read_data(id: DataComponent, data: &NbtTag) -> Option<Box<dyn DataCompone
         DataComponent::Compostable => Some(CompostableImpl::read_data(data)?.to_dyn()),
         DataComponent::Waxed => Some(WaxedImpl::read_data(data)?.to_dyn()),
         _ => None,
-    }
+    }?;
+    // Placeholder implementations have no persistent codec. Do not present them as decoded data.
+    (component.write_data() != NbtTag::End).then_some(component)
 }
 
 #[cfg(test)]

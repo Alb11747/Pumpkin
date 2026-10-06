@@ -77,12 +77,9 @@ impl ItemBehaviour for CrossbowItem {
                         charged_nbts.push(arrow_nbt);
                     }
 
-                    stack.patch.push((
-                        DataComponent::ChargedProjectiles,
-                        Some(Box::new(ChargedProjectilesImpl {
-                            projectiles: charged_nbts,
-                        })),
-                    ));
+                    stack.set_data_component(ChargedProjectilesImpl {
+                        projectiles: charged_nbts,
+                    });
                     player.inventory().set_held_item(stack);
 
                     if let Some(slot) = arrow_slot

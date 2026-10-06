@@ -14,6 +14,8 @@ use crate::entity::{
     mob::{Mob, MobEntity},
 };
 
+const MAX_LIFE: i32 = 2400;
+
 pub struct EndermiteEntity {
     pub mob_entity: MobEntity,
     pub lifetime: AtomicI32,
@@ -84,8 +86,16 @@ impl Mob for EndermiteEntity {
             return;
         }
 
-        let life = self.lifetime.fetch_add(1, Ordering::Relaxed) + 1;
-        if life >= 2400 {
+        // Vanilla Endermite.aiStep freezes aging for persistent mobs, but still
+        // discards a loaded endermite whose saved lifetime is already exhausted.
+        let life = if self.mob_entity.persistence_required.load(Ordering::Relaxed) {
+            self.lifetime.load(Ordering::Relaxed)
+        } else {
+            self.lifetime
+                .fetch_add(1, Ordering::Relaxed)
+                .wrapping_add(1)
+        };
+        if life >= MAX_LIFE {
             entity.remove();
         }
     }

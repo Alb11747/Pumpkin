@@ -379,6 +379,50 @@ const fn bedrock_inventory_slot(player_screen_slot: i16) -> Option<u32> {
     }
 }
 
+// These modeled fields are optional in the existing entity/living/player
+// writers. Their absence means removal, rather than retention from the import.
+const OPTIONAL_PLAYER_NBT_FIELDS: &[&str] = &[
+    "HasVisualFire",
+    "CustomName",
+    "Tags",
+    "PumpkinCustomData",
+    "active_effects",
+    "equipment",
+    "previousPlayerGameType",
+    "respawn",
+    "SpawnX",
+    "SpawnY",
+    "SpawnZ",
+    "SpawnDimension",
+    "SpawnForced",
+    "RootVehicle",
+];
+
+fn merge_player_nbt(original: &NbtCompound, mut modeled: NbtCompound) -> NbtCompound {
+    // The current RootVehicle codec models Attach only. Retain the mounted
+    // entity subtree only while it still belongs to that same attached vehicle.
+    if read_root_vehicle(original).is_some()
+        && read_root_vehicle(original) == read_root_vehicle(&modeled)
+        && let (Some(saved), Some(current)) = (
+            original.get_compound("RootVehicle"),
+            modeled.get_compound("RootVehicle"),
+        )
+    {
+        let mut root = saved.clone();
+        root.child_tags.extend(current.child_tags.clone());
+        modeled.put_compound("RootVehicle", root);
+    }
+    let mut merged = original.clone();
+    for field in OPTIONAL_PLAYER_NBT_FIELDS {
+        merged.child_tags.remove(*field);
+    }
+    if modeled.get("respawn").is_none() && modeled.get("SpawnX").is_none() {
+        merged.child_tags.remove("SpawnAngle");
+    }
+    merged.child_tags.extend(modeled.child_tags);
+    merged
+}
+
 /// Represents a Minecraft player entity.
 ///
 /// A `Player` is a special type of entity that represents a human player connected to the server.
@@ -445,6 +489,9 @@ pub struct Player {
     pub abilities: std::sync::Mutex<Abilities>,
     /// Player statistics
     pub stats: std::sync::Mutex<statistics::Statistics>,
+    pub(crate) data_save_session:
+        std::sync::Mutex<Option<crate::data::player_progress::PlayerSaveSession>>,
+    original_player_nbt: std::sync::Mutex<NbtCompound>,
     /// The current stage of block destruction of the block the player is breaking.
     pub current_block_destroy_stage: AtomicI32,
     /// The per-tick block destruction progress last sent to Bedrock clients.
@@ -754,6 +801,8 @@ impl Player {
             mining_pos: Mutex::new(BlockPos::ZERO),
             abilities: std::sync::Mutex::new(abilities),
             stats: std::sync::Mutex::new(statistics::Statistics::default()),
+            data_save_session: std::sync::Mutex::new(None),
+            original_player_nbt: std::sync::Mutex::new(NbtCompound::new()),
             gamemode: AtomicCell::new(gamemode),
             previous_gamemode: AtomicCell::new(None),
             camera_target_id: AtomicCell::new(None),
@@ -6829,6 +6878,18 @@ impl NBTStorage for EnderChestInventory {
 impl NBTStorageInit for EnderChestInventory {}
 
 impl EntityBase for Player {
+    fn write_nbt(&self, nbt: &mut NbtCompound) {
+        let mut modeled = NbtCompound::new();
+        self.get_entity().write_nbt(&mut modeled);
+        self.living_entity.write_living_nbt(&mut modeled);
+        self.write_custom_nbt(&mut modeled);
+        let original = self
+            .original_player_nbt
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *nbt = merge_player_nbt(&original, modeled);
+    }
+
     fn damage_with_context(
         &self,
         caller: &dyn EntityBase,
@@ -7073,6 +7134,10 @@ impl EntityBase for Player {
 
     #[expect(clippy::too_many_lines)]
     fn read_custom_nbt(&self, nbt: &NbtCompound) {
+        *self
+            .original_player_nbt
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = nbt.clone();
         self.inventory.read_nbt_non_mut(nbt);
         self.ender_chest_inventory.read_nbt_non_mut(nbt);
         self.living_entity
@@ -8074,9 +8139,85 @@ impl InventoryPlayer for Player {
 
 #[cfg(test)]
 mod tests {
-    use super::{bedrock_inventory_slot, read_root_vehicle, write_root_vehicle};
+    use super::{bedrock_inventory_slot, merge_player_nbt, read_root_vehicle, write_root_vehicle};
     use pumpkin_nbt::{compound::NbtCompound, tag::NbtTag};
     use uuid::Uuid;
+
+    #[test]
+    fn unmapped_player_root_data_survives_storage_and_modeled_fields_are_removed() {
+        use pumpkin_world::data::player_data::PlayerDataStorage;
+        let temp = tempfile::tempdir().unwrap();
+        let storage = PlayerDataStorage::new(temp.path(), true);
+        let uuid = Uuid::new_v4();
+        let mut original = NbtCompound::new();
+        let mut plugin = NbtCompound::new();
+        plugin.put_int("plugin:counter", 17);
+        original.put_compound("BukkitValues", plugin.clone());
+        let mut recipes = NbtCompound::new();
+        recipes.put_bool("isFilteringCraftable", true);
+        original.put_compound("recipeBook", recipes.clone());
+        original.put("ShoulderEntityLeft", NbtTag::Compound(plugin.clone()));
+        original.put_int("XpLevel", 7);
+        original.put_string("CustomName", "old name".to_owned());
+        original.put(
+            "active_effects",
+            NbtTag::List(vec![NbtTag::Compound(plugin.clone())]),
+        );
+        original.put_int("previousPlayerGameType", 1);
+        original.put_int("SpawnX", 10);
+        original.put_float("SpawnAngle", 90.0);
+        let vehicle = Uuid::new_v4();
+        write_root_vehicle(&mut original, vehicle);
+        let mut root = original.get_compound("RootVehicle").unwrap().clone();
+        let mut entity = NbtCompound::new();
+        entity.put_string("id", "minecraft:pig".to_owned());
+        entity.put_float("Health", 8.0);
+        root.put_compound("Entity", entity.clone());
+        original.put_compound("RootVehicle", root);
+        let mut modeled = NbtCompound::new();
+        modeled.put_int("XpLevel", 42);
+        modeled.put("Inventory", NbtTag::List(vec![]));
+        write_root_vehicle(&mut modeled, vehicle);
+        storage
+            .save_player_data(&uuid, merge_player_nbt(&original, modeled))
+            .unwrap();
+        let saved = storage.load_player_data(&uuid).unwrap().1;
+        assert_eq!(saved.get_int("XpLevel"), Some(42));
+        assert_eq!(saved.get_compound("BukkitValues"), Some(&plugin));
+        assert_eq!(saved.get_compound("recipeBook"), Some(&recipes));
+        assert_eq!(saved.get_compound("ShoulderEntityLeft"), Some(&plugin));
+        assert_eq!(
+            saved
+                .get_compound("RootVehicle")
+                .unwrap()
+                .get_compound("Entity"),
+            Some(&entity)
+        );
+        for removed in [
+            "CustomName",
+            "active_effects",
+            "previousPlayerGameType",
+            "SpawnX",
+            "SpawnAngle",
+        ] {
+            assert!(
+                saved.get(removed).is_none(),
+                "stale modeled field {removed}"
+            );
+        }
+        let cleared = merge_player_nbt(&saved, NbtCompound::new());
+        assert!(cleared.get("RootVehicle").is_none());
+        assert_eq!(cleared.get_compound("BukkitValues"), Some(&plugin));
+        let mut changed_vehicle = NbtCompound::new();
+        write_root_vehicle(&mut changed_vehicle, Uuid::new_v4());
+        assert!(
+            merge_player_nbt(&saved, changed_vehicle)
+                .get_compound("RootVehicle")
+                .unwrap()
+                .get("Entity")
+                .is_none()
+        );
+    }
 
     #[test]
     fn player_screen_slots_map_to_bedrock_inventory() {

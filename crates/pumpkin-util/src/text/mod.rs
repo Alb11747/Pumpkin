@@ -901,7 +901,16 @@ impl TextComponentBase {
 fn nbt_compound_to_json(compound: &pumpkin_nbt::NbtCompound) -> serde_json::Value {
     let mut map = serde_json::Map::new();
     for (k, v) in &compound.child_tags {
-        map.insert(k.to_string(), nbt_tag_to_json(v));
+        let value = if matches!(
+            k.as_ref(),
+            "bold" | "italic" | "underlined" | "strikethrough" | "obfuscated" | "interpret" | "hat"
+        ) && let pumpkin_nbt::tag::NbtTag::Byte(value) = v
+        {
+            serde_json::Value::Bool(*value != 0)
+        } else {
+            nbt_tag_to_json(v)
+        };
+        map.insert(k.to_string(), value);
     }
     serde_json::Value::Object(map)
 }
@@ -1322,7 +1331,12 @@ impl TextComponent {
     /// Parses a text component from its NBT representation
     #[must_use]
     pub fn from_nbt(tag: &pumpkin_nbt::tag::NbtTag) -> Self {
-        serde_json::from_value(nbt_tag_to_json(tag)).unwrap_or_else(|_| Self::empty())
+        Self::try_from_nbt(tag).unwrap_or_else(|_| Self::empty())
+    }
+
+    /// Parses an NBT text component without replacing malformed data with empty text.
+    pub fn try_from_nbt(tag: &pumpkin_nbt::tag::NbtTag) -> Result<Self, serde_json::Error> {
+        serde_json::from_value(nbt_tag_to_json(tag))
     }
 
     /// Creates a new text component with plain text content.
@@ -2186,8 +2200,12 @@ mod test {
         let mut styled = pumpkin_nbt::compound::NbtCompound::new();
         styled.put_string("text", "hi".to_string());
         styled.put_string("color", "red".to_string());
+        styled.put_byte("italic", 0);
+        styled.put_byte("bold", 1);
         let component = TextComponent::from_nbt(&pumpkin_nbt::tag::NbtTag::Compound(styled));
         assert_eq!(component.0.style.color, Some(Color::Named(NamedColor::Red)));
+        assert_eq!(component.0.style.italic, Some(false));
+        assert_eq!(component.0.style.bold, Some(true));
         assert_eq!(component.get_text(), "hi");
     }
 }

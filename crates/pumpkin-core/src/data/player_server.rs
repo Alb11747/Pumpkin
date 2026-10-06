@@ -1,3 +1,7 @@
+use crate::data::player_progress::{
+    PlayerSaveChannel, PlayerSaveSession, PlayerSaveState, PlayerSaveTicket,
+};
+use crate::entity::player::statistics::{StatisticsDataError, StatisticsSnapshot};
 use crate::{
     entity::{NBTStorage, player::Player},
     server::Server,
@@ -6,7 +10,10 @@ use crossbeam::atomic::AtomicCell;
 use pumpkin_inventory::screen_handler::ScreenHandler;
 use pumpkin_nbt::compound::NbtCompound;
 use pumpkin_world::data::player_data::{PlayerDataError, PlayerDataStorage};
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 use std::{
     path::PathBuf,
     time::{Duration, Instant},
@@ -21,6 +28,30 @@ pub struct ServerPlayerData {
     storage: Arc<PlayerDataStorage>,
     save_interval: Duration,
     last_save: AtomicCell<Instant>,
+    save_states: Mutex<HashMap<uuid::Uuid, Arc<PlayerSaveState>>>,
+}
+
+struct PlayerNbtSnapshot {
+    data: NbtCompound,
+    ticket: PlayerSaveTicket,
+}
+
+impl PlayerNbtSnapshot {
+    #[cfg(test)]
+    fn new(data: NbtCompound, session: &PlayerSaveSession) -> Result<Self, PlayerDataError> {
+        let ticket = session
+            .ticket(PlayerSaveChannel::Nbt)
+            .map_err(|reason| PlayerDataError::Io(std::io::Error::other(reason)))?;
+        Ok(Self { data, ticket })
+    }
+
+    fn save(self, storage: &PlayerDataStorage, uuid: &uuid::Uuid) -> Result<(), PlayerDataError> {
+        let _writer = self.ticket.writer();
+        if !self.ticket.is_current() {
+            return Ok(());
+        }
+        storage.save_player_data(uuid, self.data)
+    }
 }
 
 impl ServerPlayerData {
@@ -30,6 +61,7 @@ impl ServerPlayerData {
             storage: Arc::new(PlayerDataStorage::new(data_path, enabled)),
             save_interval,
             last_save: AtomicCell::new(Instant::now()),
+            save_states: Mutex::new(HashMap::new()),
         }
     }
 
@@ -52,11 +84,26 @@ impl ServerPlayerData {
             .on_closed(player.as_ref());
         player.on_handled_screen_closed();
 
-        let mut nbt = NbtCompound::new();
-        player.write_nbt(&mut nbt);
-
-        self.storage.save_player_data(&player.gameprofile.id, nbt)?;
-        Ok(())
+        let session = Self::player_session(player)?;
+        let (nbt_ticket, statistics_ticket) = session
+            .final_tickets()
+            .map_err(|error| PlayerDataError::Io(std::io::Error::other(error)))?;
+        let mut data = NbtCompound::new();
+        player.write_nbt(&mut data);
+        let statistics = player
+            .stats
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .snapshot_with_ticket(statistics_ticket);
+        Self::save_snapshot(
+            &self.storage,
+            player.gameprofile.id,
+            Ok(PlayerNbtSnapshot {
+                data,
+                ticket: nbt_ticket,
+            }),
+            statistics,
+        )
     }
 
     /// Performs periodic maintenance tasks.
@@ -76,9 +123,15 @@ impl ServerPlayerData {
             let mut snapshots = Vec::new();
             for world in server.worlds.load().iter() {
                 for player in world.players.load().iter() {
-                    let mut nbt = NbtCompound::new();
-                    player.write_nbt(&mut nbt);
-                    snapshots.push((player.gameprofile.id, nbt));
+                    let nbt = Self::nbt_snapshot(player);
+                    let statistics = Self::statistics_snapshot(player);
+                    // Removal can finish while this tick retains an old list.
+                    // The final disconnect snapshot has already reserved its order.
+                    if Self::player_session(player).is_ok_and(|session| session.snapshots_closed())
+                    {
+                        continue;
+                    }
+                    snapshots.push((player.gameprofile.id, nbt, statistics));
                 }
             }
 
@@ -88,9 +141,9 @@ impl ServerPlayerData {
 
             let storage = self.storage.clone();
             rayon::spawn(move || {
-                for (uuid, nbt) in snapshots {
-                    if let Err(e) = storage.save_player_data(&uuid, nbt) {
-                        error!("Failed to save player data for {uuid}: {e}");
+                for (uuid, nbt, statistics) in snapshots {
+                    if let Err(error) = Self::save_snapshot(&storage, uuid, nbt, statistics) {
+                        error!("Failed to save player progress for {uuid}: {error}");
                     }
                 }
                 debug!("Periodic player data save completed");
@@ -104,17 +157,26 @@ impl ServerPlayerData {
     /// Useful for server shutdown or backup operations.
     pub fn save_all_players(&self, server: &Server) -> Result<(), PlayerDataError> {
         let mut total_players = 0;
+        let mut failures = Vec::new();
 
         // Save players from all worlds
         for world in server.worlds.load().iter() {
             for player in world.players.load().iter() {
-                self.extract_data_and_save_player(player)?;
-                total_players += 1;
+                match self.extract_data_and_save_player(player) {
+                    Ok(()) => total_players += 1,
+                    Err(error) => failures.push(format!("{}: {error}", player.gameprofile.id)),
+                }
             }
         }
 
         debug!("Saved data for {total_players} online players");
-        Ok(())
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(PlayerDataError::Io(std::io::Error::other(
+                failures.join("; "),
+            )))
+        }
     }
 
     /// Loads player data and applies it to a player.
@@ -130,27 +192,130 @@ impl ServerPlayerData {
     ///
     /// A Result indicating success or the error that occurred.
     pub fn load_data(&self, uuid: &uuid::Uuid) -> Result<Option<NbtCompound>, PlayerDataError> {
-        let result = self.storage.load_player_data(uuid);
+        self.load_session(uuid).map(|(data, _)| data)
+    }
 
-        match result {
-            Ok((should_load, data)) => {
-                if !should_load {
-                    // No data to load, continue with default data
-                    return Ok(None);
-                }
-                Ok(Some(data))
-            }
-            Err(e) => {
-                if self.storage.is_save_enabled() {
-                    // Only log as error if player data saving is enabled
-                    error!("Error loading player data for {uuid}: {e}");
-                } else {
-                    // Otherwise just log as info since it's expected
-                    debug!("Not loading player data for {uuid} (saving disabled)");
-                }
-                // Continue with default data even if there's an error
-                Ok(None)
-            }
+    fn save_state(&self, uuid: &uuid::Uuid) -> Arc<PlayerSaveState> {
+        self.save_states
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(*uuid)
+            .or_default()
+            .clone()
+    }
+
+    /// Admission and disconnect share this gate through final persistence.
+    /// It is owned and asynchronous: cancellation releases it without blocking
+    /// Tokio threads or carrying a synchronous mutex guard across await.
+    pub(crate) async fn admission_guard(
+        &self,
+        uuid: &uuid::Uuid,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        self.save_state(uuid).admission_guard().await
+    }
+
+    pub(crate) fn load_session(
+        &self,
+        uuid: &uuid::Uuid,
+    ) -> Result<(Option<NbtCompound>, PlayerSaveSession), PlayerDataError> {
+        let state = self.save_state(uuid);
+        let _writer = state.writer();
+        let session = state.begin_session();
+        session.set_load_failed(true);
+        let (present, data) = self.storage.load_player_data(uuid)?;
+        session.set_load_failed(false);
+        Ok((present.then_some(data), session))
+    }
+
+    pub(crate) fn reject_player(player: &Player) {
+        if let Some(session) = player
+            .data_save_session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            session.set_load_failed(true);
+        }
+    }
+
+    pub fn load_statistics(&self, player: &Player) -> Result<(), StatisticsDataError> {
+        if !self.storage.is_save_enabled() {
+            return Ok(());
+        }
+        let players = self
+            .storage
+            .get_data_path()
+            .parent()
+            .ok_or_else(|| std::io::Error::other("player data directory has no parent"))?;
+        let session = player
+            .data_save_session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .ok_or_else(|| std::io::Error::other("player save session is not initialized"))?;
+        let mut stats = player
+            .stats
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        stats.use_save_session(session);
+        stats.load(players, player.gameprofile.id)
+    }
+
+    fn player_session(player: &Player) -> Result<PlayerSaveSession, PlayerDataError> {
+        player
+            .data_save_session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .ok_or_else(|| {
+                PlayerDataError::Io(std::io::Error::other(
+                    "player save session is not initialized",
+                ))
+            })
+    }
+
+    fn nbt_snapshot(player: &Player) -> Result<PlayerNbtSnapshot, PlayerDataError> {
+        let session = Self::player_session(player)?;
+        // Reserve the order before reading player state. A slow earlier
+        // serialization must not supersede a later disconnect snapshot.
+        let ticket = session
+            .ticket(PlayerSaveChannel::Nbt)
+            .map_err(|reason| PlayerDataError::Io(std::io::Error::other(reason)))?;
+        let mut data = NbtCompound::new();
+        player.write_nbt(&mut data);
+        Ok(PlayerNbtSnapshot { data, ticket })
+    }
+
+    fn statistics_snapshot(
+        player: &Player,
+    ) -> Result<Option<StatisticsSnapshot>, StatisticsDataError> {
+        player
+            .stats
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .snapshot()
+    }
+
+    // Both saves are attempted before returning an error. Statistics failures
+    // must not prevent inventory, experience, and other player NBT from saving.
+    fn save_snapshot(
+        storage: &PlayerDataStorage,
+        uuid: uuid::Uuid,
+        nbt: Result<PlayerNbtSnapshot, PlayerDataError>,
+        statistics: Result<Option<StatisticsSnapshot>, StatisticsDataError>,
+    ) -> Result<(), PlayerDataError> {
+        let statistics_result =
+            statistics.and_then(|snapshot| snapshot.map_or(Ok(()), StatisticsSnapshot::save));
+        let nbt_result = nbt.and_then(|snapshot| snapshot.save(storage, &uuid));
+        match (statistics_result, nbt_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Ok(()), Err(error)) => Err(error),
+            (Err(statistics), Ok(())) => Err(PlayerDataError::Io(std::io::Error::other(format!(
+                "statistics save failed (player NBT saved): {statistics}"
+            )))),
+            (Err(statistics), Err(nbt)) => Err(PlayerDataError::Io(std::io::Error::other(
+                format!("statistics save failed: {statistics}; player NBT save failed: {nbt}"),
+            ))),
         }
     }
 
@@ -171,23 +336,308 @@ impl ServerPlayerData {
         }
 
         let uuid = player.gameprofile.id;
-        let mut nbt = NbtCompound::new();
-        player.write_nbt(&mut nbt);
-
-        self.storage.save_player_data(&uuid, nbt)?;
-        Ok(())
+        Self::save_snapshot(
+            &self.storage,
+            uuid,
+            Self::nbt_snapshot(player),
+            Self::statistics_snapshot(player),
+        )
     }
 }
 
 #[cfg(test)]
 mod test {
-    use crate::data::player_server::ServerPlayerData;
+    use crate::data::player_progress::PlayerSaveState;
+    use crate::data::player_server::{PlayerNbtSnapshot, ServerPlayerData};
     use pumpkin_nbt::compound::NbtCompound;
     use pumpkin_world::data::player_data::PlayerDataStorage;
+    use std::sync::Arc;
     use std::time::Duration;
     use std::time::Instant;
     use tempfile::tempdir;
     use uuid::Uuid;
+
+    #[tokio::test]
+    async fn disconnect_handoff_waits_for_final_storage_and_cancelled_waiter_does_not_unlock_it() {
+        use crate::entity::player::statistics::{CustomStatistic, Statistics};
+        use pumpkin_nbt::tag::NbtTag;
+        use std::{
+            future::{Future, poll_fn},
+            task::Poll,
+        };
+        let temp = tempdir().unwrap();
+        let players = temp.path().join("players");
+        let server_data =
+            ServerPlayerData::new(players.join("data"), Duration::from_secs(60), true);
+        let uuid = Uuid::new_v4();
+        let (_, session) = server_data.load_session(&uuid).unwrap();
+        let mut statistics = Statistics::default();
+        statistics.use_save_session(session.clone());
+        statistics.load(&players, uuid).unwrap();
+        let mut initial = NbtCompound::new();
+        initial.put_int("XpLevel", 1);
+        server_data
+            .storage
+            .save_player_data(&uuid, initial.clone())
+            .unwrap();
+        let queued_tick = PlayerNbtSnapshot::new(initial, &session).unwrap();
+
+        // Both disconnect drivers reserve this before World::remove_player can
+        // unregister the UUID, then retain it through asynchronous leave events.
+        let handoff = server_data.admission_guard(&uuid).await;
+        let mut reconnect = Box::pin(async {
+            let _admission = server_data.admission_guard(&uuid).await;
+            server_data.load_session(&uuid)
+        });
+        assert!(
+            poll_fn(|cx| Poll::Ready(reconnect.as_mut().poll(cx).is_pending())).await,
+            "reconnect must wait before reading the stale experience/inventory file"
+        );
+        let mut cancelled = Box::pin(server_data.admission_guard(&uuid));
+        assert!(poll_fn(|cx| Poll::Ready(cancelled.as_mut().poll(cx).is_pending())).await);
+        drop(cancelled);
+        tokio::task::yield_now().await;
+
+        // Screen-close/leave-event mutations are represented by a changed real
+        // inventory and experience, not by a session-counter assertion.
+        let mut final_data = NbtCompound::new();
+        final_data.put_int("XpLevel", 42);
+        let mut stack = NbtCompound::new();
+        stack.put_byte("Slot", 0);
+        stack.put_string("id", "minecraft:diamond".to_owned());
+        stack.put_int("count", 3);
+        let inventory = NbtTag::List(vec![NbtTag::Compound(stack)]);
+        final_data.put("Inventory", inventory.clone());
+        statistics.increment_custom(CustomStatistic::Jump, 9);
+        statistics.increment_custom(CustomStatistic::LeaveGame, 1);
+        let (nbt_ticket, statistics_ticket) = session.final_tickets().unwrap();
+        ServerPlayerData::save_snapshot(
+            &server_data.storage,
+            uuid,
+            Ok(PlayerNbtSnapshot {
+                data: final_data,
+                ticket: nbt_ticket,
+            }),
+            statistics.snapshot_with_ticket(statistics_ticket),
+        )
+        .unwrap();
+        let path = server_data.storage.get_player_data_path(&uuid);
+        let final_bytes = std::fs::read(&path).unwrap();
+        queued_tick.save(&server_data.storage, &uuid).unwrap();
+        assert!(PlayerNbtSnapshot::new(NbtCompound::new(), &session).is_err());
+        assert!(statistics.snapshot().is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), final_bytes);
+        assert!(poll_fn(|cx| Poll::Ready(reconnect.as_mut().poll(cx).is_pending())).await);
+        drop(handoff);
+
+        let (data, new_session) = reconnect.await.unwrap();
+        let data = data.unwrap();
+        assert_eq!(data.get_int("XpLevel"), Some(42));
+        assert_eq!(data.get("Inventory"), Some(&inventory));
+        statistics.use_save_session(new_session);
+        statistics.load(&players, uuid).unwrap();
+        assert_eq!(
+            statistics.get(
+                pumpkin_data::statistic::StatisticCategory::Custom,
+                CustomStatistic::Jump as i32
+            ),
+            9
+        );
+        assert_eq!(
+            statistics.get(
+                pumpkin_data::statistic::StatisticCategory::Custom,
+                CustomStatistic::LeaveGame as i32
+            ),
+            1
+        );
+        assert!(PlayerNbtSnapshot::new(NbtCompound::new(), &session).is_err());
+    }
+
+    #[test]
+    fn paired_nbt_and_statistics_snapshots_are_ordered_across_reconnects() {
+        use crate::entity::player::statistics::{CustomStatistic, Statistics};
+        let temp = tempdir().unwrap();
+        let players = temp.path().join("players");
+        let server_data =
+            ServerPlayerData::new(players.join("data"), Duration::from_secs(60), true);
+        let uuid = Uuid::new_v4();
+        let (_, session) = server_data.load_session(&uuid).unwrap();
+        let mut statistics = Statistics::default();
+        statistics.use_save_session(session.clone());
+        statistics.load(&players, uuid).unwrap();
+        let nbt_at_level = |level| {
+            let mut nbt = NbtCompound::new();
+            nbt.put_int("XpLevel", level);
+            nbt
+        };
+        let older_nbt = PlayerNbtSnapshot::new(nbt_at_level(10), &session);
+        statistics.set(
+            crate::entity::player::statistics::StatisticCategory::Custom,
+            CustomStatistic::Jump as i32,
+            10,
+        );
+        let older_stats = statistics.snapshot();
+        let newer_nbt = PlayerNbtSnapshot::new(nbt_at_level(20), &session);
+        statistics.set(
+            crate::entity::player::statistics::StatisticCategory::Custom,
+            CustomStatistic::Jump as i32,
+            20,
+        );
+        ServerPlayerData::save_snapshot(
+            &server_data.storage,
+            uuid,
+            newer_nbt,
+            statistics.snapshot(),
+        )
+        .unwrap();
+        let path = server_data.storage.get_player_data_path(&uuid);
+        let stats_path = players.join("stats").join(format!("{uuid}.json"));
+        let latest_nbt = std::fs::read(&path).unwrap();
+        let latest_stats = std::fs::read(&stats_path).unwrap();
+        ServerPlayerData::save_snapshot(&server_data.storage, uuid, older_nbt, older_stats)
+            .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), latest_nbt);
+        assert_eq!(std::fs::read(&stats_path).unwrap(), latest_stats);
+        assert_eq!(
+            server_data
+                .storage
+                .load_player_data(&uuid)
+                .unwrap()
+                .1
+                .get_int("XpLevel"),
+            Some(20)
+        );
+
+        let queued_previous_session = PlayerNbtSnapshot::new(nbt_at_level(70), &session).unwrap();
+        let (_, new_session) = server_data.load_session(&uuid).unwrap();
+        queued_previous_session
+            .save(&server_data.storage, &uuid)
+            .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), latest_nbt);
+        assert!(PlayerNbtSnapshot::new(nbt_at_level(80), &session).is_err());
+        assert!(statistics.snapshot().is_err());
+        statistics.use_save_session(new_session.clone());
+        statistics.load(&players, uuid).unwrap();
+        let newer = PlayerNbtSnapshot::new(nbt_at_level(30), &new_session);
+        ServerPlayerData::save_snapshot(&server_data.storage, uuid, newer, statistics.snapshot())
+            .unwrap();
+        assert_eq!(
+            server_data
+                .storage
+                .load_player_data(&uuid)
+                .unwrap()
+                .1
+                .get_int("XpLevel"),
+            Some(30)
+        );
+
+        // A rejected load disables both channels for that current player too.
+        let queued = PlayerNbtSnapshot::new(nbt_at_level(90), &new_session).unwrap();
+        new_session.set_load_failed(true);
+        queued.save(&server_data.storage, &uuid).unwrap();
+        assert!(matches!(
+            statistics.snapshot(),
+            Err(crate::entity::player::statistics::StatisticsDataError::FailedLoad(_))
+        ));
+        assert!(PlayerNbtSnapshot::new(nbt_at_level(90), &new_session).is_err());
+        assert_eq!(
+            server_data
+                .storage
+                .load_player_data(&uuid)
+                .unwrap()
+                .1
+                .get_int("XpLevel"),
+            Some(30)
+        );
+    }
+
+    #[test]
+    fn failed_nbt_load_propagates_and_invalidates_pending_writes() {
+        let temp = tempdir().unwrap();
+        let server_data = ServerPlayerData::new(
+            temp.path().join("players/data"),
+            Duration::from_secs(60),
+            true,
+        );
+        let uuid = Uuid::new_v4();
+        let (_, session) = server_data.load_session(&uuid).unwrap();
+        let mut old = NbtCompound::new();
+        old.put_int("XpLevel", 20);
+        let queued = PlayerNbtSnapshot::new(old, &session).unwrap();
+        let path = server_data.storage.get_player_data_path(&uuid);
+        let corrupt = b"retained unreadable player NBT";
+        std::fs::write(&path, corrupt).unwrap();
+        assert!(server_data.load_data(&uuid).is_err());
+        queued.save(&server_data.storage, &uuid).unwrap();
+        assert!(PlayerNbtSnapshot::new(NbtCompound::new(), &session).is_err());
+        assert!(
+            server_data
+                .storage
+                .save_player_data(&uuid, NbtCompound::new())
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), corrupt);
+    }
+
+    #[test]
+    fn statistics_errors_do_not_prevent_player_nbt_save_and_both_errors_are_reported() {
+        use crate::entity::player::statistics::{CustomStatistic, Statistics, StatisticsDataError};
+        let temp = tempdir().unwrap();
+        let players = temp.path().join("players");
+        let storage = PlayerDataStorage::new(players.join("data"), true);
+        let uuid = Uuid::new_v4();
+        let session = Arc::new(PlayerSaveState::default()).begin_session();
+        let mut statistics = Statistics::default();
+        statistics.load(&players, uuid).unwrap();
+        statistics.increment_custom(CustomStatistic::Jump, 1);
+        // Fail the real statistics writer by occupying its directory with a file.
+        std::fs::write(players.join("stats"), "blocked directory").unwrap();
+        let mut nbt = NbtCompound::new();
+        nbt.put_int("XpLevel", 42);
+        let error = ServerPlayerData::save_snapshot(
+            &storage,
+            uuid,
+            PlayerNbtSnapshot::new(nbt, &session),
+            statistics.snapshot(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("player NBT saved"));
+        let (loaded, saved) = storage.load_player_data(&uuid).unwrap();
+        assert!(loaded);
+        assert_eq!(saved.get_int("XpLevel"), Some(42));
+
+        let mut nbt = NbtCompound::new();
+        nbt.put_int("XpLevel", 43);
+        let error = ServerPlayerData::save_snapshot(
+            &storage,
+            uuid,
+            PlayerNbtSnapshot::new(nbt, &session),
+            Err(StatisticsDataError::UnknownNumeric(8, -1)),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("unknown numeric statistic"));
+        assert_eq!(
+            storage
+                .load_player_data(&uuid)
+                .unwrap()
+                .1
+                .get_int("XpLevel"),
+            Some(43)
+        );
+
+        let unavailable_data = temp.path().join("unavailable");
+        std::fs::write(&unavailable_data, "blocked directory").unwrap();
+        let unavailable = PlayerDataStorage::new(unavailable_data, true);
+        let error = ServerPlayerData::save_snapshot(
+            &unavailable,
+            uuid,
+            PlayerNbtSnapshot::new(NbtCompound::new(), &session),
+            Err(StatisticsDataError::UnknownNumeric(8, -1)),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("statistics save failed"));
+        assert!(error.to_string().contains("player NBT save failed"));
+    }
 
     #[tokio::test]
     async fn player_data_storage_new() {

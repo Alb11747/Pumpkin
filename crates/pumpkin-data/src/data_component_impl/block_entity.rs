@@ -75,17 +75,12 @@ impl std::fmt::Debug for ContainerImpl {
 impl ContainerImpl {
     pub fn read_data(tag: &NbtTag) -> Option<Self> {
         let mut items = Vec::new();
-        if let NbtTag::List(l) = tag {
-            for item_tag in l {
-                if let NbtTag::Compound(c) = item_tag
-                    && let Some(slot) = c.get_int("slot")
-                    && let Some(item_compound) = c.get_compound("item")
-                    && let Some(stack) =
-                        crate::item_stack::ItemStack::read_item_stack(item_compound)
-                {
-                    items.push((slot as u8, stack));
-                }
-            }
+        for item_tag in tag.extract_list()? {
+            let c = item_tag.extract_compound()?;
+            let slot = u8::try_from(c.get_int("slot")?).ok()?;
+            let item_compound = c.get_compound("item")?;
+            let stack = crate::item_stack::ItemStack::read_item_stack(item_compound)?;
+            items.push((slot, stack));
         }
         Some(Self { items })
     }

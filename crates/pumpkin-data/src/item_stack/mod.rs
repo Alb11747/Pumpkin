@@ -1,5 +1,4 @@
 use crate::data_component::DataComponent;
-use crate::data_component::DataComponent::Enchantments;
 use crate::data_component_impl::{
     BlocksAttacksImpl, ConsumableImpl, CustomDataImpl, DamageImpl, DataComponentImpl,
     EnchantmentsImpl, IDSet, MaxDamageImpl, MaxStackSizeImpl, Rarity, RarityImpl,
@@ -20,6 +19,8 @@ use std::num::NonZero;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 mod categories;
+#[cfg(test)]
+mod preservation_tests;
 
 /// The outcome of a [`ItemStack::damage_item`] call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,9 +42,20 @@ pub struct ItemStack {
     pub item: &'static Item,
     pub patch: Vec<(DataComponent, Option<Box<dyn DataComponentImpl>>)>,
 
+    // Disk codecs can be missing or lossy. Keep the original until its modeled patch changes.
+    preserved_components: Vec<PreservedComponent>,
+
     // unique ID for Bedrock network; don't serialize
     // Should always be a positive value for non-empty stacks
     pub uid: NonZero<i32>,
+}
+
+#[derive(Clone)]
+struct PreservedComponent {
+    name: Box<str>,
+    data: NbtTag,
+    id: Option<DataComponent>,
+    modeled: Option<NbtTag>,
 }
 
 // impl Hash for ItemStack {
@@ -104,6 +116,7 @@ impl ItemStack {
             item_count,
             item,
             patch: Vec::new(),
+            preserved_components: Vec::new(),
 
             uid: ITEM_STACK_ID_GEN.next_id(),
         }
@@ -119,6 +132,7 @@ impl ItemStack {
             item_count,
             item,
             patch: component,
+            preserved_components: Vec::new(),
 
             uid: ITEM_STACK_ID_GEN.next_id(),
         }
@@ -133,6 +147,7 @@ impl ItemStack {
             item_count,
             item,
             patch: Vec::new(),
+            preserved_components: Vec::new(),
 
             uid: match NonZero::new(1) {
                 Some(v) => v,
@@ -217,12 +232,12 @@ impl ItemStack {
             let enchantments = EnchantmentsImpl {
                 enchantment: Cow::Owned(vec![(enchantment, level as i32)]),
             };
-            self.patch
-                .push((DataComponent::Enchantments, Some(Box::new(enchantments))));
+            self.set_data_component(enchantments);
         }
     }
 
     pub fn set_lore(&mut self, lines: Vec<pumpkin_util::text::TextComponent>) {
+        self.forget_preserved_component(DataComponent::Lore);
         let lore = Some(Box::new(crate::data_component_impl::LoreImpl { lines }) as _);
         if let Some((_, component)) = self
             .patch
@@ -237,6 +252,7 @@ impl ItemStack {
 
     pub fn set_data_component<T: DataComponentImpl + 'static>(&mut self, component: T) {
         let to_set_id = T::get_enum();
+        self.forget_preserved_component(to_set_id);
         let boxed = Some(Box::new(component) as _);
         if let Some((_, c)) = self.patch.iter_mut().find(|(id, _)| *id == to_set_id) {
             *c = boxed;
@@ -246,11 +262,18 @@ impl ItemStack {
     }
 
     pub fn remove_data_component(&mut self, to_remove_id: DataComponent) {
+        self.forget_preserved_component(to_remove_id);
         if let Some((_, c)) = self.patch.iter_mut().find(|(id, _)| *id == to_remove_id) {
             *c = None;
         } else {
             self.patch.push((to_remove_id, None));
         }
+    }
+
+    /// Resets all component overrides, including disk-only components with unknown registry IDs.
+    pub fn clear_components(&mut self) {
+        self.patch.clear();
+        self.preserved_components.clear();
     }
 
     pub fn add_lore(&mut self, line: pumpkin_util::text::TextComponent) {
@@ -265,6 +288,7 @@ impl ItemStack {
         item_count: 0,
         item: &Item::AIR,
         patch: Vec::new(),
+        preserved_components: Vec::new(),
 
         uid: NonZero::<i32>::MIN, // white lie - Bedrock `uid` is never sent if the stack is empty
     };
@@ -319,6 +343,7 @@ impl ItemStack {
     }
 
     pub fn set_damage(&mut self, damage: i32) {
+        self.forget_preserved_component(DataComponent::Damage);
         let damage = damage.max(0);
         if damage == 0 {
             self.patch.retain(|(id, _)| *id != DataComponent::Damage);
@@ -448,6 +473,7 @@ impl ItemStack {
     }
 
     pub fn set_custom_name(&mut self, name: String) {
+        self.forget_preserved_component(DataComponent::CustomName);
         use crate::data_component_impl::CustomNameImpl;
         let component = Some(
             CustomNameImpl {
@@ -479,6 +505,7 @@ impl ItemStack {
     }
 
     pub fn remove_custom_name(&mut self) {
+        self.forget_preserved_component(DataComponent::CustomName);
         self.patch
             .retain(|(id, _)| *id != DataComponent::CustomName);
     }
@@ -505,6 +532,7 @@ impl ItemStack {
     }
 
     pub fn set_repair_cost(&mut self, cost: i32) {
+        self.forget_preserved_component(DataComponent::RepairCost);
         if cost <= 0 {
             self.patch
                 .retain(|(id, _)| *id != DataComponent::RepairCost);
@@ -570,6 +598,7 @@ impl ItemStack {
     }
 
     fn set_custom_data_component(&mut self, custom_data: NbtCompound) {
+        self.forget_preserved_component(DataComponent::CustomData);
         let component = Some(CustomDataImpl { data: custom_data }.to_dyn());
         if let Some((_, data)) = self
             .patch
@@ -689,15 +718,9 @@ impl ItemStack {
             }
             data.enchantment.to_mut().push((enchantment, level));
         } else {
-            self.patch.push((
-                Enchantments,
-                Some(
-                    EnchantmentsImpl {
-                        enchantment: Cow::Owned(vec![(enchantment, level)]),
-                    }
-                    .to_dyn(),
-                ),
-            ));
+            self.set_data_component(EnchantmentsImpl {
+                enchantment: Cow::Owned(vec![(enchantment, level)]),
+            });
         }
     }
 
@@ -734,7 +757,11 @@ impl ItemStack {
             }
         }
 
-        true
+        if self.preserved_components.is_empty() && other.preserved_components.is_empty() {
+            true
+        } else {
+            self.write_components() == other.write_components()
+        }
     }
 
     #[must_use]
@@ -800,25 +827,51 @@ impl ItemStack {
         false
     }
 
+    fn forget_preserved_component(&mut self, id: DataComponent) {
+        self.preserved_components
+            .retain(|component| component.id != Some(id));
+    }
+
+    fn write_components(&self) -> NbtCompound {
+        let mut tag = NbtCompound::new();
+        for (id, data) in &self.patch {
+            if let Some(data) = data {
+                tag.put(id.to_name(), data.write_data());
+            } else {
+                tag.put(&format!("!{}", id.to_name()), NbtCompound::new());
+            }
+        }
+
+        let preserved: Vec<_> = self
+            .preserved_components
+            .iter()
+            .filter(|component| {
+                component.id.is_none_or(|id| {
+                    self.patch.iter().any(|(patch_id, data)| {
+                        *patch_id == id
+                            && data.as_ref().map(|data| data.write_data()) == component.modeled
+                    })
+                })
+            })
+            .collect();
+        for component in &preserved {
+            if let Some(id) = component.id {
+                tag.child_tags.remove(id.to_name());
+                tag.child_tags.remove(format!("!{}", id.to_name()).as_str());
+            }
+        }
+        for component in preserved {
+            tag.put(&component.name, component.data.clone());
+        }
+        tag
+    }
+
     pub fn write_item_stack(&self, compound: &mut NbtCompound) {
         // Minecraft 1.21.4 uses "id" as string with namespaced ID (minecraft:diamond_sword)
         compound.put_string("id", format!("minecraft:{}", self.item.registry_key));
         compound.put_int("count", self.item_count as i32);
 
-        // Create a tag compound for additional data
-        let mut tag = NbtCompound::new();
-
-        for (id, data) in &self.patch {
-            if let Some(data) = data {
-                tag.put(id.to_name(), data.write_data());
-            } else {
-                let name = '!'.to_string() + id.to_name();
-                tag.put(name.as_str(), NbtCompound::new());
-            }
-        }
-
-        // Store custom data like enchantments, display name, etc. would go here
-        compound.put_compound("components", tag);
+        compound.put_compound("components", self.write_components());
     }
 
     #[must_use]
@@ -830,23 +883,75 @@ impl ItemStack {
         let registry_key = full_id.strip_prefix("minecraft:").unwrap_or(full_id);
 
         // Try to get item by registry key
-        let item = Item::from_registry_key(registry_key)?;
+        let Some(item) = Item::from_registry_key(registry_key) else {
+            tracing::warn!(item = full_id, "Cannot load item with unknown registry ID");
+            return None;
+        };
 
-        let count = compound.get_int("count")? as u8;
+        let count = match compound.get("count") {
+            None => 1, // ItemStack.MAP_CODEC defaults a missing count to one.
+            Some(NbtTag::Int(count)) => *count,
+            Some(_) => {
+                tracing::warn!(item = full_id, "Cannot load item with non-integer count");
+                return None;
+            }
+        };
+        let Ok(count) = u8::try_from(count) else {
+            tracing::warn!(
+                item = full_id,
+                count,
+                "Cannot load item with unsupported count"
+            );
+            return None;
+        };
 
         // Create the item stack
         let mut item_stack = Self::new(count, item);
 
         // Process any additional data in the components compound
+        if compound.get("components").is_some() && compound.get_compound("components").is_none() {
+            tracing::warn!(
+                item = full_id,
+                "Cannot load item with non-compound components"
+            );
+            return None;
+        }
         if let Some(tag) = compound.get_compound("components") {
+            let mut occurrences = [0u8; u8::MAX as usize + 1];
+            for name in tag.child_tags.keys() {
+                if let Some(id) =
+                    DataComponent::try_from_name(name.strip_prefix('!').unwrap_or(name))
+                {
+                    occurrences[id.to_id() as usize] =
+                        occurrences[id.to_id() as usize].saturating_add(1);
+                }
+            }
             for (name, data) in &tag.child_tags {
-                if let Some(name) = name.strip_prefix("!") {
-                    item_stack
-                        .patch
-                        .push((DataComponent::try_from_name(name)?, None));
-                } else {
-                    let id = DataComponent::try_from_name(name)?;
-                    item_stack.patch.push((id, Some(read_data(id, data)?)));
+                let removed = name.starts_with('!');
+                let id = DataComponent::try_from_name(name.strip_prefix('!').unwrap_or(name));
+                // Conflicting aliases/removals have no unambiguous runtime value. Keep all on disk.
+                let modeled = id.and_then(|id| {
+                    (!removed && occurrences[id.to_id() as usize] == 1)
+                        .then(|| read_data(id, data))
+                        .flatten()
+                });
+                let snapshot = modeled.as_ref().map(|data| data.write_data());
+                if let Some(id) = id
+                    && !item_stack.patch.iter().any(|(patch_id, _)| *patch_id == id)
+                {
+                    // A missing disk codec must not fall through to an incompatible item default.
+                    item_stack.patch.push((id, modeled));
+                }
+                if !removed && snapshot.is_none() || id.is_none() {
+                    tracing::warn!(item = full_id, component = %name, "Preserving unsupported item component; gameplay behavior is unavailable");
+                }
+                if snapshot.as_ref() != Some(data) {
+                    item_stack.preserved_components.push(PreservedComponent {
+                        name: name.clone(),
+                        data: data.clone(),
+                        id,
+                        modeled: snapshot,
+                    });
                 }
             }
         }

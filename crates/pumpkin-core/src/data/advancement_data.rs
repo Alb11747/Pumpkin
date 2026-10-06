@@ -61,6 +61,7 @@ impl AdvancementManager {
                 .advancements
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.ensure_saveable()?;
             let json = serde_json::to_string_pretty(&*guard).map_err(AdvancementDataError::Json)?;
             to_write.push((guard.path.clone(), json));
         }

@@ -1176,6 +1176,11 @@ impl GenerationSchedule {
                 // Neighbor chunks returned to holders — unblock waiting tasks
                 self.check_waiting_tasks();
             }
+            RecvChunk::ReadFailure { error } => {
+                // The reader has halted the world and failed its listeners. Keep
+                // this holder empty: shutdown must never save a replacement here.
+                error!("{error}");
+            }
             RecvChunk::GenerationFailure {
                 pos: fail_pos,
                 stage,
@@ -1699,6 +1704,8 @@ impl GenerationSchedule {
             self.running_task_count = 0;
         }
 
+        self.listener
+            .stop("World chunk system shut down".to_string());
         drop(self.io_write);
 
         let unreleased_count = self.graph.nodes.len();

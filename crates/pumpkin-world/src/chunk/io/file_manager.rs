@@ -99,11 +99,7 @@ impl<S: ChunkSerializer<WriteBackend = PathBuf> + 'static> ChunkSerializerLazyLo
         match tokio::fs::read(&self.path).await {
             Ok(bytes) => {
                 if bytes.is_empty() {
-                    trace!(
-                        "File is empty (0 bytes), using default for: {}",
-                        self.path.display()
-                    );
-                    return Ok(S::default());
+                    return Err(ChunkReadingError::InvalidHeader);
                 }
                 let value = run_blocking(move || S::read(bytes.into()))
                     .await
@@ -276,12 +272,20 @@ where
 
                 let chunk_serializer = match self.get_serializer(&path).await {
                     Ok(s) => s,
-                    Err(ChunkReadingError::ChunkNotExist) => {
-                        return;
-                    }
                     Err(err) => {
-                        // Best-effort: report the error for the first coord in the batch.
-                        let _ = task_stream.send(LoadedData::Error((chunks[0], err))).await;
+                        let err = Arc::new(err);
+                        for pos in chunks {
+                            if task_stream
+                                .send(LoadedData::Error((
+                                    pos,
+                                    ChunkReadingError::RegionReadError(err.clone()),
+                                )))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
                         return;
                     }
                 };

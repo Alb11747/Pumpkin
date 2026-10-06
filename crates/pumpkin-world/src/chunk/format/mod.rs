@@ -132,52 +132,55 @@ fn lowest_biome_section_y(root_tag: &NbtCompound) -> Option<i32> {
         .map(|y| y.min(0))
 }
 
-fn extract_u16_array(tag: &pumpkin_nbt::tag::NbtTag) -> Option<Box<[BlockStateId]>> {
-    match tag {
-        pumpkin_nbt::tag::NbtTag::IntArray(arr) => Some(
-            arr.iter()
-                .map(|&x| BlockStateId::new_or_air(x as u16))
-                .collect(),
-        ),
-        pumpkin_nbt::tag::NbtTag::ByteArray(arr) => Some(
-            arr.iter()
-                .map(|&x| BlockStateId::new_or_air(x as u16))
-                .collect(),
-        ),
-        pumpkin_nbt::tag::NbtTag::LongArray(arr) => Some(
-            arr.iter()
-                .map(|&x| BlockStateId::new_or_air(x as u16))
-                .collect(),
-        ),
-        pumpkin_nbt::tag::NbtTag::List(list) => {
-            let ids: Box<[BlockStateId]> = list
-                .iter()
-                .map(|t| match t {
-                    pumpkin_nbt::tag::NbtTag::Int(x) => BlockStateId::new_or_air(*x as u16),
-                    pumpkin_nbt::tag::NbtTag::Short(x) => BlockStateId::new_or_air(*x as u16),
-                    pumpkin_nbt::tag::NbtTag::Byte(x) => BlockStateId::new_or_air(*x as u16),
-                    pumpkin_nbt::tag::NbtTag::Long(x) => BlockStateId::new_or_air(*x as u16),
-                    pumpkin_nbt::tag::NbtTag::Compound(compound) => {
-                        if let Ok(entry) =
-                            crate::generation::structure::template::PaletteEntry::from_nbt_compound(
-                                compound,
-                            )
-                            && let Some(state) =
-                                crate::generation::structure::template::BlockStateResolver::resolve_simple(
-                                    &entry,
-                                )
-                        {
-                            return state.id;
-                        }
-                        BlockStateId::AIR
+fn extract_u16_array(
+    tag: &pumpkin_nbt::tag::NbtTag,
+    position: Vector2<i32>,
+    section_y: i32,
+) -> Result<Option<Box<[BlockStateId]>>, ChunkParsingError> {
+    use pumpkin_nbt::tag::NbtTag;
+
+    let palette = match tag {
+        NbtTag::IntArray(arr) => arr
+            .iter()
+            .map(|&x| BlockStateId::new_or_air(x as u16))
+            .collect(),
+        NbtTag::ByteArray(arr) => arr
+            .iter()
+            .map(|&x| BlockStateId::new_or_air(x as u16))
+            .collect(),
+        NbtTag::LongArray(arr) => arr
+            .iter()
+            .map(|&x| BlockStateId::new_or_air(x as u16))
+            .collect(),
+        NbtTag::List(list) => list
+            .iter()
+            .enumerate()
+            .map(|(palette_index, tag)| {
+                let invalid = |cause| ChunkParsingError::InvalidBlockPalette {
+                    position,
+                    section_y,
+                    palette_index,
+                    cause,
+                };
+                Ok(match tag {
+                    NbtTag::Int(x) => BlockStateId::new_or_air(*x as u16),
+                    NbtTag::Short(x) => BlockStateId::new_or_air(*x as u16),
+                    NbtTag::Byte(x) => BlockStateId::new_or_air(*x as u16),
+                    NbtTag::Long(x) => BlockStateId::new_or_air(*x as u16),
+                    NbtTag::Compound(compound) => {
+                        let entry = crate::generation::structure::template::PaletteEntry::from_nbt_compound(compound)
+                            .map_err(|err| invalid(err.to_string()))?;
+                        crate::generation::structure::template::BlockStateResolver::resolve_simple(&entry)
+                            .ok_or_else(|| invalid(format!("Unknown block {}", entry.name)))?
+                            .id
                     }
-                    _ => BlockStateId::AIR,
+                    _ => return Err(invalid("Unsupported block palette entry".to_string())),
                 })
-                .collect();
-            Some(ids)
-        }
-        _ => None,
-    }
+            })
+            .collect::<Result<Box<[_]>, ChunkParsingError>>()?,
+        _ => return Ok(None),
+    };
+    Ok(Some(palette))
 }
 
 fn extract_u8_array(tag: &pumpkin_nbt::tag::NbtTag) -> Option<Box<[u8]>> {
@@ -334,7 +337,11 @@ impl ChunkData {
                             .map(|arr| arr.to_vec().into_boxed_slice());
                         let palette = bs_compound
                             .get("palette")
-                            .and_then(extract_u16_array)
+                            .map(|tag| {
+                                extract_u16_array(tag, position, section_y(section_compound))
+                            })
+                            .transpose()?
+                            .flatten()
                             .unwrap_or_else(|| vec![BlockStateId::AIR].into_boxed_slice());
 
                         block_palettes[index] =
@@ -1188,6 +1195,24 @@ mod tests {
     }
 
     #[test]
+    fn unknown_block_in_existing_chunk_fails_to_load() {
+        let bytes = test_chunk(vec![test_section(-4, "minecraft:removed_block", true)]).write();
+        let Err(ChunkReadingError::ParsingError(ChunkParsingError::InvalidBlockPalette {
+            position,
+            section_y,
+            palette_index,
+            cause,
+        })) = ChunkData::from_bytes(&bytes, Vector2::new(0, 0))
+        else {
+            panic!("unknown registry entries must fail with palette context");
+        };
+        assert_eq!(position, Vector2::new(0, 0));
+        assert_eq!(section_y, -4);
+        assert_eq!(palette_index, 1);
+        assert!(cause.contains("minecraft:removed_block"));
+    }
+
+    #[test]
     fn extract_u16_array_from_vanilla_compound_palette() {
         let mut entry1 = NbtCompound::new();
         entry1.put_string("Name", "minecraft:stone".to_string());
@@ -1202,7 +1227,9 @@ mod tests {
         entry2.put_compound("Properties", props);
 
         let list_tag = NbtTag::List(vec![NbtTag::Compound(entry1), NbtTag::Compound(entry2)]);
-        let result = extract_u16_array(&list_tag).expect("should extract palette");
+        let result = extract_u16_array(&list_tag, Vector2::new(0, 0), 0)
+            .expect("palette is valid")
+            .expect("should extract palette");
 
         assert_eq!(result.len(), 2);
         assert_eq!(result[0], Block::STONE.default_state.id);

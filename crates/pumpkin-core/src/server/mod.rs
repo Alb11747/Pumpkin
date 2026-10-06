@@ -638,12 +638,18 @@ impl Server {
     /// # Note
     ///
     /// You still have to spawn the `Player` in a `World` to let them join and make them visible.
-    pub fn add_player(
+    pub async fn add_player(
         self: &Arc<Self>,
         client: Arc<ClientPlatform>,
         profile: GameProfile,
         config: Option<PlayerConfig>,
     ) -> Option<(Arc<Player>, Arc<World>)> {
+        // A previous connection may have unregistered while its leave event or
+        // final save is still running. Wait before checking duplicates or loading.
+        let _admission = self.player_data_storage.admission_guard(&profile.id).await;
+        if !self.validate_player_admission(client.as_ref(), &profile) {
+            return None;
+        }
         let gamemode = self
             .defaultgamemode
             .lock()
@@ -652,23 +658,32 @@ impl Server {
 
         let first_world = self.worlds.load().first().cloned()?;
 
-        let (world, nbt) = if let Ok(Some(data)) = self.player_data_storage.load_data(&profile.id) {
-            if let Some(dimension_key) = data.get_string("Dimension") {
-                if let Some(dimension) = Dimension::from_name(dimension_key) {
-                    let world = self.get_world_from_dimension(dimension);
-                    (world, Some(data))
-                } else {
-                    warn!("Invalid dimension key in player data: {dimension_key}");
-                    (first_world, Some(data))
-                }
-            } else {
-                // Player data exists but doesn't have a "Dimension" key.
-                (first_world, Some(data))
+        let (loaded_nbt, session) = match self.player_data_storage.load_session(&profile.id) {
+            Ok(data) => data,
+            Err(error) => {
+                error!("Player NBT load failed for {}: {error}", profile.id);
+                client.try_kick(
+                    DisconnectReason::Kicked,
+                    &TextComponent::text(
+                        "Unable to load your player data. Contact the server administrator.",
+                    ),
+                );
+                return None;
             }
-        } else {
-            // No player data found or an error occurred, default to the Overworld.
-            (first_world, None)
         };
+        let world = loaded_nbt
+            .as_ref()
+            .and_then(|data| data.get_string("Dimension"))
+            .and_then(|dimension_key| {
+                let dimension = Dimension::from_name(dimension_key);
+                if dimension.is_none() {
+                    warn!("Invalid dimension key in player data: {dimension_key}");
+                }
+                dimension
+            })
+            .map_or(first_world, |dimension| {
+                self.get_world_from_dimension(dimension)
+            });
 
         let mut player = Player::new(
             client,
@@ -678,25 +693,19 @@ impl Server {
             gamemode,
         );
 
-        if let Some(mut nbt_data) = nbt {
+        *player
+            .data_save_session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(session);
+        if let Some(mut nbt_data) = loaded_nbt {
             player.read_nbt(&mut nbt_data);
             // The data file itself proves this is a returning player. Older Bedrock
             // sessions could persist HasPlayedBefore as false and mask a valid Pos.
             player.has_played_before.store(true, Ordering::Relaxed);
         }
 
-        // Wrap in Arc after data is loaded
         let player = Arc::new(player);
-        {
-            let mut advancements = player
-                .advancements
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Err(e) = advancements.load() {
-                warn!("Error loading player {}: {e}", player.gameprofile.id);
-            }
-            advancements.player = Arc::downgrade(&player);
-        };
+        self.load_player_progress(&player)?;
 
         send_cancellable_blocking! {{
             self;
@@ -739,6 +748,65 @@ impl Server {
                 None
             }
         }}
+    }
+
+    // The caller holds the UUID admission guard through validation and registration.
+    fn validate_player_admission(&self, client: &ClientPlatform, profile: &GameProfile) -> bool {
+        let closed = match client {
+            ClientPlatform::Java(client) => client.is_closed(),
+            ClientPlatform::Bedrock(client) => client.is_closed(),
+        };
+        if closed {
+            return false;
+        }
+        if self.get_player_by_uuid(profile.id).is_some()
+            || self.get_player_by_name(&profile.name).is_some()
+        {
+            client.try_kick(
+                DisconnectReason::Kicked,
+                &TextComponent::translate_cross(
+                    pumpkin_data::translation::java::MULTIPLAYER_DISCONNECT_DUPLICATE_LOGIN,
+                    pumpkin_data::translation::bedrock::DISCONNECTIONSCREEN_LOGGEDINOTHERLOCATION,
+                    [],
+                ),
+            );
+            return false;
+        }
+        true
+    }
+
+    fn load_player_progress(&self, player: &Arc<Player>) -> Option<()> {
+        if let Err(error) = self.player_data_storage.load_statistics(player) {
+            ServerPlayerData::reject_player(player);
+            error!("Stats load failed for {}: {error}", player.gameprofile.id);
+            player.kick(
+                DisconnectReason::Kicked,
+                &TextComponent::text(
+                    "Unable to load your statistics. Contact the server administrator.",
+                ),
+            );
+            return None;
+        }
+        let mut advancements = player
+            .advancements
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Err(error) = advancements.load() {
+            ServerPlayerData::reject_player(player);
+            error!(
+                "Advancement load failed for {}: {error}",
+                player.gameprofile.id
+            );
+            player.kick(
+                DisconnectReason::Kicked,
+                &TextComponent::text(
+                    "Unable to load your advancements. Contact the server administrator.",
+                ),
+            );
+            return None;
+        }
+        advancements.player = Arc::downgrade(player);
+        Some(())
     }
 
     pub fn remove_player(&self, player: &Player) {

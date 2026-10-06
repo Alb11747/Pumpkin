@@ -423,14 +423,9 @@ impl std::fmt::Debug for BundleContentsImpl {
 impl BundleContentsImpl {
     pub fn read_data(tag: &NbtTag) -> Option<Self> {
         let mut items = Vec::new();
-        if let NbtTag::List(l) = tag {
-            for item_tag in l {
-                if let NbtTag::Compound(c) = item_tag
-                    && let Some(stack) = crate::item_stack::ItemStack::read_item_stack(c)
-                {
-                    items.push(stack);
-                }
-            }
+        for item_tag in tag.extract_list()? {
+            let c = item_tag.extract_compound()?;
+            items.push(crate::item_stack::ItemStack::read_item_stack(c)?);
         }
         Some(Self { items })
     }

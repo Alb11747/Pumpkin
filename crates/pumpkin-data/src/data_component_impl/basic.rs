@@ -109,14 +109,15 @@ pub struct CustomNameImpl {
 }
 impl CustomNameImpl {
     pub fn read_data(data: &NbtTag) -> Option<Self> {
-        data.extract_string().map(|name| Self {
-            name: TextComponent::text(name.to_string()),
+        Some(Self {
+            name: TextComponent::try_from_nbt(data).ok()?,
         })
     }
 }
 impl DataComponentImpl for CustomNameImpl {
     fn write_data(&self) -> NbtTag {
-        NbtTag::String(self.name.clone().get_text().into())
+        self.name
+            .to_nbt_tag_for_version(&pumpkin_util::version::JavaMinecraftVersion::V_26_3)
     }
     fn get_hash(&self) -> i32 {
         get_str_hash(self.name.clone().get_text().as_str()) as i32
@@ -186,13 +187,11 @@ impl LoreImpl {
             return None;
         };
 
-        Some(Self {
-            lines: lines
-                .iter()
-                .filter_map(NbtTag::extract_string)
-                .map(|line| TextComponent::text(line.to_owned()))
-                .collect(),
-        })
+        let mut components = Vec::with_capacity(lines.len());
+        for line in lines {
+            components.push(TextComponent::try_from_nbt(line).ok()?);
+        }
+        Some(Self { lines: components })
     }
 }
 impl DataComponentImpl for LoreImpl {
@@ -200,7 +199,11 @@ impl DataComponentImpl for LoreImpl {
         NbtTag::List(
             self.lines
                 .iter()
-                .map(|line| NbtTag::String(line.clone().get_text().into_boxed_str()))
+                .map(|line| {
+                    line.to_nbt_tag_for_version(
+                        &pumpkin_util::version::JavaMinecraftVersion::V_26_3,
+                    )
+                })
                 .collect(),
         )
     }
@@ -369,6 +372,9 @@ impl CreativeSlotLockImpl {
     }
 }
 impl DataComponentImpl for CreativeSlotLockImpl {
+    fn write_data(&self) -> NbtTag {
+        NbtTag::Compound(NbtCompound::new())
+    }
     default_impl!(CreativeSlotLock);
 }
 

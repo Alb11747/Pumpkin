@@ -37,6 +37,8 @@ pub enum ChunkReadingError {
     Compression(CompressionError),
     #[error("Tried to read chunk which does not exist")]
     ChunkNotExist,
+    #[error("Failed reading region: {0}")]
+    RegionReadError(std::sync::Arc<Self>),
     #[error("Failed to parse chunk from bytes: {0}")]
     ParsingError(ChunkParsingError),
 }
@@ -972,6 +974,15 @@ pub enum ChunkParsingError {
     FailedReadStatus(pumpkin_nbt::Error),
     #[error("The chunk isn't generated yet")]
     ChunkNotGenerated,
+    #[error(
+        "Invalid block palette at chunk {position:?}, section {section_y}, entry {palette_index}: {cause}"
+    )]
+    InvalidBlockPalette {
+        position: pumpkin_util::math::vector2::Vector2<i32>,
+        section_y: i32,
+        palette_index: usize,
+        cause: String,
+    },
     #[error("Error deserializing chunk: {0}")]
     ErrorDeserializingChunk(String),
 }
