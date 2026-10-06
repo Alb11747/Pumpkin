@@ -126,6 +126,17 @@ impl NbtTag {
 
     /// Serializes the tag payload without writing its type ID.
     pub fn serialize_data<W: NbtWriteHelper>(self, w: &mut W) -> serializer::Result<()> {
+        self.serialize_data_depth(w, 0)
+    }
+
+    pub(crate) fn serialize_data_depth<W: NbtWriteHelper>(
+        self,
+        w: &mut W,
+        depth: usize,
+    ) -> serializer::Result<()> {
+        if depth > crate::MAX_NBT_DEPTH {
+            return Err(Error::MaxDepthExceeded);
+        }
         match self {
             Self::End => {}
             Self::Byte(byte) => w.write_i8(byte)?,
@@ -156,6 +167,11 @@ impl NbtTag {
                     return Err(Error::LargeLength(len));
                 }
 
+                if list.iter().any(|tag| matches!(tag, Self::End)) {
+                    return Err(Error::InvalidListTag(END_ID));
+                }
+                let first_id = list.first().map_or(END_ID, Self::get_type_id);
+                let mixed = list.iter().any(|tag| tag.get_type_id() != first_id);
                 let list_element_id = Self::get_list_element_type_id(&list);
 
                 w.write_u8(list_element_id)?;
@@ -164,11 +180,18 @@ impl NbtTag {
                     // Since tags in the same list tag must have the same type,
                     // we need to handle those of different tag types by
                     // wrapping them in `NbtCompound`s if needed.
-                    Self::wrap_tag_if_needed(list_element_id, nbt_tag).serialize_data(w)?;
+                    // Stored lists are homogeneous. Newly modeled text components may
+                    // mix strings and compounds and need vanilla's wire wrappers.
+                    let tag = if w.preserve_list_types() && !mixed {
+                        nbt_tag
+                    } else {
+                        Self::wrap_tag_if_needed(list_element_id, nbt_tag)
+                    };
+                    tag.serialize_data_depth(w, depth + 1)?;
                 }
             }
             Self::Compound(compound) => {
-                compound.serialize_content(w)?;
+                compound.serialize_content_depth(w, depth + 1)?;
             }
             Self::IntArray(int_array) => {
                 let len = int_array.len();
@@ -243,7 +266,7 @@ impl NbtTag {
                 if len < 0 {
                     return Err(Error::NegativeLength(len));
                 }
-                if tag_type_id == END_ID && len > 0 {
+                if tag_type_id > LONG_ARRAY_ID || (tag_type_id == END_ID && len > 0) {
                     return Err(Error::InvalidListTag(tag_type_id));
                 }
 
@@ -361,7 +384,7 @@ impl NbtTag {
                 if len < 0 {
                     return Err(Error::NegativeLength(len));
                 }
-                if tag_type_id == END_ID && len > 0 {
+                if tag_type_id > LONG_ARRAY_ID || (tag_type_id == END_ID && len > 0) {
                     return Err(Error::InvalidListTag(tag_type_id));
                 }
 
@@ -377,7 +400,11 @@ impl NbtTag {
                         return Err(Error::InvalidListTag(tag.get_type_id()));
                     }
                     // Try unwrapping the tag.
-                    list.push(Self::flatten(tag));
+                    list.push(if reader.preserve_list_types() {
+                        tag
+                    } else {
+                        Self::flatten(tag)
+                    });
                 }
                 Ok(Self::List(list))
             }

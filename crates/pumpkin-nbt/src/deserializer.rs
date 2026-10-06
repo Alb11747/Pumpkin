@@ -322,9 +322,25 @@ pub trait NbtReadHelper<'a> {
     /// Returns the underlying byte source.
     fn reader(&mut self) -> &mut Self::Reader;
 
+    /// Keeps compound wrappers in lists intact when reading stored wire trees.
+    fn preserve_list_types(&self) -> bool {
+        false
+    }
+
     /// Advances by `count` bytes.
     fn skip_bytes(&mut self, count: i64) -> Result<()> {
-        self.reader().seek_relative(count)
+        if count < 0 {
+            return self.reader().seek_relative(count);
+        }
+        // Seeking may succeed past EOF. Consume bytes so truncated skipped tags fail.
+        let mut remaining = count as u64;
+        let mut buffer = [0; 1024];
+        while remaining > 0 {
+            let length = remaining.min(buffer.len() as u64) as usize;
+            self.reader().read_bytes(&mut buffer[..length])?;
+            remaining -= length as u64;
+        }
+        Ok(())
     }
     /// Advances past an unsigned byte.
     fn skip_u8(&mut self) -> Result<()> {
@@ -396,12 +412,25 @@ pub trait NbtReadHelper<'a> {
 /// Reads Java Edition NBT primitives using big-endian numeric encoding.
 pub struct NbtReadHelperJava<D> {
     reader: D,
+    preserve_list_types: bool,
 }
 
 impl<D> NbtReadHelperJava<D> {
     /// Creates a Java Edition reader over `r`.
     pub const fn new(r: D) -> Self {
-        Self { reader: r }
+        Self {
+            reader: r,
+            preserve_list_types: false,
+        }
+    }
+
+    /// Reads stored wire trees without unwrapping compound list elements.
+    /// Pair with `NbtWriteHelperJava::new_preserving` when saving the result.
+    pub const fn new_preserving(r: D) -> Self {
+        Self {
+            reader: r,
+            preserve_list_types: true,
+        }
     }
 }
 
@@ -427,6 +456,10 @@ impl<'a, D: NbtDataSource<'a>> NbtReadHelperJava<D> {
 
 impl<'a, D: NbtDataSource<'a>> NbtReadHelper<'a> for NbtReadHelperJava<D> {
     type Reader = D;
+
+    fn preserve_list_types(&self) -> bool {
+        self.preserve_list_types
+    }
 
     fn reader(&mut self) -> &mut D {
         &mut self.reader

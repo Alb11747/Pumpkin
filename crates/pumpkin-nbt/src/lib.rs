@@ -109,6 +109,15 @@ pub enum Error {
     /// A list tag specified an invalid element tag type.
     #[error("Invalid element tag type for list: {0}")]
     InvalidListTag(u8),
+    /// Duplicate compound names cannot be preserved in a map.
+    #[error("Duplicate NBT compound key: {0}")]
+    DuplicateKey(String),
+    /// A named end tag would terminate the containing compound prematurely.
+    #[error("Named TAG_End is not valid NBT: {0}")]
+    NamedEndTag(String),
+    /// A complete document must end immediately after its root compound.
+    #[error("Trailing bytes after NBT root compound")]
+    TrailingData,
 }
 
 /// A complete NBT document containing a named root compound.
@@ -162,6 +171,69 @@ impl Nbt {
         })
     }
 
+    /// Reads a complete named document, rejecting bytes after the root compound.
+    /// Use [`Self::read`] for NBT embedded within a packet or another stream.
+    pub fn read_complete<'a, R: NbtReadHelper<'a>>(reader: &mut R) -> Result<Self, Error> {
+        let nbt = Self::read(reader)?;
+        Self::require_end(reader)?;
+        Ok(nbt)
+    }
+
+    /// Reads a complete document without a root name, rejecting trailing bytes.
+    pub fn read_unnamed_complete<'a, R: NbtReadHelper<'a>>(reader: &mut R) -> Result<Self, Error> {
+        let nbt = Self::read_unnamed(reader)?;
+        Self::require_end(reader)?;
+        Ok(nbt)
+    }
+
+    fn require_end<'a, R: NbtReadHelper<'a>>(reader: &mut R) -> Result<(), Error> {
+        match reader.get_u8() {
+            Err(Error::Incomplete(error)) if error.kind() == io::ErrorKind::UnexpectedEof => Ok(()),
+            Err(error) => Err(error),
+            Ok(_) => Err(Error::TrailingData),
+        }
+    }
+
+    /// Serializes a named Java document, propagating invalid tags and strings.
+    pub fn try_write(self) -> Result<Bytes, Error> {
+        let mut bytes = Vec::new();
+        self.serialize_document(&mut NbtWriteHelperJava::new(&mut bytes), true)?;
+        Ok(bytes.into())
+    }
+
+    /// Preserves homogeneous stored lists and wraps newly modeled mixed lists.
+    pub fn try_write_preserving(self) -> Result<Bytes, Error> {
+        let mut bytes = Vec::new();
+        self.serialize_document(&mut NbtWriteHelperJava::new_preserving(&mut bytes), true)?;
+        Ok(bytes.into())
+    }
+
+    /// Serializes unnamed Java NBT, propagating invalid tags and strings.
+    pub fn try_write_unnamed(self) -> Result<Bytes, Error> {
+        let mut bytes = Vec::new();
+        self.serialize_document(&mut NbtWriteHelperJava::new(&mut bytes), false)?;
+        Ok(bytes.into())
+    }
+
+    /// Serializes an unnamed stored wire tree without changing compound list elements.
+    pub fn try_write_unnamed_preserving(self) -> Result<Bytes, Error> {
+        let mut bytes = Vec::new();
+        self.serialize_document(&mut NbtWriteHelperJava::new_preserving(&mut bytes), false)?;
+        Ok(bytes.into())
+    }
+
+    fn serialize_document<W: NbtWriteHelper>(
+        self,
+        writer: &mut W,
+        named: bool,
+    ) -> Result<(), Error> {
+        writer.write_u8(COMPOUND_ID)?;
+        if named {
+            writer.write_string(&self.name)?;
+        }
+        self.root_tag.serialize_content(writer)
+    }
+
     /// Serializes this document using the Java Edition NBT representation.
     #[must_use]
     pub fn write(self) -> Bytes {
@@ -196,14 +268,14 @@ impl Nbt {
 
     /// Writes this document in the Java Edition representation.
     pub fn write_to_writer<W: Write>(self, mut writer: W) -> Result<(), io::Error> {
-        writer.write_all(&self.write())?;
-        Ok(())
+        self.serialize_document(&mut NbtWriteHelperJava::new(&mut writer), true)
+            .map_err(serialization_io_error)
     }
 
     /// Writes this document in the Bedrock network representation.
     pub fn write_to_writer_bedrock<W: Write>(self, mut writer: W) -> Result<(), io::Error> {
-        writer.write_all(&self.write_bedrock())?;
-        Ok(())
+        self.serialize_document(&mut NbtWriteHelperBedrock::new(&mut writer), true)
+            .map_err(serialization_io_error)
     }
 
     /// Serializes this document without the root compound's name.
@@ -221,8 +293,15 @@ impl Nbt {
 
     /// Writes this document without the root compound's name.
     pub fn write_unnamed_to_writer<W: Write>(self, mut writer: W) -> Result<(), io::Error> {
-        writer.write_all(&self.write_unnamed())?;
-        Ok(())
+        self.serialize_document(&mut NbtWriteHelperJava::new(&mut writer), false)
+            .map_err(serialization_io_error)
+    }
+}
+
+fn serialization_io_error(error: Error) -> io::Error {
+    match error {
+        Error::Incomplete(error) => error,
+        error => io::Error::new(io::ErrorKind::InvalidData, error),
     }
 }
 
@@ -255,3 +334,6 @@ impl AsMut<NbtCompound> for Nbt {
         &mut self.root_tag
     }
 }
+
+#[cfg(test)]
+mod tests;

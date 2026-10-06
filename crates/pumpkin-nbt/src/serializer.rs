@@ -32,6 +32,10 @@ pub trait NbtWriteHelper {
 
     /// Returns the underlying output writer.
     fn writer(&mut self) -> &mut Self::Writer;
+    /// Keeps homogeneous list elements exactly as represented.
+    fn preserve_list_types(&self) -> bool {
+        false
+    }
     /// Writes an unsigned byte.
     fn write_u8(&mut self, value: u8) -> Result<()>;
     /// Writes a signed byte.
@@ -59,12 +63,24 @@ pub trait NbtWriteHelper {
 /// Writes Java Edition NBT primitives using big-endian numeric encoding.
 pub struct NbtWriteHelperJava<W: Write> {
     writer: W,
+    preserve_list_types: bool,
 }
 
 impl<W: Write> NbtWriteHelperJava<W> {
     /// Creates a Java Edition writer over `w`.
     pub const fn new(w: W) -> Self {
-        Self { writer: w }
+        Self {
+            writer: w,
+            preserve_list_types: false,
+        }
+    }
+
+    /// Writes a stored wire tree without adding compound wrappers to lists.
+    pub const fn new_preserving(w: W) -> Self {
+        Self {
+            writer: w,
+            preserve_list_types: true,
+        }
     }
 }
 
@@ -74,6 +90,10 @@ impl<W: Write> NbtWriteHelperJava<W> {
 
 impl<W: Write> NbtWriteHelper for NbtWriteHelperJava<W> {
     type Writer = W;
+
+    fn preserve_list_types(&self) -> bool {
+        self.preserve_list_types
+    }
 
     fn writer(&mut self) -> &mut Self::Writer {
         &mut self.writer

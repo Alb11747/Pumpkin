@@ -9,7 +9,6 @@ use crate::serializer::NbtWriteHelper;
 use crate::tag::NbtTag;
 use crate::{END_ID, Error, Nbt};
 use std::collections::hash_map::IntoIter;
-use std::io::ErrorKind;
 
 #[macro_export]
 /// Creates an [`NbtTag::Compound`](crate::tag::NbtTag::Compound) from key-value pairs.
@@ -63,18 +62,19 @@ impl NbtCompound {
             return Err(Error::MaxDepthExceeded);
         }
 
+        let mut names = std::collections::HashSet::new();
         loop {
-            let tag_id = match reader.get_u8() {
-                Ok(id) => id,
-                Err(Error::Incomplete(e)) if e.kind() == ErrorKind::UnexpectedEof => break,
-                Err(e) => return Err(e),
-            };
+            let tag_id = reader.get_u8()?;
 
             if tag_id == END_ID {
                 break;
             }
 
-            reader.skip_string()?;
+            let name = reader.get_string()?.into_owned();
+            if names.contains(&name) {
+                return Err(Error::DuplicateKey(name));
+            }
+            names.insert(name);
 
             // Skip Value
             NbtTag::skip_data_depth(reader, tag_id, depth + 1)?;
@@ -100,19 +100,17 @@ impl NbtCompound {
         let mut compound = Self::new();
 
         loop {
-            let tag_id = match reader.get_u8() {
-                Ok(id) => id,
-                Err(Error::Incomplete(e)) if e.kind() == ErrorKind::UnexpectedEof => break,
-                Err(e) => return Err(e),
-            };
+            let tag_id = reader.get_u8()?;
 
             if tag_id == END_ID {
                 break;
             }
 
             let name = reader.get_string()?;
+            if compound.child_tags.contains_key(name.as_ref()) {
+                return Err(Error::DuplicateKey(name.into_owned()));
+            }
             let tag = NbtTag::deserialize_data_depth(reader, tag_id, depth + 1)?;
-
             compound.child_tags.insert(name.into(), tag);
         }
 
@@ -121,10 +119,24 @@ impl NbtCompound {
 
     /// Serializes the compound's entries followed by an end tag.
     pub fn serialize_content<W: NbtWriteHelper>(self, w: &mut W) -> Result<(), Error> {
+        self.serialize_content_depth(w, 0)
+    }
+
+    pub(crate) fn serialize_content_depth<W: NbtWriteHelper>(
+        self,
+        w: &mut W,
+        depth: usize,
+    ) -> Result<(), Error> {
+        if depth > crate::MAX_NBT_DEPTH {
+            return Err(Error::MaxDepthExceeded);
+        }
         for (name, tag) in self.child_tags {
+            if matches!(tag, NbtTag::End) {
+                return Err(Error::NamedEndTag(name.into()));
+            }
             w.write_u8(tag.get_type_id())?;
             w.write_string(&name)?;
-            tag.serialize_data(w)?;
+            tag.serialize_data_depth(w, depth + 1)?;
         }
         w.write_u8(END_ID)?;
         Ok(())
