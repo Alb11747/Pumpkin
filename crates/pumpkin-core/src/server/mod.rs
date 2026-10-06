@@ -563,7 +563,19 @@ impl Server {
     }
 
     pub fn save_world_info(&self) -> Result<(), WorldInfoError> {
-        let level_data = self.level_info.load();
+        // Serialize snapshots and renames so an older concurrent write cannot win last.
+        static WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _write_lock = WRITE_LOCK.lock().unwrap();
+        let mut level_data = (**self.level_info.load()).clone();
+        if let Some(overworld) = self
+            .worlds
+            .load()
+            .iter()
+            .find(|world| world.dimension.minecraft_name == Dimension::OVERWORLD.minecraft_name)
+        {
+            // Commands and ticking update the live clock, not the loaded metadata copy.
+            level_data.day_time = overworld.get_time_of_day();
+        }
         self.world_info_writer
             .write_world_info(&level_data, &self.basic_config.get_world_path())
     }
@@ -866,13 +878,7 @@ impl Server {
         for world in self.worlds.load().iter() {
             world.shutdown().await;
         }
-        let level_data = self.level_info.load();
-        // then lets save the world info
-
-        if let Err(err) = self
-            .world_info_writer
-            .write_world_info(&level_data, &self.basic_config.get_world_path())
-        {
+        if let Err(err) = self.save_world_info() {
             error!("Failed to save level.dat: {err}");
         }
         info!("Completed worlds");

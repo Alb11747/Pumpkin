@@ -410,6 +410,11 @@ impl World {
             NbtCompound::new()
         };
 
+        let mut level_time = LevelTime::new();
+        if dimension.minecraft_name == Dimension::OVERWORLD.minecraft_name {
+            level_time.set_time(level_info.load().day_time);
+        }
+
         Ok(Self {
             uuid: Uuid::new_v4(),
             level,
@@ -428,7 +433,7 @@ impl World {
                 5,
                 300,
             )),
-            level_time: std::sync::Mutex::new(LevelTime::new()),
+            level_time: std::sync::Mutex::new(level_time),
             dimension,
             weather: std::sync::Mutex::new(Weather::new()),
             block_registry,
@@ -1982,8 +1987,26 @@ impl World {
                     && let Some(server) = self.server.upgrade()
                 {
                     let world = self.clone();
+                    let metadata_server = server.clone();
                     server.spawn_task(async move {
                         world.save().await;
+                        if world.dimension.minecraft_name == Dimension::OVERWORLD.minecraft_name {
+                            // The shared root metadata belongs to the overworld autosave.
+                            // Its synchronous, fsynced writer must not block a Tokio worker.
+                            match tokio::task::spawn_blocking(move || {
+                                metadata_server.save_world_info()
+                            })
+                            .await
+                            {
+                                Ok(Ok(())) => {}
+                                Ok(Err(error)) => {
+                                    error!("Failed to autosave world metadata: {error}")
+                                }
+                                Err(error) => {
+                                    error!("World metadata autosave task failed: {error}")
+                                }
+                            }
+                        }
                     });
                 }
             }
