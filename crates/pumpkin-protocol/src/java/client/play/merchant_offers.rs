@@ -61,7 +61,7 @@ impl MerchantOffer {
                 write.write_bool(false)?;
             }
         }
-        write.write_bool(self.reward_exp)?;
+        write.write_bool(self.is_out_of_stock())?;
         write.write_i32_be(self.uses)?;
         write.write_i32_be(self.max_uses)?;
         write.write_i32_be(self.xp)?;
@@ -183,7 +183,7 @@ impl<'a> crate::ServerPacket<'a> for CMerchantOffers {
                 (base_cost_a, output, cost_b)
             };
 
-            let reward_exp = bytebuf.get_bool()?;
+            let out_of_stock = bytebuf.get_bool()?;
             let uses = bytebuf.get_i32_be()?;
             let max_uses = bytebuf.get_i32_be()?;
             let xp = bytebuf.get_i32_be()?;
@@ -195,8 +195,9 @@ impl<'a> crate::ServerPacket<'a> for CMerchantOffers {
                 base_cost_a,
                 output,
                 cost_b,
-                reward_exp,
-                uses,
+                // MerchantOffer.STREAM_CODEC does not transmit rewardExp; vanilla defaults it to true.
+                reward_exp: true,
+                uses: if out_of_stock { max_uses } else { uses },
                 max_uses,
                 xp,
                 special_price,
@@ -272,6 +273,59 @@ mod tests {
         );
         assert_eq!(cursor.get_var_int().unwrap(), VarInt(12));
         assert_eq!(cursor.get_var_int().unwrap(), VarInt(0));
+    }
+
+    #[test]
+    fn merchant_stock_flag_encodes_and_decodes_like_vanilla() {
+        let version = JavaMinecraftVersion::V_26_3;
+        for (uses, out_of_stock) in [(7, false), (12, true), (13, true)] {
+            for reward_exp in [false, true] {
+                let mut offer = offer();
+                offer.uses = uses;
+                offer.reward_exp = reward_exp;
+                let packet =
+                    CMerchantOffers::new(VarInt(1), vec![offer], VarInt(1), VarInt(0), true, true);
+                let mut bytes = Vec::new();
+                packet.write_packet_data(&mut bytes, &version).unwrap();
+                let mut cursor = Cursor::new(&bytes);
+
+                assert_eq!(cursor.get_var_int().unwrap(), VarInt(1));
+                assert_eq!(cursor.get_var_int().unwrap(), VarInt(1));
+                assert_eq!(
+                    cursor.get_var_int().unwrap(),
+                    VarInt::from(Item::EMERALD.id)
+                );
+                assert_eq!(cursor.get_var_int().unwrap(), VarInt(12));
+                assert_eq!(cursor.get_var_int().unwrap(), VarInt(0));
+                ItemStackSerializer::read_with_version(&mut cursor, &version).unwrap();
+                assert!(!cursor.get_bool().unwrap()); // No second cost.
+                let stock_flag_index = cursor.position() as usize;
+                // Vanilla writes isOutOfStock here, independently of rewardExp.
+                assert_eq!(cursor.get_bool().unwrap(), out_of_stock);
+                assert_eq!(cursor.get_i32_be().unwrap(), uses);
+                assert_eq!(cursor.get_i32_be().unwrap(), 12);
+
+                let decoded =
+                    <CMerchantOffers as crate::ServerPacket>::read(&mut bytes.as_slice(), &version)
+                        .unwrap();
+                assert_eq!(decoded.offers[0].uses, if out_of_stock { 12 } else { uses });
+                assert_eq!(decoded.offers[0].max_uses, 12);
+                assert!(decoded.offers[0].reward_exp);
+
+                if uses == 7 && reward_exp {
+                    // Vanilla honors a disabled flag even when transmitted uses are below maxUses.
+                    bytes[stock_flag_index] = 1;
+                    let decoded = <CMerchantOffers as crate::ServerPacket>::read(
+                        &mut bytes.as_slice(),
+                        &version,
+                    )
+                    .unwrap();
+                    assert_eq!(decoded.offers[0].uses, 12);
+                    assert_eq!(decoded.offers[0].max_uses, 12);
+                    assert!(decoded.offers[0].reward_exp);
+                }
+            }
+        }
     }
 
     #[test]
