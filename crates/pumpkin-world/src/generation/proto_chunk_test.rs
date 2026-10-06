@@ -10,6 +10,115 @@ mod test {
     use pumpkin_data::dimension::Dimension;
     use pumpkin_util::world_seed::Seed;
 
+    #[test]
+    fn relighting_imported_full_chunks_skips_generation_spawn_callbacks() {
+        use crate::chunk::ChunkData;
+        use crate::generation::proto_chunk::GenerationCache;
+        use crate::world::{BlockAccessor, WorldPortalExt};
+        use pumpkin_data::{Block, BlockState, BlockStateId, Mirror, Rotation, chunk::ChunkStatus};
+        use pumpkin_nbt::compound::NbtCompound;
+        use pumpkin_util::math::position::BlockPos;
+        use std::sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering::Relaxed},
+        };
+
+        #[derive(Default)]
+        struct SpawnCallbacks {
+            mobs: AtomicUsize,
+            structures: Mutex<Vec<Vec<NbtCompound>>>,
+        }
+        impl WorldPortalExt for SpawnCallbacks {
+            fn can_place_at(
+                &self,
+                _block: &Block,
+                _state: &BlockState,
+                _accessor: &dyn BlockAccessor,
+                _position: &BlockPos,
+            ) -> bool {
+                true
+            }
+
+            fn mirror(
+                &self,
+                block: &Block,
+                state_id: BlockStateId,
+                mirror: Mirror,
+            ) -> &'static BlockState {
+                block.mirror(state_id, mirror)
+            }
+
+            fn rotate(
+                &self,
+                block: &Block,
+                state_id: BlockStateId,
+                rotation: Rotation,
+            ) -> &'static BlockState {
+                block.rotate(state_id, rotation)
+            }
+
+            fn spawn_mobs_for_chunk_generation(
+                &self,
+                cache: &mut dyn GenerationCache,
+                _biome: &'static pumpkin_data::chunk::Biome,
+                chunk_x: i32,
+                chunk_z: i32,
+            ) {
+                assert_eq!(cache.get_center_chunk().stage, StagedChunkEnum::Lighting);
+                assert_eq!((chunk_x, chunk_z), (12, -4));
+                self.mobs.fetch_add(1, Relaxed);
+            }
+
+            fn spawn_structure_entities(&self, entities: Vec<NbtCompound>) {
+                self.structures.lock().unwrap().push(entities);
+            }
+        }
+
+        let generator = get_world_gen(
+            Seed(42),
+            Dimension::OVERWORLD,
+            true,
+            Vec::new(),
+            "minecraft:plains".into(),
+        );
+        for (original_status, expected_callbacks) in [
+            (None, 1),
+            (Some(ChunkStatus::Light), 1),
+            (Some(ChunkStatus::Full), 0),
+        ] {
+            let mut proto = original_status.map_or_else(
+                || ProtoChunk::new(12, -4, &generator),
+                |status| {
+                    let mut original = ChunkData::empty(12, -4);
+                    original.status = status;
+                    let original = Arc::new(original);
+                    let mut proto = ProtoChunk::from_chunk_data(&original, &generator);
+                    proto.original_chunk = Some(original);
+                    proto
+                },
+            );
+            // The relighting pipeline reaches Lighting before requesting Spawn.
+            proto.stage = StagedChunkEnum::Lighting;
+            let mut entity = NbtCompound::new();
+            entity.put_string("id", "minecraft:pig".into());
+            proto.add_structure_entity(entity.clone());
+            let callbacks = SpawnCallbacks::default();
+            ProtoChunk::spawn_mobs(&mut proto, &callbacks);
+            assert_eq!(proto.stage, StagedChunkEnum::Spawn);
+            assert_eq!(callbacks.mobs.load(Relaxed), expected_callbacks);
+            let expected_entities = if expected_callbacks == 0 {
+                Vec::new()
+            } else {
+                vec![vec![entity]]
+            };
+            assert_eq!(*callbacks.structures.lock().unwrap(), expected_entities);
+            // Repeated scheduling must not invoke either spawning callback again.
+            ProtoChunk::spawn_mobs(&mut proto, &callbacks);
+            assert_eq!(callbacks.mobs.load(Relaxed), expected_callbacks);
+            assert_eq!(*callbacks.structures.lock().unwrap(), expected_entities);
+        }
+    }
+
     fn surface_biomes(
         world_gen: &WorldGenerator,
         center_x: i32,

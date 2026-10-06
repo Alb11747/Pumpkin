@@ -63,8 +63,10 @@ fn needs_relighting(chunk: &crate::chunk::ChunkData, config: LightingEngineConfi
     !has_complex_light
 }
 
-fn load_proto_chunk(chunk: &crate::chunk::ChunkData, level: &Level) -> ProtoChunk {
-    ProtoChunk::from_chunk_data(chunk, &level.world_gen.load())
+fn load_proto_chunk(chunk: &Arc<crate::chunk::ChunkData>, level: &Level) -> ProtoChunk {
+    let mut proto = ProtoChunk::from_chunk_data(chunk, &level.world_gen.load());
+    proto.original_chunk = Some(chunk.clone());
+    proto
 }
 
 fn process_loaded_chunk(chunk: Arc<crate::chunk::ChunkData>, level: &Level) -> Chunk {
@@ -342,6 +344,97 @@ mod tests {
     use pumpkin_config::world::LevelConfig;
     use pumpkin_data::dimension::Dimension;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn saving_imported_chunks_keeps_full_status_and_original_metadata() {
+        use crate::chunk::{ChunkData, format::anvil::SingleChunkDataSerializer};
+        use crate::tick::{ScheduledTick, TickPriority};
+        use pumpkin_data::{Block, fluid::Fluid};
+        use pumpkin_nbt::{compound::NbtCompound, tag::NbtTag};
+        use pumpkin_util::math::{position::BlockPos, vector2::Vector2};
+
+        let directory = tempfile::tempdir().unwrap();
+        let level = Level::from_root_folder(
+            &LevelConfig::default(),
+            directory.path().into(),
+            0,
+            Dimension::OVERWORLD,
+        )
+        .unwrap();
+        for (status, expected) in [
+            (ChunkStatus::Full, "minecraft:full"),
+            (ChunkStatus::Light, "minecraft:light"),
+            (ChunkStatus::Spawn, "minecraft:spawn"),
+        ] {
+            let mut imported = ChunkData::empty(0, 0);
+            imported.status = status;
+            imported.inhabited_time.store(6_992_414, Relaxed);
+            let mut original_tags = NbtCompound::new();
+            original_tags.put_list(
+                "PostProcessing",
+                vec![NbtTag::List(vec![NbtTag::Short(42)])],
+            );
+            original_tags.put_string("example:unknown", "retained".into());
+            *imported.preserved_tags.lock().unwrap() = original_tags.clone();
+            imported.custom_data.lock().unwrap().put_int("owner", 17);
+            let position = BlockPos::new(1, 64, 2);
+            imported.block_ticks.schedule_tick(
+                &ScheduledTick {
+                    delay: -134,
+                    priority: TickPriority::Normal,
+                    position,
+                    value: &Block::STONE,
+                },
+                0,
+            );
+            imported.fluid_ticks.schedule_tick(
+                &ScheduledTick {
+                    delay: 70_000,
+                    priority: TickPriority::Normal,
+                    position,
+                    value: &Fluid::WATER,
+                },
+                0,
+            );
+            // A converted full chunk without isLightOn or light arrays takes this
+            // same load path. Exercise the codec as well as the relighting/save bridge.
+            let bytes = imported.to_bytes().unwrap();
+            let decoded = ChunkData::from_bytes(&bytes, Vector2::new(0, 0)).unwrap();
+            let mut chunk = process_loaded_chunk(Arc::new(decoded), &level);
+            let Chunk::Proto(proto) = &mut chunk else {
+                panic!("unlit imported chunks must enter the proto load path");
+            };
+            if status == ChunkStatus::Full {
+                assert_eq!(proto.stage, StagedChunkEnum::Features);
+                // Saving a relighting dependency after Spawn must keep its already
+                // completed generation status, without promoting incomplete chunks.
+                proto.stage = StagedChunkEnum::Spawn;
+            }
+            chunk.upgrade_to_level_chunk(&Dimension::OVERWORLD, &LightingEngineConfig::Default);
+            let Chunk::Level(saved) = chunk else {
+                unreachable!()
+            };
+            let bytes = saved.to_bytes().unwrap();
+            let mut cursor = std::io::Cursor::new(bytes.as_ref());
+            let mut reader = pumpkin_nbt::deserializer::NbtReadHelperJava::new(&mut cursor);
+            let root = pumpkin_nbt::Nbt::read(&mut reader).unwrap().root_tag;
+            assert_eq!(root.get_string("Status"), Some(expected));
+            assert_eq!(root.get_long("InhabitedTime"), Some(6_992_414));
+            for (name, tag) in &original_tags.child_tags {
+                assert_eq!(root.get(name), Some(tag));
+            }
+            let reloaded = ChunkData::from_bytes(&bytes, Vector2::new(0, 0)).unwrap();
+            assert_eq!(
+                reloaded.custom_data.lock().unwrap().get_int("owner"),
+                Some(17)
+            );
+            assert_eq!(reloaded.block_ticks.to_vec()[0].delay, -134);
+            assert_eq!(reloaded.fluid_ticks.to_vec()[0].delay, 70_000);
+        }
+        tokio::time::timeout(Duration::from_secs(10), level.shutdown())
+            .await
+            .unwrap();
+    }
 
     async fn read_batch(
         level: &Arc<Level>,

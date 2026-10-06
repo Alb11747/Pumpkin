@@ -299,16 +299,11 @@ impl Chunk {
 
         let proto_chunk = *proto_chunk_box;
         let structure_spawns = proto_chunk.structure_spawn_starts();
-        let structure_spawn_data =
+        let mut structure_spawn_data =
             crate::chunk::structure_spawns::generated_spawn_data(&structure_spawns);
 
         let sections = Self::build_level_sections(&proto_chunk, dimension);
         let heightmaps = Self::build_level_heightmaps(&proto_chunk, dimension.min_y);
-
-        // Move the light data instead of cloning it
-        // By taking ownership of proto_chunk, we can move the light data directly
-        // This prevents keeping duplicate lighting data in memory
-        let light_data = proto_chunk.light;
 
         // Only mark lit if past the lighting stage, and the lighting config is "default" ("full" and "dark" modes skip proper lighting)
         let is_lit = proto_chunk.stage >= StagedChunkEnum::Lighting
@@ -326,25 +321,66 @@ impl Chunk {
             }
         }
 
+        let mut status = proto_chunk.stage.into();
+        let mut inhabited_time = 0;
+        let mut preserved_tags = NbtCompound::new();
+        let mut block_ticks = ChunkTickScheduler::default();
+        let mut fluid_ticks = proto_chunk.fluid_ticks;
+        let imported_without_new_structures =
+            proto_chunk.original_chunk.is_some() && structure_spawns.is_empty();
+        if let Some(original) = proto_chunk.original_chunk {
+            // Relighting a complete imported chunk does not undo world generation.
+            // Proto stages are temporary work progress, not its persisted status.
+            if original.status == ChunkStatus::Full {
+                status = ChunkStatus::Full;
+            }
+            inhabited_time = original
+                .inhabited_time
+                .load(std::sync::atomic::Ordering::Relaxed);
+            preserved_tags = original
+                .preserved_tags
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            let mut custom_data = original
+                .custom_data
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if !structure_spawns.is_empty() {
+                for (name, tag) in structure_spawn_data.child_tags {
+                    custom_data.put(&name, tag);
+                }
+            }
+            structure_spawn_data = custom_data;
+            block_ticks = ChunkTickScheduler::from_iter(original.block_ticks.to_vec());
+            let mut imported_fluid_ticks = original.fluid_ticks.to_vec();
+            imported_fluid_ticks.append(&mut fluid_ticks);
+            fluid_ticks = imported_fluid_ticks;
+        }
+
         let chunk = ChunkData {
-            light_engine: Mutex::new(light_data),
+            light_engine: Mutex::new(proto_chunk.light),
             light_populated: AtomicBool::new(is_lit),
             section: sections,
             heightmap: Mutex::new(heightmaps),
             x: proto_chunk.x,
             z: proto_chunk.z,
             dirty: AtomicBool::new(true),
-            block_ticks: ChunkTickScheduler::default(),
-            fluid_ticks: ChunkTickScheduler::from_iter(proto_chunk.fluid_ticks),
+            block_ticks,
+            fluid_ticks: ChunkTickScheduler::from_iter(fluid_ticks),
             pending_block_entities: Mutex::new(pending_block_entities),
-            status: proto_chunk.stage.into(),
+            status,
             blending_data: proto_chunk.blending_data,
-            inhabited_time: AtomicU64::new(0),
+            inhabited_time: AtomicU64::new(inhabited_time),
             custom_data: Mutex::new(structure_spawn_data),
-            preserved_tags: Mutex::new(NbtCompound::new()),
-            structure_spawns: Mutex::new(
-                crate::chunk::structure_spawns::StructureSpawnState::Ready(structure_spawns),
-            ),
+            preserved_tags: Mutex::new(preserved_tags),
+            structure_spawns: Mutex::new(if imported_without_new_structures {
+                // Resolve imported structure geometry from the retained original tags.
+                crate::chunk::structure_spawns::StructureSpawnState::Pending
+            } else {
+                crate::chunk::structure_spawns::StructureSpawnState::Ready(structure_spawns)
+            }),
         };
 
         *self = Self::Level(Arc::new(chunk));

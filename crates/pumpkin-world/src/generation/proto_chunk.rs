@@ -2,7 +2,7 @@ use crate::generation::structure::placement::GlobalStructureCache;
 use std::sync::Arc;
 
 use pumpkin_data::block_properties::is_air;
-use pumpkin_data::chunk::DoublePerlinNoiseParameters;
+use pumpkin_data::chunk::{ChunkStatus, DoublePerlinNoiseParameters};
 use pumpkin_data::fluid::{Fluid, FluidState};
 use pumpkin_data::structures::{
     Structure, StructureKeys, StructurePlacementType, StructureSet, WeightedEntry,
@@ -142,6 +142,8 @@ pub struct ProtoChunk {
     generation_height: u16,
     generation_bottom_y: i8,
     pub stage: StagedChunkEnum,
+    /// Imported metadata survives temporary generation stages used for relighting.
+    pub(crate) original_chunk: Option<Arc<ChunkData>>,
     pub light: ChunkLight,
     pub blending_data: Option<crate::generation::blender::blending_data::BlendingData>,
     pub pending_block_entities: Vec<NbtCompound>,
@@ -268,6 +270,7 @@ impl ProtoChunk {
             generation_height,
             generation_bottom_y,
             stage: StagedChunkEnum::Empty,
+            original_chunk: None,
             light: ChunkLight {
                 sky_light: (0..section_count)
                     .map(|_| LightContainer::new_empty(0))
@@ -920,6 +923,15 @@ impl ProtoChunk {
             return;
         }
         debug_assert_eq!(chunk.stage, StagedChunkEnum::Lighting);
+        if chunk
+            .original_chunk
+            .as_ref()
+            .is_some_and(|original| original.status == ChunkStatus::Full)
+        {
+            // A complete imported chunk only repeats lighting, not worldgen spawning.
+            cache.get_center_chunk_mut().stage = StagedChunkEnum::Spawn;
+            return;
+        }
 
         let biome = chunk.get_terrain_gen_biome(
             section_to_block(chunk.x),
