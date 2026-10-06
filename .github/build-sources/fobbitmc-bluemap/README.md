@@ -9,7 +9,7 @@ The supported Pumpkin revision is the exact git revision in `Cargo.toml`. Native
 Rust plugin ABI compatibility requires rebuilding this library and Pumpkin with
 the same revision, Rust toolchain and target. An API version match alone does not
 prove Rust ABI compatibility. This source targets native API 7 at the exact reviewed revision
-`356776c57ecd54f0068bb4337ecbccb5b3f3d8e8`.
+`7e9947ce7173ee3526b2d47595939f3a2e201e63`.
 
 ## Build and load
 
