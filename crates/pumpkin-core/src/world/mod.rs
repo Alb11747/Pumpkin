@@ -2001,25 +2001,8 @@ impl World {
                     );
                     server.spawn_task(async move {
                         world
-                            .save_with_lineage(request_id, "autosave", Some(cycle))
+                            .autosave_with_lineage(request_id, cycle, metadata_server)
                             .await;
-                        if world.dimension.minecraft_name == Dimension::OVERWORLD.minecraft_name {
-                            // The shared root metadata belongs to the overworld autosave.
-                            // Its synchronous, fsynced writer must not block a Tokio worker.
-                            match tokio::task::spawn_blocking(move || {
-                                metadata_server.save_world_info()
-                            })
-                            .await
-                            {
-                                Ok(Ok(())) => {}
-                                Ok(Err(error)) => {
-                                    error!("Failed to autosave world metadata: {error}");
-                                }
-                                Err(error) => {
-                                    error!("World metadata autosave task failed: {error}");
-                                }
-                            }
-                        }
                     });
                 }
             }
@@ -2060,6 +2043,29 @@ impl World {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 weather.reset_weather_cycle(self);
+            }
+        }
+    }
+
+    async fn autosave_with_lineage(
+        &self,
+        request_id: u64,
+        cycle: i64,
+        metadata_server: Arc<Server>,
+    ) {
+        self.save_with_lineage(request_id, "autosave", Some(cycle))
+            .await;
+        if self.dimension.minecraft_name == Dimension::OVERWORLD.minecraft_name {
+            // The shared root metadata belongs to the overworld autosave.
+            // Its synchronous, fsynced writer must not block a Tokio worker.
+            match tokio::task::spawn_blocking(move || metadata_server.save_world_info()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    error!("Failed to autosave world metadata: {error}");
+                }
+                Err(error) => {
+                    error!("World metadata autosave task failed: {error}");
+                }
             }
         }
     }
@@ -8263,6 +8269,7 @@ mod tests {
 
 #[cfg(test)]
 mod save_lineage_tests {
+    use super::World;
     use crate::{data::VanillaData, server::Server};
     use pumpkin_config::{AdvancedConfiguration, BasicConfiguration, TelemetryConfig};
     use pumpkin_data::dimension::Dimension;
@@ -8273,7 +8280,7 @@ mod save_lineage_tests {
     };
     use std::{
         io::Write,
-        sync::{Arc, Mutex, atomic::Ordering::Relaxed},
+        sync::{Arc, Mutex},
         time::Duration,
     };
     use tracing_subscriber::{EnvFilter, layer::SubscriberExt};
@@ -8328,8 +8335,7 @@ mod save_lineage_tests {
             .0
     }
 
-    #[tokio::test]
-    async fn save_lineage_console_keeps_world_batch_retry_and_autosave_context() {
+    async fn console_server() -> (tempfile::TempDir, Arc<Server>, Console) {
         // Global capture is intentional: autosave tasks and the dedicated
         // scheduler threads must use the same console subscriber as deployment.
         // Run this focused test in its own process (see preparation handoff).
@@ -8374,29 +8380,13 @@ mod save_lineage_tests {
         )
         .await
         .unwrap();
-        let worlds = [
-            server.get_world_from_dimension(&Dimension::OVERWORLD),
-            server.get_world_from_dimension(&Dimension::THE_NETHER),
-        ];
-        let names: Vec<_> = worlds
-            .iter()
-            .map(|w| w.level.level_folder.dim_folder.display().to_string())
-            .collect();
-        for world in &worlds {
-            world.level_time.lock().unwrap().world_age = 1;
-            world.tick_environment();
-        }
-        until(&console, |text| {
-            names.iter().all(|name| {
-                !matching(text, "request_finished", name).is_empty()
-                    && !matching(text, "request_consumed", name).is_empty()
-                    && !matching(text, "no_batch", name).is_empty()
-            })
-        })
-        .await;
+        (directory, server, console)
+    }
+
+    fn assert_autosave_context(console: &Console, names: &[String]) {
         let text = console.text();
         let mut ids = Vec::new();
-        for name in &names {
+        for name in names {
             let scheduled = matching(&text, "autosave_scheduled", name);
             assert_eq!(scheduled.len(), 1);
             let id = scheduled[0]
@@ -8423,6 +8413,72 @@ mod save_lineage_tests {
             );
         }
         assert_ne!(ids[0], ids[1]);
+    }
+
+    fn assert_writer_context(text: &str, names: &[String], worlds: &[Arc<World>]) {
+        for (name, world) in names.iter().zip(worlds) {
+            for kind in ["receive", "complete"] {
+                let events = matching(text, kind, name);
+                assert_eq!(events.len(), 2);
+                assert!(events[0].contains("batch=1"));
+                assert!(events[1].contains("batch=2"));
+            }
+            for kind in ["region_begin", "temp_open", "commit"] {
+                let events = matching(text, kind, name);
+                assert_eq!(
+                    events.len(),
+                    if kind == "region_begin" && name == &names[0] {
+                        3
+                    } else {
+                        2
+                    }
+                );
+                assert!(events.iter().all(|line| {
+                    span_fields(line, "terrain_batch").starts_with(&format!(
+                        "world={name} dimension={:?} batch=",
+                        world.dimension.minecraft_name
+                    ))
+                }));
+                for (region, batch) in [("r.0.0", "batch=1"), ("r.1.0", "batch=2")] {
+                    assert!(
+                        events
+                            .iter()
+                            .any(|line| line.contains(region) && line.contains(batch))
+                    );
+                }
+            }
+        }
+        for kind in ["write_failed", "retry"] {
+            let events = matching(text, kind, &names[0]);
+            assert_eq!(events.len(), 1);
+            assert!(events[0].contains("batch=1"));
+        }
+    }
+
+    #[tokio::test]
+    async fn save_lineage_console_keeps_world_batch_retry_and_autosave_context() {
+        let (_directory, server, console) = console_server().await;
+        let worlds = [
+            server.get_world_from_dimension(&Dimension::OVERWORLD),
+            server.get_world_from_dimension(&Dimension::THE_NETHER),
+        ];
+        let names: Vec<_> = worlds
+            .iter()
+            .map(|w| w.level.level_folder.dim_folder.display().to_string())
+            .collect();
+        for world in &worlds {
+            world.level_time.lock().unwrap().world_age = 1;
+            world.tick_environment();
+        }
+        until(&console, |text| {
+            names.iter().all(|name| {
+                !matching(text, "request_finished", name).is_empty()
+                    && !matching(text, "request_consumed", name).is_empty()
+                    && !matching(text, "no_batch", name).is_empty()
+            })
+        })
+        .await;
+        assert_autosave_context(&console, &names);
 
         // Actual writer futures use two worlds with overlapping IO, and two FIFO
         // receives in each. A failed create must retain batch 1 and its barrier.
@@ -8470,43 +8526,7 @@ mod save_lineage_tests {
                 .unwrap();
         }
         let text = console.text();
-        for (name, world) in names.iter().zip(&worlds) {
-            for kind in ["receive", "complete"] {
-                let events = matching(&text, kind, name);
-                assert_eq!(events.len(), 2);
-                assert!(events[0].contains("batch=1"));
-                assert!(events[1].contains("batch=2"));
-            }
-            for kind in ["region_begin", "temp_open", "commit"] {
-                let events = matching(&text, kind, name);
-                assert_eq!(
-                    events.len(),
-                    if kind == "region_begin" && name == &names[0] {
-                        3
-                    } else {
-                        2
-                    }
-                );
-                assert!(events.iter().all(|line| {
-                    span_fields(line, "terrain_batch").starts_with(&format!(
-                        "world={name} dimension={:?} batch=",
-                        world.dimension.minecraft_name
-                    ))
-                }));
-                for (region, batch) in [("r.0.0", "batch=1"), ("r.1.0", "batch=2")] {
-                    assert!(
-                        events
-                            .iter()
-                            .any(|line| line.contains(region) && line.contains(batch))
-                    );
-                }
-            }
-        }
-        for kind in ["write_failed", "retry"] {
-            let events = matching(&text, kind, &names[0]);
-            assert_eq!(events.len(), 1);
-            assert!(events[0].contains("batch=1"));
-        }
+        assert_writer_context(&text, &names, &worlds);
         assert!(locks.iter().all(|lock| lock.0.lock().unwrap().is_empty()));
         let direct = Arc::new(ChunkData::empty(64, 0));
         direct.mark_dirty(true);
