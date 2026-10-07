@@ -23,8 +23,8 @@ fixed = production.read_bytes()
 
 
 def test_bytes():
-    text = fixture.read_text(encoding="utf-8")
-    return text[text.index("#[cfg(test)]"):].encode()
+    data = fixture.read_bytes()
+    return data[data.index(b"#[cfg(test)]"):]
 
 
 fixture_hash = hashlib.sha256(test_bytes()).hexdigest()
@@ -42,10 +42,13 @@ try:
             "                crate::world::chunker::update_position(&player);\n"
             "            }\n"
         )
-        text = fixed.decode()
-        assert text.count(hunk) == 1
-        with production.open("w", encoding="utf-8", newline="\n") as stream:
-            stream.write(text.replace(hunk, ""))
+        # Git may check out CRLF on Windows; remove only the production hunk
+        # while retaining every fixture byte and the checkout's line endings.
+        hunk_bytes = hunk.encode()
+        if b"\r\n" in fixed:
+            hunk_bytes = hunk_bytes.replace(b"\n", b"\r\n")
+        assert fixed.count(hunk_bytes) == 1
+        production.write_bytes(fixed.replace(hunk_bytes, b""))
     assert hashlib.sha256(test_bytes()).hexdigest() == fixture_hash
     baseline_hash = hashlib.sha256(production.read_bytes()).hexdigest()
     result = subprocess.run(
@@ -55,7 +58,10 @@ try:
     text = result.stdout.decode("utf-8", errors="replace")
     (output / "negative.log").write_bytes(result.stdout)
     if kind == "region":
-        matched = "running 1 test" in text and "stack overflow" in text.lower()
+        matched = "running 1 test" in text and (
+            "stack overflow" in text.lower()
+            or "has overflowed its stack" in text.lower()
+        )
     else:
         matched = (
             "running 1 test" in text
