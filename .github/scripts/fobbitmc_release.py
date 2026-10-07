@@ -96,6 +96,30 @@ def autosave_negative():
     STATE.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8", newline="\n")
 
 
+def merchant_negative(target):
+    test = "entity::passive::villager::tests::successful_trade_player_click_returns_and_preserves_payment"
+    assertion = "successful trade player click must return after its callback"
+    source = git_source(ROOT / "engine", os.environ["MERCHANT_BASELINE_SHA"])
+    log = TEMP / f"merchant-negative-{target}.log"
+    args = ["cargo", "+" + os.environ["RUST_TOOLCHAIN"], "test", "--locked",
+            "--release", "--target", target, "-p", "pumpkin-core", "--lib", test,
+            "--", "--exact", "--color", "never"]
+    with log.open("w", encoding="utf-8", newline="\n") as stream:
+        result = subprocess.run(args, cwd=ROOT / "engine", stdout=stream,
+                                stderr=subprocess.STDOUT, timeout=1800, check=False)
+    output = log.read_text(encoding="utf-8")
+    print(output, end="")
+    lines = output.splitlines()
+    if (result.returncode != 101 or "running 1 test" not in lines
+            or f"test {test} ... FAILED" not in lines or assertion not in output
+            or re.search(r"^test result: FAILED\. 0 passed; 1 failed; 0 ignored; 0 measured; [0-9]+ filtered out;", output, re.MULTILINE) is None):
+        raise ValueError("Merchant negative gate did not fail on the exact deadlock regression")
+    state = json.loads(STATE.read_text(encoding="utf-8"))
+    state["merchantNegative"] = {**source, "test": test, "assertion": assertion,
+                                 "exitCode": result.returncode, "logSha256": sha256(log)}
+    STATE.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8", newline="\n")
+
+
 def verify_engine():
     state = json.loads(STATE.read_text(encoding="utf-8"))
     if git_source(ROOT / "engine", os.environ["ENGINE_SHA"]) != state["engine"]:
@@ -138,5 +162,5 @@ def manifest(target):
 
 if __name__ == "__main__":
     mode, *args = sys.argv[1:]
-    {"prepare": prepare, "autosave_negative": autosave_negative, "verify_engine": verify_engine,
+    {"prepare": prepare, "autosave_negative": autosave_negative, "merchant_negative": merchant_negative, "verify_engine": verify_engine,
      "collect": collect, "manifest": manifest}[mode](*args)

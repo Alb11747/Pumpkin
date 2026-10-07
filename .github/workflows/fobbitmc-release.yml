@@ -24,6 +24,11 @@ on:
         required: false
         type: string
 
+      merchant_baseline_sha:
+        description: Exact test-only baseline expected to fail the merchant callback regression
+        required: false
+        type: string
+
 permissions:
   contents: read
 
@@ -47,6 +52,7 @@ env:
   EXPORTER_SHA: ${{ inputs.exporter_sha }}
   BUILD_EXPORTER: ${{ inputs.build_exporter }}
   AUTOSAVE_BASELINE_SHA: ${{ inputs.autosave_baseline_sha }}
+  MERCHANT_BASELINE_SHA: ${{ inputs.merchant_baseline_sha }}
 
 jobs:
   release:
@@ -74,6 +80,9 @@ jobs:
           [[ "$BRIDGE_SHA" =~ ^[0-9a-f]{40}$ ]]
           if [[ -n "$AUTOSAVE_BASELINE_SHA" ]]; then
             [[ "$AUTOSAVE_BASELINE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          fi
+          if [[ -n "$MERCHANT_BASELINE_SHA" ]]; then
+            [[ "$MERCHANT_BASELINE_SHA" =~ ^[0-9a-f]{40}$ ]]
           fi
           if [[ "$BUILD_EXPORTER" == true ]]; then
             [[ "$EXPORTER_SHA" =~ ^[0-9a-f]{40}$ ]]
@@ -139,6 +148,33 @@ jobs:
         run: |
           git -C engine checkout --detach "$ENGINE_SHA"
           python build-control/.github/scripts/fobbitmc_release.py verify_engine
+      - name: Prove the test-only baseline fails on the merchant callback assertion
+        if: inputs.merchant_baseline_sha != ''
+        working-directory: engine
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/fobbitmc-release-target
+        run: |
+          git fetch --depth=1 origin "$MERCHANT_BASELINE_SHA"
+          git checkout --detach "$MERCHANT_BASELINE_SHA"
+          cd ..
+          python build-control/.github/scripts/fobbitmc_release.py merchant_negative '${{ matrix.target }}'
+      - name: Restore and verify exact engine after merchant negative gate
+        if: always() && inputs.merchant_baseline_sha != ''
+        run: |
+          git -C engine checkout --detach "$ENGINE_SHA"
+          python build-control/.github/scripts/fobbitmc_release.py verify_engine
+      - name: Prove the exact merchant regression passes on the restored engine
+        working-directory: engine
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/fobbitmc-release-target
+        run: |
+          TEST='entity::passive::villager::tests::successful_trade_player_click_returns_and_preserves_payment'
+          LOG="$RUNNER_TEMP/merchant-positive-${{ matrix.target }}.log"
+          cargo +"$RUST_TOOLCHAIN" test --locked --release --target '${{ matrix.target }}' -p pumpkin-core --lib "$TEST" -- --exact --color never > "$LOG" 2>&1
+          cat "$LOG"
+          grep -Fx 'running 1 test' "$LOG"
+          grep -Fx "test $TEST ... ok" "$LOG"
+          grep -E '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$LOG"
       - name: Build optimized engine
         working-directory: engine
         env:
