@@ -6853,6 +6853,10 @@ impl EntityBase for Player {
             let yaw = yaw.unwrap_or_else(|| self.living_entity.entity.yaw.load());
             let pitch = pitch.unwrap_or_else(|| self.living_entity.entity.pitch.load());
             self.request_teleport(position, yaw, pitch);
+            // Watch the destination without waiting for client confirmation or movement.
+            if let Some(player) = self.world().get_player_by_uuid(self.gameprofile.id) {
+                crate::world::chunker::update_position(&player);
+            }
             let entity = self.get_entity();
             let chunk_pos = entity.chunk_pos.load();
             entity.world.load().broadcast_to_chunk_except(
@@ -8074,9 +8078,173 @@ impl InventoryPlayer for Player {
 
 #[cfg(test)]
 mod tests {
-    use super::{bedrock_inventory_slot, read_root_vehicle, write_root_vehicle};
+    use super::{Player, bedrock_inventory_slot, read_root_vehicle, write_root_vehicle};
+    use crate::{
+        data::VanillaData,
+        entity::EntityBase,
+        net::{
+            ClientPlatform, GameProfile, PacketRateLimiter, PlayerConfig,
+            java::{JavaClient, pending::PendingConnection},
+        },
+        plugin::{
+            BoxFuture, EventHandler, EventPriority, player::player_teleport::PlayerTeleportEvent,
+        },
+        server::Server,
+    };
+    use arc_swap::ArcSwap;
+    use pumpkin_config::{AdvancedConfiguration, BasicConfiguration, TelemetryConfig};
+    use pumpkin_data::dimension::Dimension;
     use pumpkin_nbt::{compound::NbtCompound, tag::NbtTag};
+    use pumpkin_protocol::ConnectionState;
+    use pumpkin_util::{
+        GameMode,
+        math::{vector2::Vector2, vector3::Vector3},
+        world_seed::Seed,
+    };
+    use pumpkin_world::cylindrical_chunk_iterator::Cylindrical;
+    use std::{error::Error, num::NonZero, path::Path, sync::Arc};
+    use tokio::net::{TcpListener, TcpStream};
     use uuid::Uuid;
+
+    async fn teleport_test_player(
+        directory: &Path,
+    ) -> Result<(Arc<Server>, Arc<Player>, TcpStream), Box<dyn Error>> {
+        let basic = BasicConfiguration {
+            default_level_name: directory.to_string_lossy().into_owned(),
+            seed: Seed(0),
+            allow_nether: false,
+            allow_end: false,
+            allow_chat_reports: false,
+            ..BasicConfiguration::default()
+        };
+        let mut advanced = AdvancedConfiguration::default();
+        advanced.networking.bedrock.online_mode = false;
+        advanced.networking.java.online_mode = false;
+        let view_distance = NonZero::new(2).ok_or("test view distance must be nonzero")?;
+        advanced.networking.java.view_distance = view_distance;
+        advanced.networking.java.simulation_distance = view_distance;
+        let data = VanillaData {
+            banned_ip_list: std::sync::RwLock::default(),
+            banned_player_list: std::sync::RwLock::default(),
+            operator_config: std::sync::RwLock::default(),
+            user_cache: std::sync::RwLock::default(),
+            whitelist_config: std::sync::RwLock::default(),
+        };
+        let server = Server::new(
+            basic,
+            advanced,
+            TelemetryConfig::default(),
+            data,
+            Vec::new(),
+        )
+        .await?;
+        let world = server.get_world_from_dimension(&Dimension::OVERWORLD);
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
+        let address = listener.local_addr()?;
+        let (peer, accepted) = tokio::join!(TcpStream::connect(address), listener.accept());
+        let peer = peer?;
+        let (stream, address) = accepted?;
+        let pending = PendingConnection::new(
+            stream,
+            address,
+            0,
+            PacketRateLimiter::new(false, 0.0, 0.0),
+            Arc::downgrade(&server),
+        );
+        let profile = GameProfile {
+            id: Uuid::new_v4(),
+            name: "TeleportViewTest".to_owned(),
+            properties: ArcSwap::from_pointee(Vec::new()),
+            profile_actions: None,
+        };
+        let config = PlayerConfig {
+            view_distance,
+            ..PlayerConfig::default()
+        };
+        let client = JavaClient::from_pending(pending, profile.clone(), config.clone());
+        client.connection_state.store(ConnectionState::Play);
+        let player = Arc::new(Player::new(
+            Arc::new(ClientPlatform::Java(client)),
+            profile,
+            config,
+            &world,
+            GameMode::Survival,
+        ));
+        world.add_player(&player)?;
+        player.get_entity().set_pos(Vector3::new(0.5, 80.0, 0.5));
+        player
+            .watched_section
+            .store(Cylindrical::new(Vector2::new(0, 0), view_distance));
+        Ok((server, player, peer))
+    }
+
+    struct CancelTeleport;
+
+    impl EventHandler<PlayerTeleportEvent> for CancelTeleport {
+        fn handle_blocking<'a>(
+            &'a self,
+            _server: &'a Arc<Server>,
+            event: &'a mut PlayerTeleportEvent,
+        ) -> BoxFuture<'a, ()> {
+            Box::pin(async move { event.cancelled = true })
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[expect(clippy::unwrap_used, reason = "regression test mutex assertions")]
+    async fn same_world_teleport_moves_chunk_view_before_client_confirmation_or_movement()
+    -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let (server, player, _peer) = teleport_test_player(directory.path()).await?;
+        let world = player.world();
+
+        // Neither the socket nor a movement handler supplies any client packets.
+        let mut observations = Vec::new();
+        for (destination, expected_center) in [
+            (Vector3::new(145.5, 66.0, 338.5), Vector2::new(9, 21)),
+            (Vector3::new(-640.5, 80.0, 624.5), Vector2::new(-41, 39)),
+        ] {
+            player.teleport(destination, None, None, world.clone());
+            observations.push((
+                expected_center,
+                player.watched_section.load().center,
+                player
+                    .chunk_sender
+                    .lock()
+                    .unwrap()
+                    .pending_chunks
+                    .contains(&expected_center),
+                player.awaiting_teleport.lock().unwrap().is_some(),
+            ));
+        }
+
+        server
+            .plugin_manager
+            .register(Arc::new(CancelTeleport), EventPriority::Normal, true);
+        let previous_confirmation = *player.awaiting_teleport.lock().unwrap();
+        player.teleport(Vector3::new(1024.5, 80.0, 1024.5), None, None, world);
+        let cancelled_position = player.position();
+        let cancelled_center = player.watched_section.load().center;
+        let cancelled_chunk_pending = player
+            .chunk_sender
+            .lock()
+            .unwrap()
+            .pending_chunks
+            .contains(&Vector2::new(64, 64));
+        let cancelled_confirmation = *player.awaiting_teleport.lock().unwrap();
+        server.shutdown().await;
+
+        for (destination, watched, pending, awaiting_confirmation) in observations {
+            assert_eq!(watched, destination);
+            assert!(pending, "destination terrain must already be queued");
+            assert!(awaiting_confirmation);
+        }
+        assert_eq!(cancelled_position, Vector3::new(-640.5, 80.0, 624.5));
+        assert_eq!(cancelled_center, Vector2::new(-41, 39));
+        assert!(!cancelled_chunk_pending);
+        assert_eq!(cancelled_confirmation, previous_confirmation);
+        Ok(())
+    }
 
     #[test]
     fn player_screen_slots_map_to_bedrock_inventory() {
