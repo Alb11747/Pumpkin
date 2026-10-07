@@ -928,6 +928,15 @@ impl GenerationSchedule {
             *data.entry(*pos).or_insert(0) += 1;
         }
         drop(data);
+        self.send_unload_save_batch(level, chunks, origin);
+    }
+
+    fn send_unload_save_batch(
+        &mut self,
+        level: &Level,
+        chunks: Vec<(ChunkPos, Chunk)>,
+        origin: &'static str,
+    ) {
         self.save_batch_ordinal += 1;
         let batch = self.save_batch_ordinal;
         let chunk_count = chunks.len();

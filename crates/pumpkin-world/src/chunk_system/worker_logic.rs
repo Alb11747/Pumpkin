@@ -211,7 +211,7 @@ pub async fn io_write_work(
     level: Arc<Level>,
     lock: IOLock,
 ) {
-    let mut batch = 0_u64;
+    let mut batch = 0u64;
     loop {
         // Don't check cancel_token here (keep saving chunks)
         let Some(data) = recv.recv().await else {
@@ -301,31 +301,7 @@ pub async fn io_write_work(
             );
         }
 
-        {
-            let mut data = lock
-                .0
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            for i in positions {
-                match data.entry(i) {
-                    Entry::Occupied(mut entry) => {
-                        let rc = entry.get_mut();
-                        if *rc <= 1 {
-                            entry.remove();
-                        } else {
-                            *rc -= 1;
-                        }
-                    }
-                    Entry::Vacant(_) => {
-                        warn!(
-                            "io_write: attempted to release missing lock entry for {:?}",
-                            i
-                        );
-                    }
-                }
-            }
-        }
-        lock.1.notify_waiters();
+        release_saved_chunk_barriers(&lock, positions);
         debug!(
             target: "pumpkin_save_lineage", kind = "complete",
             world = %level.level_folder.dim_folder.display(),
@@ -333,6 +309,34 @@ pub async fn io_write_work(
             batch, "save_lineage"
         );
     }
+}
+
+fn release_saved_chunk_barriers(lock: &IOLock, positions: Vec<ChunkPos>) {
+    {
+        let mut data = lock
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for i in positions {
+            match data.entry(i) {
+                Entry::Occupied(mut entry) => {
+                    let rc = entry.get_mut();
+                    if *rc <= 1 {
+                        entry.remove();
+                    } else {
+                        *rc -= 1;
+                    }
+                }
+                Entry::Vacant(_) => {
+                    warn!(
+                        "io_write: attempted to release missing lock entry for {:?}",
+                        i
+                    );
+                }
+            }
+        }
+    }
+    lock.1.notify_waiters();
 }
 
 pub fn run_generation(
