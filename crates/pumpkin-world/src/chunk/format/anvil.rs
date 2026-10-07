@@ -452,6 +452,10 @@ impl<S: SingleChunkDataSerializer> AnvilChunkFile<S> {
         trace!("Writing tmp file to disk: {temp_path:?}");
 
         let file = tokio::fs::File::create(&temp_path).await?;
+        debug!(
+            target: "pumpkin_save_lineage", kind = "temp_open",
+            temp = %temp_path.display(), region = %path.display(), "save_lineage"
+        );
         let mut write = BufWriter::new(file);
 
         // Build the 8 KiB header in memory
@@ -489,7 +493,11 @@ impl<S: SingleChunkDataSerializer> AnvilChunkFile<S> {
         write.flush().await?;
         write.get_ref().sync_all().await?;
         drop(write);
-        tokio::fs::rename(temp_path, path).await?;
+        tokio::fs::rename(&temp_path, path).await?;
+        debug!(
+            target: "pumpkin_save_lineage", kind = "commit",
+            temp = %temp_path.display(), region = %path.display(), "save_lineage"
+        );
         Ok(())
     }
 }

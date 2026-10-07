@@ -36,7 +36,7 @@ use std::{
 };
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+use tracing::{Instrument, debug, debug_span, error, info, warn};
 // use tokio::runtime::Handle;
 use tokio::{
     sync::{
@@ -892,10 +892,29 @@ impl Level {
         &self,
         chunks_to_write: Vec<(Vector2<i32>, SyncChunk)>,
     ) -> Result<(), ChunkWritingError> {
+        debug!(
+            target: "pumpkin_save_lineage", kind = "direct_terrain_write_begin",
+            world = %self.level_folder.dim_folder.display(),
+            dimension = self.world_gen.load().dimension().minecraft_name,
+            origin = "direct", chunk_count = chunks_to_write.len(), "save_lineage"
+        );
+        let span = debug_span!(
+            target: "pumpkin_save_lineage", "direct_terrain_write",
+            world = %self.level_folder.dim_folder.display(),
+            dimension = self.world_gen.load().dimension().minecraft_name,
+            origin = "direct"
+        );
         let result = self
             .chunk_saver
             .save_chunks(&self.level_folder, chunks_to_write)
+            .instrument(span)
             .await;
+        debug!(
+            target: "pumpkin_save_lineage", kind = "direct_terrain_write_finished",
+            world = %self.level_folder.dim_folder.display(),
+            dimension = self.world_gen.load().dimension().minecraft_name,
+            origin = "direct", success = result.is_ok(), "save_lineage"
+        );
         if let Err(error) = &result {
             error!("Failed writing chunks to disk: {error}");
         }

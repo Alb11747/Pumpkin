@@ -350,6 +350,10 @@ where
             .into_iter()
             .map(|(file_name, chunk_locks)| async move {
                 let path = P::file_path(folder, &file_name);
+                debug!(
+                    target: "pumpkin_save_lineage", kind = "region_begin",
+                    region = %path.display(), "save_lineage"
+                );
                 trace!("Saving chunks into {}", path.display());
 
                 let chunk_serializer = match self.get_serializer(&path).await {

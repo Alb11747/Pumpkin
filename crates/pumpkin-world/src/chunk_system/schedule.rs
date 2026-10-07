@@ -72,6 +72,8 @@ pub struct GenerationSchedule {
     recv_chunk: crossbeam::channel::Receiver<(ChunkPos, RecvChunk)>,
     io_read: tokio::sync::mpsc::Sender<Vec<ChunkPos>>,
     io_write: tokio::sync::mpsc::Sender<Vec<(ChunkPos, Chunk)>>,
+    // One producer and one receiver per Level; diagnostic ordinals count ALL sends.
+    save_batch_ordinal: u64,
     send_chunk: crossbeam::channel::Sender<(ChunkPos, RecvChunk)>,
     listener: Arc<ChunkListener>,
     lighting_config: LightingEngineConfig,
@@ -165,6 +167,7 @@ impl GenerationSchedule {
                     recv_chunk,
                     io_read: send_read_io,
                     io_write: send_write_io,
+                    save_batch_ordinal: 0,
                     send_chunk,
                     listener,
                     chunk_map: HashMap::default(),
@@ -839,7 +842,7 @@ impl GenerationSchedule {
         }
     }
 
-    fn process_unload_queue(&mut self, level: &Level) {
+    fn process_unload_queue(&mut self, level: &Level, origin: &'static str) {
         if self.unload_chunks.is_empty() {
             return;
         }
@@ -925,15 +928,37 @@ impl GenerationSchedule {
             *data.entry(*pos).or_insert(0) += 1;
         }
         drop(data);
+        self.save_batch_ordinal += 1;
+        let batch = self.save_batch_ordinal;
+        let chunk_count = chunks.len();
+        debug!(
+            target: "pumpkin_save_lineage", kind = "send_begin",
+            world = %level.level_folder.dim_folder.display(),
+            dimension = level.world_gen.load().dimension().minecraft_name,
+            batch, origin, chunk_count, site = "unload", "save_lineage"
+        );
         if let Err(e) = self.io_write.blocking_send(chunks) {
+            debug!(
+                target: "pumpkin_save_lineage", kind = "send_error",
+                world = %level.level_folder.dim_folder.display(),
+                dimension = level.world_gen.load().dimension().minecraft_name,
+                batch, origin, chunk_count, site = "unload", error = %e, "save_lineage"
+            );
             error!(
                 "Failed to send chunks to io write thread during save (may have shut down): {:?}",
                 e
             );
+        } else {
+            debug!(
+                target: "pumpkin_save_lineage", kind = "send_ok",
+                world = %level.level_folder.dim_folder.display(),
+                dimension = level.world_gen.load().dimension().minecraft_name,
+                batch, origin, chunk_count, site = "unload", "save_lineage"
+            );
         }
     }
 
-    fn save_all_chunk(&mut self, save_proto_chunk: bool) {
+    fn save_all_chunk(&mut self, level: &Level, save_proto_chunk: bool, origin: &'static str) {
         let mut chunks = Vec::with_capacity(self.chunk_map.len());
 
         for (pos, holder) in &mut self.chunk_map {
@@ -961,6 +986,12 @@ impl GenerationSchedule {
         }
 
         if chunks.is_empty() {
+            debug!(
+                target: "pumpkin_save_lineage", kind = "no_batch",
+                world = %level.level_folder.dim_folder.display(),
+                dimension = level.world_gen.load().dimension().minecraft_name,
+                origin, "save_lineage"
+            );
             return;
         }
 
@@ -980,8 +1011,30 @@ impl GenerationSchedule {
         }
         drop(data);
 
+        self.save_batch_ordinal += 1;
+        let batch = self.save_batch_ordinal;
+        let chunk_count = chunks.len();
+        debug!(
+            target: "pumpkin_save_lineage", kind = "send_begin",
+            world = %level.level_folder.dim_folder.display(),
+            dimension = level.world_gen.load().dimension().minecraft_name,
+            batch, origin, chunk_count, site = "save_all", "save_lineage"
+        );
         if let Err(e) = self.io_write.blocking_send(chunks) {
+            debug!(
+                target: "pumpkin_save_lineage", kind = "send_error",
+                world = %level.level_folder.dim_folder.display(),
+                dimension = level.world_gen.load().dimension().minecraft_name,
+                batch, origin, chunk_count, site = "save_all", error = %e, "save_lineage"
+            );
             error!("Failed to send chunks to io write thread: {:?}", e);
+        } else {
+            debug!(
+                target: "pumpkin_save_lineage", kind = "send_ok",
+                world = %level.level_folder.dim_folder.display(),
+                dimension = level.world_gen.load().dimension().minecraft_name,
+                batch, origin, chunk_count, site = "save_all", "save_lineage"
+            );
         }
     }
 
@@ -1279,16 +1332,22 @@ impl GenerationSchedule {
         loop {
             if level.should_unload.swap(false, Relaxed) {
                 self.garbage_collect_dependencies();
-                self.process_unload_queue(level);
+                self.process_unload_queue(level, "unload");
             }
             if level.should_save.swap(false, Relaxed) {
-                self.save_all_chunk(false);
+                debug!(
+                    target: "pumpkin_save_lineage", kind = "request_consumed",
+                    world = %level.level_folder.dim_folder.display(),
+                    dimension = level.world_gen.load().dimension().minecraft_name,
+                    origin = "request", "save_lineage"
+                );
+                self.save_all_chunk(level, false, "request");
             }
             if level.shut_down_chunk_system.load(Relaxed) {
                 info!("Saving chunks before shutdown...");
                 self.garbage_collect_dependencies();
-                self.process_unload_queue(level);
-                self.save_all_chunk(true);
+                self.process_unload_queue(level, "shutdown");
+                self.save_all_chunk(level, true, "shutdown");
                 break;
             }
 
@@ -1303,7 +1362,7 @@ impl GenerationSchedule {
             // is what puts stale dependency holders into the queue in the first place.
             if self.last_unload.elapsed() >= std::time::Duration::from_secs(1) {
                 self.garbage_collect_dependencies();
-                self.process_unload_queue(level);
+                self.process_unload_queue(level, "unload");
                 self.last_unload = std::time::Instant::now();
             }
 
@@ -1324,7 +1383,7 @@ impl GenerationSchedule {
                 if level.shut_down_chunk_system.load(Relaxed) {
                     self.queue.push(task);
                     info!("Shutdown detected during task processing, saving chunks...");
-                    self.save_all_chunk(true);
+                    self.save_all_chunk(level, true, "shutdown");
                     break 'out2;
                 }
 
@@ -1420,7 +1479,7 @@ impl GenerationSchedule {
                                 .is_err()
                         {
                             info!("IO read thread closed, saving remaining chunks...");
-                            self.save_all_chunk(true);
+                            self.save_all_chunk(level, true, "read_failure");
                             break 'out2;
                         }
                     } else {
@@ -1432,7 +1491,7 @@ impl GenerationSchedule {
                                 .is_err()
                         {
                             info!("IO read thread closed, saving remaining chunks...");
-                            self.save_all_chunk(true);
+                            self.save_all_chunk(level, true, "read_failure");
                             break 'out2;
                         }
 
@@ -1586,7 +1645,7 @@ impl GenerationSchedule {
                     .is_err()
             {
                 info!("IO read thread closed, saving remaining chunks...");
-                self.save_all_chunk(true);
+                self.save_all_chunk(level, true, "read_failure");
             }
 
             // 5. Wait for work or results
@@ -1762,5 +1821,229 @@ impl GenerationSchedule {
             }
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod save_lineage_tests {
+    use super::*;
+    use crate::chunk::ChunkData;
+    use pumpkin_config::world::LevelConfig;
+    use pumpkin_data::dimension::Dimension;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use tracing::field::{Field, Visit};
+    use tracing::instrument::WithSubscriber;
+    use tracing::span::{Attributes, Id, Record};
+    use tracing::{Event, Metadata, Subscriber};
+
+    #[derive(Clone, Default)]
+    struct Events(Arc<Mutex<Vec<HashMap<String, String>>>>);
+
+    #[derive(Default)]
+    struct Fields(HashMap<String, String>);
+
+    impl Visit for Fields {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.0.insert(field.name().into(), format!("{value:?}"));
+        }
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.0.insert(field.name().into(), value.into());
+        }
+        fn record_u64(&mut self, field: &Field, value: u64) {
+            self.0.insert(field.name().into(), value.to_string());
+        }
+    }
+
+    impl Subscriber for Events {
+        fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+            metadata.target() == "pumpkin_save_lineage"
+        }
+        fn new_span(&self, _: &Attributes<'_>) -> Id {
+            static ID: AtomicU64 = AtomicU64::new(1);
+            Id::from_u64(ID.fetch_add(1, Ordering::Relaxed))
+        }
+        fn record(&self, _: &Id, _: &Record<'_>) {}
+        fn record_follows_from(&self, _: &Id, _: &Id) {}
+        fn enter(&self, _: &Id) {}
+        fn exit(&self, _: &Id) {}
+        fn event(&self, event: &Event<'_>) {
+            let mut fields = Fields::default();
+            event.record(&mut fields);
+            self.0.lock().unwrap().push(fields.0);
+        }
+    }
+
+    fn scheduler(
+        level: &Level,
+    ) -> (
+        GenerationSchedule,
+        tokio::sync::mpsc::Receiver<Vec<(ChunkPos, Chunk)>>,
+    ) {
+        let (io_read, _) = tokio::sync::mpsc::channel(1);
+        let (io_write, recv) = tokio::sync::mpsc::channel(4);
+        let (send_chunk, recv_chunk) = crossbeam::channel::unbounded();
+        (
+            GenerationSchedule {
+                queue: BinaryHeap::new(),
+                graph: DAG::default(),
+                last_level: ChunkLevel::default(),
+                last_high_priority: Vec::new(),
+                send_level: level.level_channel.clone(),
+                public_chunk_map: level.loaded_chunks.clone(),
+                loaded_chunk_changes: level.loaded_chunk_changes.clone(),
+                chunk_map: HashMap::new(),
+                unload_chunks: HashSetType::default(),
+                waiting_for_chunks: HashSetType::default(),
+                io_lock: Arc::new((
+                    Mutex::new(HashMapType::default()),
+                    tokio::sync::Notify::new(),
+                )),
+                running_task_count: 0,
+                max_in_flight: 1,
+                queue_dirty: false,
+                recv_chunk,
+                io_read,
+                io_write,
+                save_batch_ordinal: 0,
+                send_chunk,
+                listener: Arc::new(ChunkListener::new()),
+                lighting_config: level.lighting_config,
+                last_unload: std::time::Instant::now(),
+                generation_pool: Arc::new(
+                    rayon::ThreadPoolBuilder::new()
+                        .num_threads(1)
+                        .build()
+                        .unwrap(),
+                ),
+            },
+            recv,
+        )
+    }
+
+    fn dirty_holder() -> ChunkHolder {
+        let chunk = Arc::new(ChunkData::empty(0, 0));
+        chunk.mark_dirty(true);
+        ChunkHolder {
+            chunk: Some(Chunk::Level(chunk)),
+            ..ChunkHolder::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn save_lineage_fifo_counts_unload_save_and_no_batch_per_world() {
+        let directory = tempfile::tempdir().unwrap();
+        let a = Level::from_root_folder(
+            &LevelConfig::default(),
+            directory.path().into(),
+            0,
+            Dimension::OVERWORLD,
+        )
+        .unwrap();
+        let b = Level::from_root_folder(
+            &LevelConfig::default(),
+            directory.path().into(),
+            0,
+            Dimension::THE_NETHER,
+        )
+        .unwrap();
+        let (mut sched_a, recv_a) = scheduler(&a);
+        let (mut sched_b, recv_b) = scheduler(&b);
+        let locks = [sched_a.io_lock.clone(), sched_b.io_lock.clone()];
+        let events = Events::default();
+        let pos = ChunkPos::new(0, 0);
+        // blocking_send runs outside Tokio, just as on the scheduler thread.
+        let events_for_thread = events.clone();
+        let a_for_thread = a.clone();
+        let b_for_thread = b.clone();
+        std::thread::spawn(move || {
+            tracing::subscriber::with_default(events_for_thread, || {
+                sched_a.save_all_chunk(&a_for_thread, false, "request");
+                assert_eq!(sched_a.save_batch_ordinal, 0);
+                sched_a.chunk_map.insert(pos, dirty_holder());
+                sched_a.unload_chunks.insert(pos);
+                sched_a.process_unload_queue(&a_for_thread, "unload");
+                sched_b.chunk_map.insert(pos, dirty_holder());
+                sched_b.save_all_chunk(&b_for_thread, false, "request");
+                sched_a.chunk_map.insert(pos, dirty_holder());
+                sched_a.save_all_chunk(&a_for_thread, false, "request");
+                assert_eq!(sched_a.save_batch_ordinal, 2);
+                assert_eq!(sched_b.save_batch_ordinal, 1);
+            })
+        })
+        .join()
+        .unwrap();
+        let captured = events.0.lock().unwrap();
+        let emitted: Vec<_> = captured
+            .iter()
+            .filter(|e| e["kind"] == "send_ok")
+            .map(|e| {
+                (
+                    e["world"].clone(),
+                    e["batch"].clone(),
+                    e["origin"].clone(),
+                    e["site"].clone(),
+                )
+            })
+            .collect();
+        let world_a = a.level_folder.dim_folder.display().to_string();
+        let world_b = b.level_folder.dim_folder.display().to_string();
+        assert_eq!(
+            emitted,
+            vec![
+                (
+                    world_a.clone(),
+                    "1".into(),
+                    "unload".into(),
+                    "unload".into()
+                ),
+                (world_b, "1".into(), "request".into(), "save_all".into()),
+                (
+                    world_a.clone(),
+                    "2".into(),
+                    "request".into(),
+                    "save_all".into()
+                ),
+            ]
+        );
+        let empty = captured.iter().find(|e| e["kind"] == "no_batch").unwrap();
+        assert_eq!(empty["world"], world_a);
+        assert!(!empty.contains_key("batch"));
+        assert!(!captured.iter().any(|e| e["kind"] == "complete"));
+        drop(captured);
+        tokio::join!(
+            io_write_work(recv_a, a.clone(), locks[0].clone()).with_subscriber(events.clone()),
+            io_write_work(recv_b, b.clone(), locks[1].clone()).with_subscriber(events.clone()),
+        );
+        let captured = events.0.lock().unwrap();
+        for kind in ["receive", "complete"] {
+            let outcomes: Vec<_> = captured
+                .iter()
+                .filter(|e| e["kind"] == kind)
+                .map(|e| (e["world"].clone(), e["batch"].clone()))
+                .collect();
+            for (name, count) in [
+                (&a.level_folder.dim_folder, 2),
+                (&b.level_folder.dim_folder, 1),
+            ] {
+                let name = name.display().to_string();
+                let batches: Vec<_> = outcomes
+                    .iter()
+                    .filter(|(world, _)| *world == name)
+                    .map(|(_, batch)| batch.as_str())
+                    .collect();
+                assert_eq!(
+                    batches,
+                    if count == 2 {
+                        vec!["1", "2"]
+                    } else {
+                        vec!["1"]
+                    }
+                );
+            }
+        }
+        assert!(locks.iter().all(|lock| lock.0.lock().unwrap().is_empty()));
+        drop(captured);
+        a.shutdown().await;
+        b.shutdown().await;
     }
 }

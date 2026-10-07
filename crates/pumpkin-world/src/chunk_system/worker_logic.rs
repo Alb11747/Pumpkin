@@ -11,7 +11,7 @@ use pumpkin_data::chunk::ChunkStatus;
 use std::collections::hash_map::Entry;
 use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
-use tracing::{debug, error, warn};
+use tracing::{Instrument, debug, debug_span, error, warn};
 
 pub enum RecvChunk {
     IO(Chunk),
@@ -211,9 +211,31 @@ pub async fn io_write_work(
     level: Arc<Level>,
     lock: IOLock,
 ) {
+    let mut batch = 0_u64;
     loop {
         // Don't check cancel_token here (keep saving chunks)
-        let Some(data) = recv.recv().await else { break };
+        let Some(data) = recv.recv().await else {
+            debug!(
+                target: "pumpkin_save_lineage", kind = "writer_closed",
+                world = %level.level_folder.dim_folder.display(),
+                dimension = level.world_gen.load().dimension().minecraft_name,
+                "save_lineage"
+            );
+            break;
+        };
+        batch += 1;
+        debug!(
+            target: "pumpkin_save_lineage", kind = "receive",
+            world = %level.level_folder.dim_folder.display(),
+            dimension = level.world_gen.load().dimension().minecraft_name,
+            batch, chunk_count = data.len(), "save_lineage"
+        );
+        let save_span = debug_span!(
+            target: "pumpkin_save_lineage", "terrain_batch",
+            world = %level.level_folder.dim_folder.display(),
+            dimension = level.world_gen.load().dimension().minecraft_name,
+            batch
+        );
         // debug!("io write thread receive chunks size {}", data.len());
         let positions = data.iter().map(|(pos, _)| *pos).collect::<Vec<_>>();
         let level_for_upgrade = level.clone();
@@ -239,6 +261,12 @@ pub async fn io_write_work(
         let chunks = match upgrade_result {
             Ok(chunks) => chunks,
             Err(cause) => {
+                debug!(
+                    target: "pumpkin_save_lineage", kind = "upgrade_failed",
+                    world = %level.level_folder.dim_folder.display(),
+                    dimension = level.world_gen.load().dimension().minecraft_name,
+                    batch, error = %cause, "save_lineage"
+                );
                 level.fail_chunk_system(format!("Failed to upgrade chunks for saving: {cause}"));
                 // Keep the read barrier: disk does not contain this version.
                 break;
@@ -248,8 +276,15 @@ pub async fn io_write_work(
         while let Err(cause) = level
             .chunk_saver
             .save_chunks(&level.level_folder, chunks.clone())
+            .instrument(save_span.clone())
             .await
         {
+            debug!(
+                target: "pumpkin_save_lineage", kind = "write_failed",
+                world = %level.level_folder.dim_folder.display(),
+                dimension = level.world_gen.load().dimension().minecraft_name,
+                batch, error = %cause, retry_seconds = retry_delay.as_secs(), "save_lineage"
+            );
             error!(
                 "Failed to save chunks: {cause}; retaining data and retrying in {}s",
                 retry_delay.as_secs()
@@ -258,6 +293,12 @@ pub async fn io_write_work(
             // including during shutdown. Cancelling here would discard world data.
             tokio::time::sleep(retry_delay).await;
             retry_delay = (retry_delay * 2).min(std::time::Duration::from_secs(30));
+            debug!(
+                target: "pumpkin_save_lineage", kind = "retry",
+                world = %level.level_folder.dim_folder.display(),
+                dimension = level.world_gen.load().dimension().minecraft_name,
+                batch, "save_lineage"
+            );
         }
 
         {
@@ -285,6 +326,12 @@ pub async fn io_write_work(
             }
         }
         lock.1.notify_waiters();
+        debug!(
+            target: "pumpkin_save_lineage", kind = "complete",
+            world = %level.level_folder.dim_folder.display(),
+            dimension = level.world_gen.load().dimension().minecraft_name,
+            batch, "save_lineage"
+        );
     }
 }
 

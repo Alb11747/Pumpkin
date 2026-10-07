@@ -12,13 +12,16 @@ use pumpkin_protocol::bedrock::network_item::NetworkItemDescriptor;
 use pumpkin_protocol::codec::data_component::data_to_proto_sound;
 use pumpkin_world::generation::proto_chunk::GenerationCache;
 use rayon::prelude::*;
-use std::sync::atomic::Ordering::Relaxed;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, RwLock, Weak};
 use std::{
     collections::{BTreeMap, HashMap},
     sync::atomic::Ordering,
 };
 use tracing::{debug, error, info, trace, warn};
+
+// Diagnostic IDs never participate in save scheduling or queue association.
+static SAVE_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 mod active_chunks;
 mod block_entity_storage;
@@ -1988,8 +1991,18 @@ impl World {
                 {
                     let world = self.clone();
                     let metadata_server = server.clone();
+                    let request_id = SAVE_REQUEST_ID.fetch_add(1, Relaxed);
+                    let cycle = level_time.world_age;
+                    world.log_save_request(
+                        "autosave_scheduled",
+                        request_id,
+                        "autosave",
+                        Some(cycle),
+                    );
                     server.spawn_task(async move {
-                        world.save().await;
+                        world
+                            .save_with_lineage(request_id, "autosave", Some(cycle))
+                            .await;
                         if world.dimension.minecraft_name == Dimension::OVERWORLD.minecraft_name {
                             // The shared root metadata belongs to the overworld autosave.
                             // Its synchronous, fsynced writer must not block a Tokio worker.
@@ -7355,6 +7368,32 @@ impl World {
     }
 
     pub async fn save(&self) {
+        self.save_with_lineage(SAVE_REQUEST_ID.fetch_add(1, Relaxed), "external", None)
+            .await;
+    }
+
+    fn log_save_request(
+        &self,
+        kind: &'static str,
+        request_id: u64,
+        origin: &'static str,
+        cycle: Option<i64>,
+    ) {
+        debug!(
+            target: "pumpkin_save_lineage",
+            kind,
+            request_id,
+            world = %self.level.level_folder.dim_folder.display(),
+            world_name = self.get_world_name(),
+            dimension = self.dimension.minecraft_name,
+            origin,
+            ?cycle,
+            "save_lineage"
+        );
+    }
+
+    async fn save_with_lineage(&self, request_id: u64, origin: &'static str, cycle: Option<i64>) {
+        self.log_save_request("request_begin", request_id, origin, cycle);
         self.save_dragon_fight().await;
         let entity_storage = self.entity_storage_lock.lock().await;
         let entities = self.entities.load_full();
@@ -7395,9 +7434,13 @@ impl World {
             }
         }
 
+        // This remains an observation-only edge: overlapping/coalesced requests
+        // cannot be attributed to a batch by these diagnostics.
+        self.log_save_request("request_publish_begin", request_id, origin, cycle);
         self.level
             .should_save
             .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.log_save_request("request_published", request_id, origin, cycle);
         self.level.level_channel.notify();
 
         let mut save_event = crate::plugin::api::events::world::world_save::WorldSaveEvent::new(
@@ -7406,6 +7449,7 @@ impl World {
         if let Some(server) = self.server.upgrade() {
             server.plugin_manager.fire(&server, &mut save_event).await;
         }
+        self.log_save_request("request_finished", request_id, origin, cycle);
     }
 
     pub fn set_custom_data(&self, namespace: &str, key: &str, value: pumpkin_nbt::tag::NbtTag) {
@@ -8214,5 +8258,276 @@ mod tests {
             GameRuleValue::Int(v) => assert_eq!(*v, 20),
             GameRuleValue::Bool(_) => panic!("expected int"),
         }
+    }
+}
+
+#[cfg(test)]
+mod save_lineage_tests {
+    use crate::{data::VanillaData, server::Server};
+    use pumpkin_config::{AdvancedConfiguration, BasicConfiguration, TelemetryConfig};
+    use pumpkin_data::dimension::Dimension;
+    use pumpkin_util::{math::vector2::Vector2, world_seed::Seed};
+    use pumpkin_world::{
+        chunk::{ChunkData, io::Dirtiable},
+        chunk_system::{Chunk, HashMapType, worker_logic::io_write_work},
+    };
+    use std::{
+        io::Write,
+        sync::{Arc, Mutex, atomic::Ordering::Relaxed},
+        time::Duration,
+    };
+    use tracing_subscriber::{EnvFilter, layer::SubscriberExt};
+
+    #[derive(Clone, Default)]
+    struct Console(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Console {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Console {
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    async fn until(console: &Console, predicate: impl Fn(&str) -> bool) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if predicate(&console.text()) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    fn matching<'a>(text: &'a str, kind: &str, world: &str) -> Vec<&'a str> {
+        text.lines()
+            .filter(|line| {
+                line.contains(&format!("kind=\"{kind}\""))
+                    && line.contains(&format!("world={world} "))
+            })
+            .collect()
+    }
+
+    fn span_fields<'a>(line: &'a str, name: &str) -> &'a str {
+        line.split_once(&format!("{name}{{"))
+            .unwrap()
+            .1
+            .split_once('}')
+            .unwrap()
+            .0
+    }
+
+    #[tokio::test]
+    async fn save_lineage_console_keeps_world_batch_retry_and_autosave_context() {
+        // Global capture is intentional: autosave tasks and the dedicated
+        // scheduler threads must use the same console subscriber as deployment.
+        // Run this focused test in its own process (see preparation handoff).
+        let console = Console::default();
+        let writer = console.clone();
+        let subscriber = tracing_subscriber::registry()
+            .with(EnvFilter::new("info,pumpkin_save_lineage=debug"))
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(move || writer.clone())
+                    .with_ansi(false)
+                    .with_target(false)
+                    .without_time(),
+            );
+        tracing::subscriber::set_global_default(subscriber).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let basic = BasicConfiguration {
+            default_level_name: directory.path().to_string_lossy().into_owned(),
+            seed: Seed(0),
+            allow_nether: true,
+            allow_end: false,
+            ..BasicConfiguration::default()
+        };
+        let mut advanced = AdvancedConfiguration::default();
+        advanced.world.autosave_ticks = 2;
+        advanced.plugins.enabled = false;
+        advanced.networking.bedrock.online_mode = false;
+        advanced.networking.java.online_mode = false;
+        let data = VanillaData {
+            banned_ip_list: std::sync::RwLock::default(),
+            banned_player_list: std::sync::RwLock::default(),
+            operator_config: std::sync::RwLock::default(),
+            user_cache: std::sync::RwLock::default(),
+            whitelist_config: std::sync::RwLock::default(),
+        };
+        let server = Server::new(
+            basic,
+            advanced,
+            TelemetryConfig::default(),
+            data,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        let worlds = [
+            server.get_world_from_dimension(&Dimension::OVERWORLD),
+            server.get_world_from_dimension(&Dimension::THE_NETHER),
+        ];
+        let names: Vec<_> = worlds
+            .iter()
+            .map(|w| w.level.level_folder.dim_folder.display().to_string())
+            .collect();
+        for world in &worlds {
+            world.level_time.lock().unwrap().world_age = 1;
+            world.tick_environment();
+        }
+        until(&console, |text| {
+            names.iter().all(|name| {
+                !matching(text, "request_finished", name).is_empty()
+                    && !matching(text, "request_consumed", name).is_empty()
+                    && !matching(text, "no_batch", name).is_empty()
+            })
+        })
+        .await;
+        let text = console.text();
+        let mut ids = Vec::new();
+        for name in &names {
+            let scheduled = matching(&text, "autosave_scheduled", name);
+            assert_eq!(scheduled.len(), 1);
+            let id = scheduled[0]
+                .split_whitespace()
+                .find(|f| f.starts_with("request_id="))
+                .unwrap();
+            ids.push(id.to_string());
+            for kind in [
+                "request_begin",
+                "request_publish_begin",
+                "request_published",
+                "request_finished",
+            ] {
+                let events = matching(&text, kind, name);
+                assert_eq!(events.len(), 1);
+                assert!(events[0].contains(id));
+                assert!(events[0].contains("origin=\"autosave\""));
+                assert!(events[0].contains("cycle=Some(2)"));
+            }
+            assert!(
+                matching(&text, "no_batch", name)
+                    .iter()
+                    .all(|line| !line.contains("batch="))
+            );
+        }
+        assert_ne!(ids[0], ids[1]);
+
+        // Actual writer futures use two worlds with overlapping IO, and two FIFO
+        // receives in each. A failed create must retain batch 1 and its barrier.
+        let mut writers = Vec::new();
+        let mut locks = Vec::new();
+        let temporary = worlds[0].level.level_folder.region_folder.join("r.0.0.tmp");
+        tokio::fs::create_dir(&temporary).await.unwrap();
+        for world in &worlds {
+            let lock = Arc::new((
+                Mutex::new(HashMapType::default()),
+                tokio::sync::Notify::new(),
+            ));
+            let (send, recv) = tokio::sync::mpsc::channel(2);
+            for x in [0, 32] {
+                let pos = Vector2::new(x, 0);
+                let chunk = Arc::new(ChunkData::empty(x, 0));
+                chunk.mark_dirty(true);
+                lock.0.lock().unwrap().insert(pos, 1);
+                send.send(vec![(pos, Chunk::Level(chunk))]).await.unwrap();
+            }
+            drop(send);
+            writers.push(tokio::spawn(io_write_work(
+                recv,
+                world.level.clone(),
+                lock.clone(),
+            )));
+            locks.push(lock);
+        }
+        until(&console, |text| {
+            !matching(text, "write_failed", &names[0]).is_empty()
+        })
+        .await;
+        let failed = console.text();
+        assert!(matching(&failed, "temp_open", &names[0]).is_empty());
+        assert!(matching(&failed, "complete", &names[0]).is_empty());
+        assert_eq!(
+            locks[0].0.lock().unwrap().get(&Vector2::new(0, 0)),
+            Some(&1)
+        );
+        tokio::fs::remove_dir(&temporary).await.unwrap();
+        for writer in writers {
+            tokio::time::timeout(Duration::from_secs(10), writer)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        let text = console.text();
+        for (name, world) in names.iter().zip(&worlds) {
+            for kind in ["receive", "complete"] {
+                let events = matching(&text, kind, name);
+                assert_eq!(events.len(), 2);
+                assert!(events[0].contains("batch=1"));
+                assert!(events[1].contains("batch=2"));
+            }
+            for kind in ["region_begin", "temp_open", "commit"] {
+                let events = matching(&text, kind, name);
+                assert_eq!(
+                    events.len(),
+                    if kind == "region_begin" && name == &names[0] {
+                        3
+                    } else {
+                        2
+                    }
+                );
+                assert!(events.iter().all(|line| {
+                    span_fields(line, "terrain_batch").starts_with(&format!(
+                        "world={name} dimension={:?} batch=",
+                        world.dimension.minecraft_name
+                    ))
+                }));
+                for (region, batch) in [("r.0.0", "batch=1"), ("r.1.0", "batch=2")] {
+                    assert!(
+                        events
+                            .iter()
+                            .any(|line| line.contains(region) && line.contains(batch))
+                    );
+                }
+            }
+        }
+        for kind in ["write_failed", "retry"] {
+            let events = matching(&text, kind, &names[0]);
+            assert_eq!(events.len(), 1);
+            assert!(events[0].contains("batch=1"));
+        }
+        assert!(locks.iter().all(|lock| lock.0.lock().unwrap().is_empty()));
+        let direct = Arc::new(ChunkData::empty(64, 0));
+        direct.mark_dirty(true);
+        worlds[0]
+            .level
+            .write_chunks(vec![(Vector2::new(64, 0), direct)])
+            .await
+            .unwrap();
+        let text = console.text();
+        let direct_temp = matching(&text, "temp_open", &names[0])
+            .into_iter()
+            .find(|line| line.contains("r.2.0.tmp"))
+            .unwrap();
+        assert_eq!(
+            span_fields(direct_temp, "direct_terrain_write"),
+            format!(
+                "world={} dimension={:?} origin=\"direct\"",
+                names[0], worlds[0].dimension.minecraft_name
+            )
+        );
+        assert!(!direct_temp.contains("batch="));
+        server.shutdown().await;
     }
 }
