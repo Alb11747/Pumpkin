@@ -111,7 +111,8 @@ struct AnvilChunkMetadata {
 }
 
 pub struct AnvilChunkFile<S: SingleChunkDataSerializer> {
-    chunks_data: [Option<AnvilChunkMetadata>; CHUNK_COUNT],
+    // Keep the region table out of the by-value loader's async stack frames.
+    chunks_data: Box<[Option<AnvilChunkMetadata>]>,
     end_sector: u32,
     write_action: Mutex<WriteAction>,
 
@@ -375,7 +376,7 @@ impl<S: SingleChunkDataSerializer> AnvilChunkFile<S> {
         let mut header = Vec::with_capacity(SECTOR_BYTES * 2);
 
         // Location Table
-        for metadata in &self.chunks_data {
+        for metadata in &*self.chunks_data {
             if let Some(chunk) = metadata {
                 let sector_count = chunk.serialized_data.sector_count();
                 header.put_u32((chunk.file_sector_offset << 8) | sector_count);
@@ -385,7 +386,7 @@ impl<S: SingleChunkDataSerializer> AnvilChunkFile<S> {
         }
 
         // Timestamp Table
-        for metadata in &self.chunks_data {
+        for metadata in &*self.chunks_data {
             if let Some(chunk) = metadata {
                 header.put_u32(chunk.timestamp);
             } else {
@@ -458,7 +459,7 @@ impl<S: SingleChunkDataSerializer> AnvilChunkFile<S> {
         let mut current_sector: u32 = 2;
 
         // Location Table
-        for metadata in &self.chunks_data {
+        for metadata in &*self.chunks_data {
             if let Some(chunk) = metadata {
                 let sector_count = chunk.serialized_data.sector_count();
                 header.put_u32((current_sector << 8) | sector_count);
@@ -469,7 +470,7 @@ impl<S: SingleChunkDataSerializer> AnvilChunkFile<S> {
         }
 
         // Timestamp Table
-        for metadata in &self.chunks_data {
+        for metadata in &*self.chunks_data {
             if let Some(chunk) = metadata {
                 header.put_u32(chunk.timestamp);
             } else {
@@ -491,11 +492,10 @@ impl<S: SingleChunkDataSerializer> AnvilChunkFile<S> {
     }
 }
 
-#[expect(clippy::large_stack_arrays)]
 impl<S: SingleChunkDataSerializer> Default for AnvilChunkFile<S> {
     fn default() -> Self {
         Self {
-            chunks_data: [const { None }; CHUNK_COUNT],
+            chunks_data: std::iter::repeat_with(|| None).take(CHUNK_COUNT).collect(),
             write_action: Mutex::new(WriteAction::Pass),
             // Two sectors for offset + timestamp
             end_sector: 2,
