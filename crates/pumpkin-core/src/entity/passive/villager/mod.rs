@@ -2411,32 +2411,37 @@ mod tests {
 
     use super::*;
 
-    #[tokio::test]
-    async fn successful_trade_player_click_returns_and_preserves_payment() {
-        use crate::data::VanillaData;
-        use crate::net::{
-            ClientPlatform, GameProfile, PacketRateLimiter, PlayerConfig,
-            java::{JavaClient, pending::PendingConnection},
-        };
-        use crate::server::Server;
-        use arc_swap::ArcSwap;
-        use pumpkin_config::{AdvancedConfiguration, BasicConfiguration, TelemetryConfig};
-        use pumpkin_data::dimension::Dimension;
-        use pumpkin_inventory::Inventory;
-        use pumpkin_inventory::screen_handler::ScreenHandler;
-        use pumpkin_protocol::codec::item_stack_seralizer::{
-            ItemStackSerializer, OptionalItemStackHash,
-        };
-        use pumpkin_protocol::java::client::play::MerchantOffer;
-        use pumpkin_protocol::ser::NetworkWriteExt;
-        use pumpkin_protocol::{
-            ConnectionState,
-            java::server::play::{SClickSlot, SlotActionType},
-        };
-        use pumpkin_util::{GameMode, world_seed::Seed};
-        use std::{borrow::Cow, num::NonZero, sync::mpsc, time::Duration};
-        use tokio::net::{TcpListener, TcpStream};
+    use crate::data::VanillaData;
+    use crate::net::{
+        ClientPlatform, GameProfile, PacketRateLimiter, PlayerConfig,
+        java::{JavaClient, pending::PendingConnection},
+    };
+    use crate::server::Server;
+    use arc_swap::ArcSwap;
+    use pumpkin_config::{AdvancedConfiguration, BasicConfiguration, TelemetryConfig};
+    use pumpkin_data::dimension::Dimension;
+    use pumpkin_inventory::Inventory;
+    use pumpkin_inventory::screen_handler::ScreenHandler;
+    use pumpkin_protocol::codec::item_stack_seralizer::{
+        ItemStackSerializer, OptionalItemStackHash,
+    };
+    use pumpkin_protocol::java::client::play::MerchantOffer;
+    use pumpkin_protocol::ser::NetworkWriteExt;
+    use pumpkin_protocol::{
+        ConnectionState,
+        java::server::play::{SClickSlot, SlotActionType},
+    };
+    use pumpkin_util::{GameMode, world_seed::Seed};
+    use std::{borrow::Cow, num::NonZero, sync::mpsc, time::Duration};
+    use tokio::net::{TcpListener, TcpStream};
 
+    async fn trade_callback_player() -> (
+        tempfile::TempDir,
+        Arc<Server>,
+        TcpStream,
+        Arc<Player>,
+        Arc<World>,
+    ) {
         let directory = tempfile::tempdir().unwrap();
         let basic = BasicConfiguration {
             default_level_name: directory.path().to_string_lossy().into_owned(),
@@ -2476,7 +2481,7 @@ mod tests {
             TcpStream::connect(listener.local_addr().unwrap()),
             listener.accept()
         );
-        let _peer = peer.unwrap();
+        let peer = peer.unwrap();
         let (stream, address) = accepted.unwrap();
         let pending = PendingConnection::new(
             stream,
@@ -2506,6 +2511,36 @@ mod tests {
         ));
         player.get_entity().set_pos(Vector3::new(1.5, 80.0, 0.5));
         world.add_player(&player).unwrap();
+        (directory, server, peer, player, world)
+    }
+
+    fn trade_callback_packet(revision: u32) -> SClickSlot {
+        // ItemStackHash fields are private; construct the actual 26.3 hash bytes
+        // for component-free client predictions through its public decoder.
+        let item_hash = |item: &Item, count: i32| {
+            let mut bytes = Vec::new();
+            bytes.put_bool(true).unwrap();
+            bytes.put_var_int(&VarInt(i32::from(item.id))).unwrap();
+            bytes.put_var_int(&VarInt(count)).unwrap();
+            bytes.put_var_int(&VarInt(0)).unwrap();
+            bytes.put_var_int(&VarInt(0)).unwrap();
+            OptionalItemStackHash::read(&mut bytes.as_slice()).unwrap()
+        };
+        SClickSlot {
+            sync_id: VarInt(1),
+            revision: VarInt(revision as i32),
+            slot: 2,
+            button: SClickSlot::BUTTON_LEFT,
+            mode: SlotActionType::Pickup,
+            length_of_array: VarInt(1),
+            array_of_changed_slots: vec![(0, item_hash(&Item::EMERALD, 63))],
+            carried_item: item_hash(&Item::REDSTONE, 2),
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_trade_player_click_returns_and_preserves_payment() {
+        let (_directory, server, _peer, player, world) = trade_callback_player().await;
         let villager = VillagerEntity::new(Entity::new(
             world.clone(),
             Vector3::new(0.5, 80.0, 0.5),
@@ -2526,7 +2561,7 @@ mod tests {
         let inventory = player.inventory();
         inventory.set_stack(0, ItemStack::new(64, &Item::EMERALD));
         let screen = villager
-            .create_screen_handler(1, &inventory, player.as_ref())
+            .create_screen_handler(1, inventory, player.as_ref())
             .unwrap();
         *player.current_screen_handler.lock().unwrap() = screen.clone();
         screen
@@ -2545,27 +2580,7 @@ mod tests {
             );
             handler.get_behaviour().revision.load(Ordering::Relaxed)
         };
-        // ItemStackHash fields are private; construct the actual 26.3 hash bytes
-        // for component-free client predictions through its public decoder.
-        let item_hash = |item: &Item, count: i32| {
-            let mut bytes = Vec::new();
-            bytes.put_bool(true).unwrap();
-            bytes.put_var_int(&VarInt(i32::from(item.id))).unwrap();
-            bytes.put_var_int(&VarInt(count)).unwrap();
-            bytes.put_var_int(&VarInt(0)).unwrap();
-            bytes.put_var_int(&VarInt(0)).unwrap();
-            OptionalItemStackHash::read(&mut bytes.as_slice()).unwrap()
-        };
-        let packet = SClickSlot {
-            sync_id: VarInt(1),
-            revision: VarInt(revision as i32),
-            slot: 2,
-            button: SClickSlot::BUTTON_LEFT,
-            mode: SlotActionType::Pickup,
-            length_of_array: VarInt(1),
-            array_of_changed_slots: vec![(0, item_hash(&Item::EMERALD, 63))],
-            carried_item: item_hash(&Item::REDSTONE, 2),
-        };
+        let packet = trade_callback_packet(revision);
         // Enter the public packet handler, including validity/events/hash
         // reconciliation. Only read the screen after that call has returned.
         // A standard thread lets the old recursive lock fail within five
