@@ -120,6 +120,86 @@ def merchant_negative(target):
     STATE.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8", newline="\n")
 
 
+# Each focused command must run the expected named tests; zero-test success fails.
+POSITIVE_GATES = {
+    "save-scheduler": [
+        ("pumpkin-world", "chunk_system::schedule::save_lineage_tests::save_lineage_fifo_counts_unload_save_and_no_batch_per_world", [
+            "chunk_system::schedule::save_lineage_tests::save_lineage_fifo_counts_unload_save_and_no_batch_per_world",
+        ]),
+    ],
+    "save-console": [
+        ("pumpkin-core", "world::save_lineage_tests::save_lineage_console_keeps_world_batch_retry_and_autosave_context", [
+            "world::save_lineage_tests::save_lineage_console_keeps_world_batch_retry_and_autosave_context",
+        ]),
+    ],
+    "intangible": [
+        ("pumpkin-protocol", "codec::data_component::tests::intangible_projectile_", [
+            "codec::data_component::tests::intangible_projectile_writes_compound_and_preserves_following_byte",
+            "codec::data_component::tests::intangible_projectile_accepts_nonempty_compound",
+            "codec::data_component::tests::intangible_projectile_rejects_absent_truncated_and_noncompound_nbt",
+        ]),
+    ],
+    "charged": [
+        ("pumpkin-protocol", "codec::data_component::tests::charged_projectiles_", [
+            "codec::data_component::tests::charged_projectiles_creative_arrow_has_exact_template_wire",
+            "codec::data_component::tests::charged_projectiles_preserve_creative_firework_nested_components",
+            "codec::data_component::tests::charged_projectiles_accept_65_and_1024_and_reject_1025",
+            "codec::data_component::tests::charged_projectiles_preserve_count_components_and_saved_nbt",
+            "codec::data_component::tests::charged_projectiles_reject_empty_templates_and_invalid_lengths",
+        ]),
+    ],
+    "preservation": [
+        ("pumpkin-protocol", "java::client::play::merchant_offers::tests::merchant_stock_flag_encodes_and_decodes_like_vanilla", [
+            "java::client::play::merchant_offers::tests::merchant_stock_flag_encodes_and_decodes_like_vanilla",
+        ]),
+        ("pumpkin-protocol", "java::client::play::set_equipment::tests::charged_crossbow_equipment_uses_nonempty_item_templates_for_26_3", [
+            "java::client::play::set_equipment::tests::charged_crossbow_equipment_uses_nonempty_item_templates_for_26_3",
+        ]),
+        ("pumpkin-core", "world::tests::automatic_save_persists_live_clock_and_rules_only_when_enabled", [
+            "world::tests::automatic_save_persists_live_clock_and_rules_only_when_enabled",
+        ]),
+    ],
+}
+
+
+def verify_positive_output(output, exit_code, tests):
+    lines = output.splitlines()
+    count = len(tests)
+    running = f"running {count} test" + ("s" if count != 1 else "")
+    passed = [match.group(1) for line in lines
+              if (match := re.fullmatch(r"test (.+) \.\.\. ok", line))]
+    summary = rf"^test result: ok\. {count} passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;"
+    if (exit_code != 0 or lines.count(running) != 1
+            or len(passed) != count or set(passed) != set(tests)
+            or re.search(summary, output, re.MULTILINE) is None):
+        raise ValueError("Focused positive gate did not pass the exact named tests/count")
+
+
+def positive(target, group):
+    cases = []
+    for index, (package, selector, tests) in enumerate(POSITIVE_GATES[group]):
+        log = TEMP / f"positive-{group}-{index}-{target}.log"
+        args = ["cargo", "+" + os.environ["RUST_TOOLCHAIN"], "test", "--locked",
+                "--release", "--target", target, "-p", package, "--lib", selector, "--"]
+        if len(tests) == 1:
+            args.append("--exact")
+        args.extend(["--color", "never"])
+        # The console gate gets a separate test process: its global subscriber
+        # must cover autosave tasks and scheduler threads together.
+        with log.open("w", encoding="utf-8", newline="\n") as stream:
+            result = subprocess.run(args, cwd=ROOT / "engine", stdout=stream,
+                                    stderr=subprocess.STDOUT, timeout=1800, check=False)
+        output = log.read_text(encoding="utf-8")
+        print(output, end="")
+        verify_positive_output(output, result.returncode, tests)
+        cases.append({"package": package, "filter": selector, "tests": tests,
+                      "count": len(tests), "exitCode": result.returncode,
+                      "logFile": log.name, "logSha256": sha256(log)})
+    state = json.loads(STATE.read_text(encoding="utf-8"))
+    state.setdefault("positiveGates", {})[group] = {"cases": cases}
+    STATE.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8", newline="\n")
+
+
 def verify_engine():
     state = json.loads(STATE.read_text(encoding="utf-8"))
     if git_source(ROOT / "engine", os.environ["ENGINE_SHA"]) != state["engine"]:
@@ -163,4 +243,4 @@ def manifest(target):
 if __name__ == "__main__":
     mode, *args = sys.argv[1:]
     {"prepare": prepare, "autosave_negative": autosave_negative, "merchant_negative": merchant_negative, "verify_engine": verify_engine,
-     "collect": collect, "manifest": manifest}[mode](*args)
+     "collect": collect, "manifest": manifest, "positive": positive}[mode](*args)

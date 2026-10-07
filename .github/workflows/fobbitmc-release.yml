@@ -175,6 +175,26 @@ jobs:
           grep -Fx 'running 1 test' "$LOG"
           grep -Fx "test $TEST ... ok" "$LOG"
           grep -E '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$LOG"
+      - name: Prove save-lineage scheduler counts and FIFO context
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/fobbitmc-release-target
+        run: python build-control/.github/scripts/fobbitmc_release.py positive '${{ matrix.target }}' save-scheduler
+      - name: Prove save-lineage console context in its own test process
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/fobbitmc-release-target
+        run: python build-control/.github/scripts/fobbitmc_release.py positive '${{ matrix.target }}' save-console
+      - name: Prove all three named intangible-projectile wire tests
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/fobbitmc-release-target
+        run: python build-control/.github/scripts/fobbitmc_release.py positive '${{ matrix.target }}' intangible
+      - name: Prove all five named charged-projectile wire tests
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/fobbitmc-release-target
+        run: python build-control/.github/scripts/fobbitmc_release.py positive '${{ matrix.target }}' charged
+      - name: Prove named merchant stock equipment and autosave preservation gates
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/fobbitmc-release-target
+        run: python build-control/.github/scripts/fobbitmc_release.py positive '${{ matrix.target }}' preservation
       - name: Build optimized engine
         working-directory: engine
         env:
