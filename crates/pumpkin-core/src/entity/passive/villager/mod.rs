@@ -2412,6 +2412,210 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn successful_trade_player_click_returns_and_preserves_payment() {
+        use crate::data::VanillaData;
+        use crate::net::{
+            ClientPlatform, GameProfile, PacketRateLimiter, PlayerConfig,
+            java::{JavaClient, pending::PendingConnection},
+        };
+        use crate::server::Server;
+        use arc_swap::ArcSwap;
+        use pumpkin_config::{AdvancedConfiguration, BasicConfiguration, TelemetryConfig};
+        use pumpkin_data::dimension::Dimension;
+        use pumpkin_inventory::Inventory;
+        use pumpkin_inventory::screen_handler::ScreenHandler;
+        use pumpkin_protocol::codec::item_stack_seralizer::{
+            ItemStackSerializer, OptionalItemStackHash,
+        };
+        use pumpkin_protocol::java::client::play::MerchantOffer;
+        use pumpkin_protocol::ser::NetworkWriteExt;
+        use pumpkin_protocol::{
+            ConnectionState,
+            java::server::play::{SClickSlot, SlotActionType},
+        };
+        use pumpkin_util::{GameMode, world_seed::Seed};
+        use std::{borrow::Cow, num::NonZero, sync::mpsc, time::Duration};
+        use tokio::net::{TcpListener, TcpStream};
+
+        let directory = tempfile::tempdir().unwrap();
+        let basic = BasicConfiguration {
+            default_level_name: directory.path().to_string_lossy().into_owned(),
+            seed: Seed(0),
+            allow_nether: false,
+            allow_end: false,
+            allow_chat_reports: false,
+            ..BasicConfiguration::default()
+        };
+        let mut advanced = AdvancedConfiguration::default();
+        advanced.networking.bedrock.online_mode = false;
+        advanced.networking.java.online_mode = false;
+        let view_distance = NonZero::new(2).unwrap();
+        advanced.networking.java.view_distance = view_distance;
+        advanced.networking.java.simulation_distance = view_distance;
+        let data = VanillaData {
+            banned_ip_list: std::sync::RwLock::default(),
+            banned_player_list: std::sync::RwLock::default(),
+            operator_config: std::sync::RwLock::default(),
+            user_cache: std::sync::RwLock::default(),
+            whitelist_config: std::sync::RwLock::default(),
+        };
+        let server = Server::new(
+            basic,
+            advanced,
+            TelemetryConfig::default(),
+            data,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        let world = server.get_world_from_dimension(&Dimension::OVERWORLD);
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let (peer, accepted) = tokio::join!(
+            TcpStream::connect(listener.local_addr().unwrap()),
+            listener.accept()
+        );
+        let _peer = peer.unwrap();
+        let (stream, address) = accepted.unwrap();
+        let pending = PendingConnection::new(
+            stream,
+            address,
+            0,
+            PacketRateLimiter::new(false, 0.0, 0.0),
+            Arc::downgrade(&server),
+        );
+        let profile = GameProfile {
+            id: Uuid::new_v4(),
+            name: "TradeCallbackTest".to_owned(),
+            properties: ArcSwap::from_pointee(Vec::new()),
+            profile_actions: None,
+        };
+        let config = PlayerConfig {
+            view_distance,
+            ..PlayerConfig::default()
+        };
+        let client = JavaClient::from_pending(pending, profile.clone(), config.clone());
+        client.connection_state.store(ConnectionState::Play);
+        let player = Arc::new(Player::new(
+            Arc::new(ClientPlatform::Java(client)),
+            profile,
+            config,
+            &world,
+            GameMode::Survival,
+        ));
+        player.get_entity().set_pos(Vector3::new(1.5, 80.0, 0.5));
+        world.add_player(&player).unwrap();
+        let villager = VillagerEntity::new(Entity::new(
+            world.clone(),
+            Vector3::new(0.5, 80.0, 0.5),
+            &EntityType::VILLAGER,
+        ));
+        villager.offers.lock().unwrap().push(MerchantOffer {
+            base_cost_a: ItemStackSerializer(Cow::Owned(ItemStack::new(1, &Item::EMERALD))),
+            output: ItemStackSerializer(Cow::Owned(ItemStack::new(2, &Item::REDSTONE))),
+            cost_b: None,
+            reward_exp: false,
+            uses: 0,
+            max_uses: 12,
+            xp: 2,
+            special_price: 0,
+            price_multiplier: 0.0,
+            demand: 0,
+        });
+        let inventory = player.inventory();
+        inventory.set_stack(0, ItemStack::new(64, &Item::EMERALD));
+        let screen = villager
+            .create_screen_handler(1, &inventory, player.as_ref())
+            .unwrap();
+        *player.current_screen_handler.lock().unwrap() = screen.clone();
+        screen
+            .lock()
+            .unwrap()
+            .as_any_mut()
+            .downcast_mut::<MerchantScreenHandler>()
+            .unwrap()
+            .set_selected_offer(0);
+
+        let revision = {
+            let handler = screen.lock().unwrap();
+            assert!(
+                handler.can_use(player.as_ref()),
+                "fixture player must be within trading range"
+            );
+            handler.get_behaviour().revision.load(Ordering::Relaxed)
+        };
+        // ItemStackHash fields are private; construct the actual 26.3 hash bytes
+        // for component-free client predictions through its public decoder.
+        let item_hash = |item: &Item, count: i32| {
+            let mut bytes = Vec::new();
+            bytes.put_bool(true).unwrap();
+            bytes.put_var_int(&VarInt(i32::from(item.id))).unwrap();
+            bytes.put_var_int(&VarInt(count)).unwrap();
+            bytes.put_var_int(&VarInt(0)).unwrap();
+            bytes.put_var_int(&VarInt(0)).unwrap();
+            OptionalItemStackHash::read(&mut bytes.as_slice()).unwrap()
+        };
+        let packet = SClickSlot {
+            sync_id: VarInt(1),
+            revision: VarInt(revision as i32),
+            slot: 2,
+            button: SClickSlot::BUTTON_LEFT,
+            mode: SlotActionType::Pickup,
+            length_of_array: VarInt(1),
+            array_of_changed_slots: vec![(0, item_hash(&Item::EMERALD, 63))],
+            carried_item: item_hash(&Item::REDSTONE, 2),
+        };
+        // Enter the public packet handler, including validity/events/hash
+        // reconciliation. Only read the screen after that call has returned.
+        // A standard thread lets the old recursive lock fail within five
+        // seconds instead of blocking the async test executor indefinitely.
+        let (sent, received) = mpsc::channel();
+        let trading_player = player.clone();
+        let trading_server = server.clone();
+        let worker = std::thread::spawn(move || {
+            trading_player.on_slot_click(packet, &trading_server);
+            let screen = trading_player
+                .current_screen_handler
+                .lock()
+                .unwrap()
+                .clone();
+            let screen = screen.lock().unwrap();
+            let handler = screen
+                .as_any()
+                .downcast_ref::<MerchantScreenHandler>()
+                .unwrap();
+            let behaviour = handler.get_behaviour();
+            let cursor = behaviour.cursor_stack.lock().unwrap().clone();
+            let payment = handler.inventory.get_stack(0);
+            sent.send((cursor, payment, handler.offers[0].uses))
+                .unwrap();
+        });
+        let (cursor, remaining_payment, handler_uses) =
+            match received.recv_timeout(Duration::from_secs(5)) {
+                Ok(completed) => {
+                    worker.join().unwrap();
+                    completed
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    panic!("successful trade player click must return after its callback")
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    worker.join().unwrap();
+                    panic!("trade worker exited without returning payment")
+                }
+            };
+        assert_eq!(cursor.item.id, Item::REDSTONE.id);
+        assert_eq!(cursor.item_count, 2);
+        assert_eq!(remaining_payment.item.id, Item::EMERALD.id);
+        assert_eq!(remaining_payment.item_count, 63);
+        assert_eq!(handler_uses, 1);
+        assert_eq!(villager.offers.lock().unwrap()[0].uses, 1);
+        assert_eq!(villager.xp.load(Ordering::Relaxed), 2);
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn vanilla_villager_import_keeps_profession_offers_pois_and_restock_state() {
         use crate::block::registry::BlockRegistry;
         use crate::entity::NBTStorage;
