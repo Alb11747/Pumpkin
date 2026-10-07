@@ -2225,7 +2225,7 @@ dependencies = [
 [[package]]
 name = "pumpkin-auth"
 version = "0.2.0+26.3-26.51"
-source = "git+https://github.com/Alb11747/Pumpkin.git?rev=a35b075c6d11503e4f93704dfd185d6e584b183d#a35b075c6d11503e4f93704dfd185d6e584b183d"
+source = "git+https://github.com/Alb11747/Pumpkin.git?rev=70d97c2de9dc9c92e9816c6b309b378971534b07#70d97c2de9dc9c92e9816c6b309b378971534b07"
 dependencies = [
  "base64 0.23.1",
  "crypto-bigint",
@@ -2246,7 +2246,7 @@ dependencies = [
 [[package]]
 name = "pumpkin-codecs"
 version = "0.2.0+26.3-26.51"
-source = "git+https://github.com/Alb11747/Pumpkin.git?rev=a35b075c6d11503e4f93704dfd185d6e584b183d#a35b075c6d11503e4f93704dfd185d6e584b183d"
+source = "git+https://github.com/Alb11747/Pumpkin.git?rev=70d97c2de9dc9c92e9816c6b309b378971534b07#70d97c2de9dc9c92e9816c6b309b378971534b07"
 dependencies = [
  "serde_json",
  "tracing",
@@ -2255,7 +2255,7 @@ dependencies = [
 [[package]]
 name = "pumpkin-command"
 version = "0.2.0+26.3-26.51"
-source = "git+https://github.com/Alb11747/Pumpkin.git?rev=a35b075c6d11503e4f93704dfd185d6e584b183d#a35b075c6d11503e4f93704dfd185d6e584b183d"
+source = "git+https://github.com/Alb11747/Pumpkin.git?rev=70d97c2de9dc9c92e9816c6b309b378971534b07#70d97c2de9dc9c92e9816c6b309b378971534b07"
 dependencies = [
  "pumpkin-codecs",
  "pumpkin-data",
@@ -2271,7 +2271,7 @@ dependencies = [
 [[package]]
 name = "pumpkin-config"
 version = "0.2.0+26.3-26.51"
-source = "git+https://github.com/Alb11747/Pumpkin.git?rev=a35b075c6d11503e4f93704dfd185d6e584b183d#a35b075c6d11503e4f93704dfd185d6e584b183d"
+source = "git+https://github.com/Alb11747/Pumpkin.git?rev=70d97c2de9dc9c92e9816c6b309b378971534b07#70d97c2de9dc9c92e9816c6b309b378971534b07"
 dependencies = [
  "pumpkin-util",
  "rand 0.10.3",
@@ -2284,7 +2284,7 @@ dependencies = [
 [[package]]
 name = "pumpkin-core"
 version = "0.2.0+26.3-26.51"
-source = "git+https://github.com/Alb11747/Pumpkin.git?rev=a35b075c6d11503e4f93704dfd185d6e584b183d#a35b075c6d11503e4f93704dfd185d6e584b183d"
+source = "git+https://github.com/Alb11747/Pumpkin.git?rev=70d97c2de9dc9c92e9816c6b309b378971534b07#70d97c2de9dc9c92e9816c6b309b378971534b07"
 dependencies = [
  "aes 0.9.3",
  "arc-swap",
@@ -2348,7 +2348,7 @@ dependencies = [
 [[package]]
 name = "pumpkin-data"
 version = "0.2.0+26.3-26.51"
-source = "git+https://github.com/Alb11747/Pumpkin.git?rev=a35b075c6d11503e4f93704dfd185d6e584b183d#a35b075c6d11503e4f93704dfd185d6e584b183d"
+source = "git+https://github.com/Alb11747/Pumpkin.git?rev=70d97c2de9dc9c92e9816c6b309b378971534b07#70d97c2de9dc9c92e9816c6b309b378971534b07"
 dependencies = [
  "crc32c",
  "flate2",
@@ -2367,7 +2367,7 @@ dependencies = [
 [[package]]
 name = "pumpkin-gametest"
 version = "0.2.0+26.3-26.51"
-source = "git+https://github.com/Alb11747/Pumpkin.git?rev=a35b075c6d11503e4f93704dfd185d6e584b183d#a35b075c6d11503e4f93704dfd185d6e584b183d"
+source = "git+https://github.com/Alb11747/Pumpkin.git?rev=70d97c2de9dc9c92e9816c6b309b378971534b07#70d97c2de9dc9c92e9816c6b309b378971534b07"
 dependencies = [
  "async-trait",
  "pumpkin-data",
@@ -2383,7 +2383,7 @@ dependencies = [
 [[package]]
 name = "pumpkin-inventory"
 version = "0.2.0+26.3-26.51"
-source = "git+https://github.com/Alb11747/Pumpkin.git?rev=a35b075c6d11503e4f93704dfd185d6e584b183d#a35b075c6d11503e4f93704dfd185d6e584b183d"
+source = "git+https://github.com/Alb11747/Pumpkin.git?rev=70d97c2de9dc9c92e9816c6b309b378971534b07#70d97c2de9dc9c92e9816c6b309b378971534b07"
 dependencies = [
  "pumpkin-data",
  "pumpkin-nbt",
@@ -2398,7 +2398,7 @@ dependencies = [
 [[package]]
 name = "pumpkin-macros"
 version = "0.2.0+26.3-26.51"
-source = "git+https://github.com/Alb11747/Pumpkin.git?rev=a35b075c6d11503e4f93704dfd185d6e584b183d#a35b075c6d11503e4f93704dfd185d6e584b183d"
+source = "git+https://github.com/Alb11747/Pumpkin.git?rev=70d97c2de9dc9c92e9816c6b309b378971534b07#70d97c2de9dc9c92e9816c6b309b378971534b07"
 dependencies = [
  "heck",
  "proc-macro-error2",
@@ -2410,7 +2410,7 @@ dependencies = [
 [[package]]
 name = "pumpkin-nbt"
 version = "0.2.0+26.3-26.51"
-source = "git+https://github.com/Alb11747/Pumpkin.git?rev=a35b075c6d11503e4f93704dfd185d6e584b183d#a35b075c6d11503e4f93704dfd185d6e584b183d"
+source = "git+https://github.com/Alb11747/Pumpkin.git?rev=70d97c2de9dc9c92e9816c6b309b378971534b07#70d97c2de9dc9c92e9816c6b309b378971534b07"
 dependencies = [
  "bytes",
  "cesu8",
@@ -2424,7 +2424,7 @@ dependencies = [
 [[package]]
 name = "pumpkin-protocol"
 version = "0.2.0+26.3-26.51"
-source = "git+https://github.com/Alb11747/Pumpkin.git?rev=a35b075c6d11503e4f93704dfd185d6e584b183d#a35b075c6d11503e4f93704dfd185d6e584b183d"
+source = "git+https://github.com/Alb11747/Pumpkin.git?rev=70d97c2de9dc9c92e9816c6b309b378971534b07#70d97c2de9dc9c92e9816c6b309b378971534b07"
 dependencies = [
  "aes 0.9.3",
  "async-compression",
@@ -2449,7 +2449,7 @@ dependencies = [
 [[package]]
 name = "pumpkin-util"
 version = "0.2.0+26.3-26.51"
-source = "git+https://github.com/Alb11747/Pumpkin.git?rev=a35b075c6d11503e4f93704dfd185d6e584b183d#a35b075c6d11503e4f93704dfd185d6e584b183d"
+source = "git+https://github.com/Alb11747/Pumpkin.git?rev=70d97c2de9dc9c92e9816c6b309b378971534b07#70d97c2de9dc9c92e9816c6b309b378971534b07"
 dependencies = [
  "bytes",
  "colored",
@@ -2468,7 +2468,7 @@ dependencies = [
 [[package]]
 name = "pumpkin-world"
 version = "0.2.0+26.3-26.51"
-source = "git+https://github.com/Alb11747/Pumpkin.git?rev=a35b075c6d11503e4f93704dfd185d6e584b183d#a35b075c6d11503e4f93704dfd185d6e584b183d"
+source = "git+https://github.com/Alb11747/Pumpkin.git?rev=70d97c2de9dc9c92e9816c6b309b378971534b07#70d97c2de9dc9c92e9816c6b309b378971534b07"
 dependencies = [
  "arc-swap",
  "bitflags 2.13.2",
