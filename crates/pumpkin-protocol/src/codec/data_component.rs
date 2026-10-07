@@ -1729,12 +1729,19 @@ impl DataComponentCodec<Self> for EnchantmentGlintOverrideImpl {
 }
 
 impl DataComponentCodec<Self> for IntangibleProjectileImpl {
-    fn serialize(&self, _seq: &mut impl NetworkWriteExt) -> Result<(), WritingError> {
-        Ok(())
+    fn serialize(&self, seq: &mut impl NetworkWriteExt) -> Result<(), WritingError> {
+        // Empty-compound writer adapted from ToffyMTA's Pumpkin PR #3897.
+        // The 26.3 unit component uses the NBT-backed codec, not a zero-byte unit.
+        seq.write_nbt(NbtTag::Compound(pumpkin_nbt::compound::NbtCompound::new()))
     }
 
-    fn deserialize(_seq: &mut impl NetworkReadExt) -> Result<Self, ReadingError> {
-        Ok(Self)
+    fn deserialize(seq: &mut impl NetworkReadExt) -> Result<Self, ReadingError> {
+        match seq.get_nbt_with_version(&JavaMinecraftVersion::V_26_3)? {
+            Some(NbtTag::Compound(_)) => Ok(Self),
+            _ => Err(ReadingError::Message(
+                "Expected intangible projectile compound".into(),
+            )),
+        }
     }
 }
 
@@ -2872,6 +2879,154 @@ impl DataComponentCodec<Self> for BreakSoundImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use pumpkin_data::{item::Item, item_stack::ItemStack};
+    use pumpkin_nbt::compound::NbtCompound;
+
+    #[test]
+    fn intangible_projectile_writes_compound_and_preserves_following_byte() {
+        let mut bytes = Vec::new();
+        IntangibleProjectileImpl.serialize(&mut bytes).unwrap();
+        assert_eq!(bytes, [0x0a, 0x00]);
+        bytes.push(0x7f);
+        let mut input = bytes.as_slice();
+        IntangibleProjectileImpl::deserialize(&mut input).unwrap();
+        assert_eq!(input, [0x7f]);
+    }
+
+    #[test]
+    fn intangible_projectile_accepts_nonempty_compound() {
+        let mut compound = NbtCompound::new();
+        compound.put_int("ignored", 7);
+        let mut bytes = Vec::new();
+        bytes.write_nbt(NbtTag::Compound(compound)).unwrap();
+        bytes.push(0x7f);
+        let mut input = bytes.as_slice();
+        IntangibleProjectileImpl::deserialize(&mut input).unwrap();
+        assert_eq!(input, [0x7f]);
+    }
+
+    #[test]
+    fn intangible_projectile_rejects_absent_truncated_and_noncompound_nbt() {
+        for bytes in [
+            &[][..],
+            &[0x00][..],
+            &[0x0a][..],
+            &[0x0a, 0x03, 0x00][..],
+            &[0x01, 0x00][..],
+        ] {
+            let mut input = bytes;
+            assert!(IntangibleProjectileImpl::deserialize(&mut input).is_err());
+        }
+    }
+
+    #[test]
+    fn charged_projectiles_creative_arrow_has_exact_template_wire() {
+        let mut arrow = ItemStack::new(1, &Item::ARROW);
+        arrow.set_data_component(IntangibleProjectileImpl);
+        let mut projectile = NbtCompound::new();
+        arrow.write_item_stack(&mut projectile);
+        let value = ChargedProjectilesImpl {
+            projectiles: vec![projectile],
+        };
+        let mut bytes = Vec::new();
+        value.serialize(&mut bytes).unwrap();
+        // List length, item ID, count, added/removed patch lengths, unit payload.
+        assert_eq!(
+            bytes,
+            [0x01, 0xf1, 0x07, 0x01, 0x01, 0x00, 0x16, 0x0a, 0x00]
+        );
+        bytes.push(0x7f);
+        let mut input = bytes.as_slice();
+        let decoded = ChargedProjectilesImpl::deserialize(&mut input).unwrap();
+        assert_eq!(decoded, value);
+        assert_eq!(input, [0x7f]);
+    }
+
+    #[test]
+    fn charged_projectiles_preserve_creative_firework_nested_components() {
+        let fireworks = FireworksImpl::new(
+            3,
+            vec![FireworkExplosionImpl::new(
+                FireworkExplosionShape::Star,
+                vec![0x123456, 0xabcdef],
+                vec![0x654321],
+                true,
+                true,
+            )],
+        );
+        let mut rocket = ItemStack::new(1, &Item::FIREWORK_ROCKET);
+        rocket.set_data_component(fireworks.clone());
+        rocket.set_data_component(IntangibleProjectileImpl);
+        let mut projectile = NbtCompound::new();
+        rocket.write_item_stack(&mut projectile);
+        let value = ChargedProjectilesImpl {
+            projectiles: vec![projectile],
+        };
+        let mut bytes = Vec::new();
+        value.serialize(&mut bytes).unwrap();
+        let mut input = bytes.as_slice();
+        let decoded = ChargedProjectilesImpl::deserialize(&mut input).unwrap();
+        assert_eq!(decoded, value);
+        assert!(input.is_empty());
+        let decoded_rocket = ItemStack::read_item_stack(&decoded.projectiles[0]).unwrap();
+        assert_eq!(decoded_rocket.item.id, Item::FIREWORK_ROCKET.id);
+        assert_eq!(
+            decoded_rocket.get_data_component::<FireworksImpl>(),
+            Some(&fireworks)
+        );
+        assert!(
+            decoded_rocket
+                .get_data_component::<IntangibleProjectileImpl>()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn charged_projectiles_accept_65_and_1024_and_reject_1025() {
+        let mut projectile = NbtCompound::new();
+        ItemStack::new(1, &Item::ARROW).write_item_stack(&mut projectile);
+        for (count, prefix) in [(65, &[0x41][..]), (1024, &[0x80, 0x08][..])] {
+            let value = ChargedProjectilesImpl {
+                projectiles: vec![projectile.clone(); count],
+            };
+            let mut bytes = Vec::new();
+            value.serialize(&mut bytes).unwrap();
+            assert!(bytes.starts_with(prefix));
+            let mut input = bytes.as_slice();
+            assert_eq!(
+                ChargedProjectilesImpl::deserialize(&mut input).unwrap(),
+                value
+            );
+            assert!(input.is_empty());
+        }
+
+        let value = ChargedProjectilesImpl {
+            projectiles: vec![projectile.clone(); 1025],
+        };
+        let mut bytes = Vec::new();
+        assert!(value.serialize(&mut bytes).is_err());
+        assert!(bytes.is_empty());
+
+        let single = ChargedProjectilesImpl {
+            projectiles: vec![projectile],
+        };
+        let mut encoded_single = Vec::new();
+        single.serialize(&mut encoded_single).unwrap();
+        // A complete, otherwise-valid 1025-entry payload proves length rejection,
+        // rather than a failure caused by an absent or malformed first element.
+        bytes.extend_from_slice(&[0x81, 0x08]);
+        for _ in 0..1025 {
+            bytes.extend_from_slice(&encoded_single[1..]);
+        }
+        let mut input = bytes.as_slice();
+        assert!(ChargedProjectilesImpl::deserialize(&mut input).is_err());
+        assert_eq!(input, &bytes[2..]);
+
+        let mut input = &[0xff, 0xff, 0xff, 0xff, 0x0f, 0x7f][..];
+        assert!(ChargedProjectilesImpl::deserialize(&mut input).is_err());
+        assert_eq!(input, [0x7f]);
+    }
 
     #[test]
     fn charged_projectiles_preserve_count_components_and_saved_nbt() {
