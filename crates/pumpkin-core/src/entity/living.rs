@@ -70,6 +70,20 @@ use pumpkin_util::text::TextComponent;
 use rand::RngExt;
 use std::sync::RwLock;
 
+fn damage_type_key(kind: DamageType) -> String {
+    // Translation message IDs are shared by distinct registry types.
+    pumpkin_data::registry::REGISTRY_V_26_3
+        .iter()
+        .find(|registry| registry.registry_id == "damage_type")
+        .and_then(|registry| {
+            registry.entries.iter().find(|entry| {
+                DamageType::from_name(entry.name).is_some_and(|candidate| candidate.id == kind.id)
+            })
+        })
+        .map(|entry| entry.name.to_string())
+        .expect("Engine damage type is missing from its generated registry")
+}
+
 /// Represents a living entity within the game world.
 ///
 /// This struct encapsulates the core properties and behaviors of living entities, including players, mobs, and other creatures.
@@ -2981,7 +2995,7 @@ impl LivingEntity {
                     entity_id: self.entity.entity_id,
                     damager_id: damager.get_entity().entity_id,
                     damage: amount,
-                    cause: format!("{damage_type:?}"),
+                    cause: damage_type_key(damage_type),
                     cancelled: false,
                 };
             if let Some(server) = self.entity.world.load().server.upgrade() {
@@ -3015,7 +3029,7 @@ impl LivingEntity {
                     entity_id: self.entity.entity_id,
                     damager_pos,
                     damage: amount,
-                    cause: format!("{damage_type:?}"),
+                    cause: damage_type_key(damage_type),
                     cancelled: false,
                 };
             if let Some(server) = self.entity.world.load().server.upgrade() {
@@ -4102,6 +4116,24 @@ mod tests {
         assert_eq!(
             LivingEntity::hurt_sound_for_entity(&EntityType::ENDERMAN),
             Sound::EntityEndermanHurt
+        );
+    }
+
+    #[test]
+    fn damage_events_use_exact_registry_keys_instead_of_translation_or_debug_names() {
+        for id in 0..=u8::MAX {
+            if let Some(kind) = DamageType::from_id(id) {
+                let key = super::damage_type_key(kind);
+                assert_eq!(DamageType::from_name(&key).unwrap().id, id);
+            }
+        }
+        assert_eq!(
+            super::damage_type_key(DamageType::MOB_ATTACK_NO_AGGRO),
+            "mob_attack_no_aggro"
+        );
+        assert_eq!(
+            super::damage_type_key(DamageType::PLAYER_ATTACK),
+            "player_attack"
         );
     }
 
