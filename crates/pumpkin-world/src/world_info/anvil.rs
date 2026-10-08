@@ -956,11 +956,15 @@ mod test {
         let game_rules_path = minecraft_data_dir(temp_dir.path()).join("game_rules.dat");
         let game_rules = read_gzip_compound_tag(File::open(game_rules_path).unwrap()).unwrap();
         assert_eq!(
+            game_rules.get_int("DataVersion"),
+            Some(MAXIMUM_SUPPORTED_WORLD_DATA_VERSION)
+        );
+        assert!(
             game_rules
                 .get_compound("data")
                 .unwrap()
-                .get_int("DataVersion"),
-            Some(MAXIMUM_SUPPORTED_WORLD_DATA_VERSION)
+                .get("DataVersion")
+                .is_none()
         );
     }
 
