@@ -70,7 +70,7 @@ use pumpkin_util::text::TextComponent;
 use rand::RngExt;
 use std::sync::RwLock;
 
-fn damage_type_key(kind: DamageType) -> String {
+fn damage_type_key(kind: DamageType) -> Option<String> {
     // Translation message IDs are shared by distinct registry types.
     pumpkin_data::registry::REGISTRY_V_26_3
         .iter()
@@ -81,7 +81,6 @@ fn damage_type_key(kind: DamageType) -> String {
             })
         })
         .map(|entry| entry.name.to_string())
-        .expect("Engine damage type is missing from its generated registry")
 }
 
 /// Represents a living entity within the game world.
@@ -2973,6 +2972,14 @@ impl LivingEntity {
             return false;
         }
 
+        let Some(damage_type_name) = damage_type_key(damage_type) else {
+            warn!(
+                damage_type_id = damage_type.id,
+                "Cannot apply damage with an unregistered damage type"
+            );
+            return false;
+        };
+
         let mut damage_event =
             crate::plugin::api::events::entity::entity_damage::EntityDamageEvent::new(
                 self.entity.entity_id,
@@ -2995,7 +3002,7 @@ impl LivingEntity {
                     entity_id: self.entity.entity_id,
                     damager_id: damager.get_entity().entity_id,
                     damage: amount,
-                    cause: damage_type_key(damage_type),
+                    cause: damage_type_name,
                     cancelled: false,
                 };
             if let Some(server) = self.entity.world.load().server.upgrade() {
@@ -3029,7 +3036,7 @@ impl LivingEntity {
                     entity_id: self.entity.entity_id,
                     damager_pos,
                     damage: amount,
-                    cause: damage_type_key(damage_type),
+                    cause: damage_type_name,
                     cancelled: false,
                 };
             if let Some(server) = self.entity.world.load().server.upgrade() {
@@ -4123,17 +4130,24 @@ mod tests {
     fn damage_events_use_exact_registry_keys_instead_of_translation_or_debug_names() {
         for id in 0..=u8::MAX {
             if let Some(kind) = DamageType::from_id(id) {
-                let key = super::damage_type_key(kind);
+                let key = super::damage_type_key(kind).unwrap();
                 assert_eq!(DamageType::from_name(&key).unwrap().id, id);
             }
         }
         assert_eq!(
             super::damage_type_key(DamageType::MOB_ATTACK_NO_AGGRO),
-            "mob_attack_no_aggro"
+            Some("mob_attack_no_aggro".to_string())
         );
         assert_eq!(
             super::damage_type_key(DamageType::PLAYER_ATTACK),
-            "player_attack"
+            Some("player_attack".to_string())
+        );
+        assert!(
+            super::damage_type_key(DamageType {
+                id: u8::MAX,
+                ..DamageType::PLAYER_ATTACK
+            })
+            .is_none()
         );
     }
 
