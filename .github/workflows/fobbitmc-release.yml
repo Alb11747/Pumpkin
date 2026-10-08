@@ -246,6 +246,11 @@ jobs:
         env:
           CARGO_TARGET_DIR: ${{ runner.temp }}/fobbitmc-release-target
         run: cargo +"$RUST_TOOLCHAIN" test --locked --release --target '${{ matrix.target }}' --workspace --lib
+      - name: Test actual Player persistence and mutable air and XP
+        working-directory: engine
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/fobbitmc-release-target
+        run: cargo +"$RUST_TOOLCHAIN" test --locked --release --target '${{ matrix.target }}' -p pumpkin-core --test player_persistence -- player_persistence_preserves_air_and_updates_independent_historical_xp --exact
       - name: Retain engine and release its temporary Cargo products
         run: python build-control/.github/scripts/fobbitmc_release.py collect engine '${{ matrix.target }}'
       - name: Build bridge JAR and verify death mapping before embedding it in the native library
