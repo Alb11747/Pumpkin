@@ -1696,6 +1696,142 @@ mod tests {
         world.level.shutdown().await;
     }
 
+    fn crossing_frog_fixture(uuid: Uuid, x: f64) -> NbtCompound {
+        let mut entity = NbtCompound::new();
+        entity.put_string("id", "minecraft:frog".into());
+        entity.put_uuid("UUID", uuid);
+        entity.put("Pos", NbtTag::List(vec![x.into(), 64.0.into(), 0.5.into()]));
+        entity.put_float("Health", 10.0);
+        entity.put_string("opaque", "retained across unload and reload".into());
+        entity
+    }
+
+    async fn load_crossing_frog(world: &World, uuid: Uuid, x: f64) -> Arc<dyn EntityBase> {
+        let position = Vector2::new((x.floor() as i32) >> 4, 0);
+        let chunk = world.level.get_entity_chunk(position).await;
+        chunk
+            .data
+            .lock()
+            .unwrap()
+            .push(crossing_frog_fixture(uuid, x));
+        let loaded = world.load_entity_chunk(&chunk, None).unwrap();
+        assert_eq!(loaded.len(), 1);
+        loaded.into_iter().next().unwrap()
+    }
+
+    fn stored_uuids(world: &World, positions: &[Vector2<i32>]) -> Vec<Uuid> {
+        let mut uuids = Vec::new();
+        for position in positions {
+            let chunk = world.level.get_entity_chunk_sync(position).unwrap();
+            uuids.extend(
+                chunk
+                    .data
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|entity| entity.get_uuid("UUID").unwrap()),
+            );
+        }
+        uuids.sort_unstable();
+        uuids
+    }
+
+    #[tokio::test]
+    async fn unload_crossing_frog_keeps_source_and_live_neighbor_records() {
+        let directory = tempfile::tempdir().unwrap();
+        let world = test_world(directory.path());
+        let a = Vector2::new(0, 0);
+        let b = Vector2::new(1, 0);
+        let p = load_crossing_frog(&world, Uuid::from_u128(1001), 15.75).await;
+        let q = load_crossing_frog(&world, Uuid::from_u128(1002), 17.5).await;
+        let moving = p.clone();
+        // Reproduce the old post-detach/pre-grouping position change exactly.
+        // The new snapshot must use its frozen source key, not partially replace B.
+        *world.entity_unload_snapshot_hook.lock().unwrap() = Some(Box::new(move || {
+            moving
+                .get_entity()
+                .set_pos(pumpkin_util::math::vector3::Vector3::new(16.5, 64.0, 0.5));
+        }));
+        world.remove_unwatched_entities_in_chunks([a]).await;
+        assert_eq!(world.entities.load().len(), 1);
+        assert_eq!(
+            world.entities.load()[0].get_entity().entity_uuid,
+            q.get_entity().entity_uuid
+        );
+        assert_eq!(
+            stored_uuids(&world, &[a, b]),
+            vec![Uuid::from_u128(1001), Uuid::from_u128(1002)],
+            "unload crossing must retain both root UUIDs without replacing the live neighbor"
+        );
+        world.save().await;
+        assert_eq!(
+            stored_uuids(&world, &[a, b]),
+            vec![Uuid::from_u128(1001), Uuid::from_u128(1002)]
+        );
+
+        // Reload the detached tree, then let a complete save relocate it into B.
+        let chunk = world.level.get_entity_chunk(a).await;
+        let reloaded = world.load_entity_chunk(&chunk, None).unwrap();
+        assert_eq!(reloaded.len(), 1);
+        assert_eq!(
+            reloaded[0].get_entity().entity_uuid,
+            p.get_entity().entity_uuid
+        );
+        world.save().await;
+        assert!(
+            world
+                .level
+                .get_entity_chunk(a)
+                .await
+                .data
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
+        let destination = world.level.get_entity_chunk(b).await;
+        {
+            let records = destination.data.lock().unwrap();
+            assert_eq!(records.len(), 2);
+            assert!(
+                records.iter().all(|entity| entity.get_string("opaque")
+                    == Some("retained across unload and reload"))
+            );
+        }
+        // A new serializer reads actual committed files, without the world's cache.
+        use pumpkin_config::chunk::AnvilChunkConfig;
+        use pumpkin_world::chunk::{
+            ChunkEntityData,
+            format::anvil::AnvilChunkFile,
+            io::{FileIO, LoadedData, file_manager::ChunkFileManager},
+        };
+        let reader =
+            ChunkFileManager::<AnvilChunkFile<ChunkEntityData>>::new(AnvilChunkConfig::default());
+        let (send, mut stream) = tokio::sync::mpsc::channel(2);
+        reader
+            .fetch_chunks(&world.level.level_folder, &[a, b], send)
+            .await;
+        let mut persisted = Vec::new();
+        while let Some(result) = stream.recv().await {
+            let LoadedData::Loaded(chunk) = result else {
+                panic!("saved entity chunks must parse from disk");
+            };
+            persisted.extend(
+                chunk
+                    .data
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|entity| entity.get_uuid("UUID").unwrap()),
+            );
+        }
+        persisted.sort_unstable();
+        assert_eq!(
+            persisted,
+            vec![Uuid::from_u128(1001), Uuid::from_u128(1002)]
+        );
+        world.level.shutdown().await;
+    }
+
     #[tokio::test]
     async fn autosave_during_unload_cannot_replace_detached_entities_with_empty_snapshot() {
         use pumpkin_world::chunk::io::Dirtiable;

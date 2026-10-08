@@ -268,6 +268,8 @@ pub struct World {
     // Serialize dormant/live transitions with snapshots. In particular, an
     // unload detaches entities before its asynchronous snapshot is complete.
     entity_storage_lock: tokio::sync::Mutex<()>,
+    #[cfg(test)]
+    entity_unload_snapshot_hook: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Actual player-owned watcher references, updated under `entity_storage_lock`.
     player_entity_chunk_watches: DashMap<i32, FxHashSet<Vector2<i32>>>,
     /// The world's scoreboard, used for tracking scores, objectives, and display information.
@@ -426,6 +428,8 @@ impl World {
             entities: ArcSwap::new(Arc::new(Vec::new())),
             preserved_entity_records: DashMap::new(),
             entity_storage_lock: tokio::sync::Mutex::new(()),
+            #[cfg(test)]
+            entity_unload_snapshot_hook: std::sync::Mutex::new(None),
             player_entity_chunk_watches: DashMap::new(),
             scoreboard: std::sync::Mutex::new(Scoreboard::default()),
             worldborder: std::sync::Mutex::new(Worldborder::new(
@@ -5323,6 +5327,10 @@ impl World {
                 })
                 .cloned(),
         );
+        #[cfg(test)]
+        if let Some(hook) = self.entity_unload_snapshot_hook.lock().unwrap().take() {
+            hook();
+        }
         self.save_entities_by_chunk(&entities_to_save, snapshot_chunks)
             .await;
 
