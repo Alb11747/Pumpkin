@@ -4,8 +4,8 @@
   "files": {
     ".gitattributes": "d60f352d0db1404c70afb4bb8b2ca3fd1c610572aa40720e8a0b7baa7885418c",
     ".gitignore": "f51753212aac6876e2ebb16fc8be9f0f409bb9a162f2a5fb226befdfc818c708",
-    "Cargo.lock": "442465214df07bd79903106fa54e5892ab2bb08cce620248490f9e537aaaaa4f",
-    "Cargo.toml": "c2dcf3fc0fb9fdcbfbc93c7327102f6f9bebc4371beb2764aae0ef28d6cd9d66",
+    "Cargo.lock": "0c03b87fb98ff34593ec2a50b4b4aea1ddad6ee1c3f7d3f32fba51ed61f66ddb",
+    "Cargo.toml": "4d024bc71422d1d668118399519520088ce4344dbd9244e5373434ac778a6383",
     "README.md": "2df186f6dc837c738d320595141a217373f9f0416860d4f01dfae202a85ea921",
     "scripts/migrate_visibility.py": "888842a632feb76bc615b930a99a1f25b3b0048999bd54a438e81605af080c81",
     "scripts/test_migrate_visibility.py": "0ed0deb63209ba5c14cd17103378cd9a50c7ed22a786f8c60a68a98be6dea435",
@@ -14,6 +14,6 @@
     "src/snapshot.rs": "81f14f1c1f9552c5925febf33c36e4bc71c94e7018464aa519911b640034927e",
     "src/visibility.rs": "363b5430160afa129bab97852d80998e17ca21cf1090c5135dba3d397f17c1a1"
   },
-  "enginePin": "26c22091d0e8e8b2ef66270f14761706e8c42c05",
+  "enginePin": "d2b43c98cbdf98de408b77153b260a8d31424fb4",
   "changesFromOriginal": "Cargo manifest and lock repinned to the matched API7 engine; implementation unchanged"
 }

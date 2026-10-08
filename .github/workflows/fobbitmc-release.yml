@@ -179,8 +179,12 @@ jobs:
         run: |
           TEST='entity::passive::villager::tests::successful_trade_player_click_returns_and_preserves_payment'
           LOG="$RUNNER_TEMP/merchant-positive-${{ matrix.target }}.log"
+          set +e
           cargo +"$RUST_TOOLCHAIN" test --locked --release --target '${{ matrix.target }}' -p pumpkin-core --lib "$TEST" -- --exact --color never > "$LOG" 2>&1
+          STATUS=$?
+          set -e
           cat "$LOG"
+          [[ "$STATUS" -eq 0 ]]
           grep -Fx 'running 1 test' "$LOG"
           grep -Fx "test $TEST ... ok" "$LOG"
           grep -E '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$LOG"
@@ -276,5 +280,12 @@ jobs:
           name: fobbitmc-${{ matrix.target }}-${{ inputs.engine_sha }}
           path: dist/*
           if-no-files-found: error
+      - name: Retain failed qualification output
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fobbitmc-failure-logs-${{ matrix.target }}-${{ inputs.engine_sha }}
+          path: ${{ runner.temp }}/*-${{ matrix.target }}.log
+          if-no-files-found: warn
           compression-level: 0
           retention-days: 30
