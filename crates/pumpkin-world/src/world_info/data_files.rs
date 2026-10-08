@@ -647,9 +647,8 @@ pub fn game_rules_to_nbt(rules: &GameRuleRegistry, data_version: i32) -> NbtComp
             GameRuleValue::Int(i) => inner.put(&key, NbtTag::Int(*i as i32)),
         }
     }
-    inner.put_int("DataVersion", data_version);
-
     let mut root = NbtCompound::new();
+    root.put_int("DataVersion", data_version);
     root.put_compound("data", inner);
     root
 }
@@ -710,9 +709,11 @@ pub fn read_world_clocks(level_folder: &Path) -> Result<Option<WorldClocksData>,
 fn world_clocks_from_nbt(root: &NbtCompound) -> Result<WorldClocksData, WorldInfoError> {
     const FILE: &str = "world_clocks.dat";
     let inner = required_metadata_field(root, "data", FILE, NbtTag::extract_compound)?;
-    let _ = metadata_field(root, "DataVersion", FILE, metadata_int)?;
+    let root_version = metadata_field(root, "DataVersion", FILE, metadata_int)?;
     let mut result = WorldClocksData {
-        data_version: metadata_field(inner, "DataVersion", FILE, metadata_int)?.unwrap_or(0),
+        data_version: root_version
+            .or(metadata_field(inner, "DataVersion", FILE, metadata_int)?)
+            .unwrap_or(0),
         ..WorldClocksData::default()
     };
     for (key, tag) in &inner.child_tags {
@@ -744,9 +745,8 @@ pub fn write_world_clocks(
         dim_compound.put_long("total_ticks", clock.total_ticks);
         inner.put_compound(dim_name, dim_compound);
     }
-    inner.put_int("DataVersion", clocks.data_version);
-
     let mut root = NbtCompound::new();
+    root.put_int("DataVersion", clocks.data_version);
     root.put_compound("data", inner);
 
     atomic_write(&path, |file| {
@@ -913,6 +913,67 @@ mod atomic_metadata_tests {
     use super::*;
     use std::io::{self, Write};
     use tempfile::TempDir;
+
+    #[test]
+    fn rules_and_clocks_keep_version_outside_the_resource_key_maps() {
+        let rules = GameRuleRegistry::default();
+        let root = game_rules_to_nbt(&rules, 5023);
+        assert_eq!(root.get_int("DataVersion"), Some(5023));
+        let data = root.get_compound("data").unwrap();
+        assert!(data.get("DataVersion").is_none());
+        assert!(
+            data.child_tags
+                .keys()
+                .all(|key| key.starts_with("minecraft:"))
+        );
+        let decoded = game_rules_from_nbt(&root).unwrap();
+        assert_eq!(game_rules_to_nbt(&decoded, 5023), root);
+
+        let directory = TempDir::new().unwrap();
+        let mut clocks = WorldClocksData {
+            data_version: 5023,
+            ..WorldClocksData::default()
+        };
+        clocks.clocks.insert(
+            "minecraft:overworld".into(),
+            DimensionClock {
+                total_ticks: 2_386_599_286,
+            },
+        );
+        write_world_clocks(directory.path(), &clocks).unwrap();
+        let path = minecraft_data_dir(directory.path()).join("world_clocks.dat");
+        let root = read_gzip_compound_tag(File::open(path).unwrap()).unwrap();
+        assert_eq!(root.get_int("DataVersion"), Some(5023));
+        assert!(
+            root.get_compound("data")
+                .unwrap()
+                .get("DataVersion")
+                .is_none()
+        );
+        let restored = read_world_clocks(directory.path()).unwrap().unwrap();
+        assert_eq!(restored, clocks);
+    }
+
+    #[test]
+    fn clocks_read_root_version_and_accept_the_prior_nested_version() {
+        let mut clock = NbtCompound::new();
+        clock.put_long("total_ticks", 2_386_599_286);
+        let mut inner = NbtCompound::new();
+        inner.put_compound("minecraft:overworld", clock);
+        inner.put_int("DataVersion", 4903);
+        let mut root = NbtCompound::new();
+        root.put_compound("data", inner);
+        assert_eq!(world_clocks_from_nbt(&root).unwrap().data_version, 4903);
+        root.put_int("DataVersion", 5023);
+        let restored = world_clocks_from_nbt(&root).unwrap();
+        assert_eq!(restored.data_version, 5023);
+        assert_eq!(
+            restored.clocks["minecraft:overworld"].total_ticks,
+            2_386_599_286
+        );
+        root.put_string("DataVersion", "invalid".into());
+        assert!(world_clocks_from_nbt(&root).is_err());
+    }
 
     #[test]
     fn older_metadata_layouts_keep_numeric_codec_and_optional_field_defaults() {
