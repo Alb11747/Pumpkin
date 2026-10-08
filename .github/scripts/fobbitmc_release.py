@@ -120,8 +120,52 @@ def merchant_negative(target):
     STATE.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8", newline="\n")
 
 
+def persistence_negative(target):
+    test = "world::entity_storage::tests::unload_crossing_frog_keeps_source_and_live_neighbor_records"
+    assertion = "unload crossing must retain both root UUIDs without replacing the live neighbor"
+    source = git_source(ROOT / "engine", os.environ["PERSISTENCE_BASELINE_SHA"])
+    log = TEMP / f"persistence-negative-{target}.log"
+    args = ["cargo", "+" + os.environ["RUST_TOOLCHAIN"], "test", "--locked",
+            "--release", "--target", target, "-p", "pumpkin-core", "--lib", test,
+            "--", "--exact", "--color", "never"]
+    with log.open("w", encoding="utf-8", newline="\n") as stream:
+        result = subprocess.run(args, cwd=ROOT / "engine", stdout=stream,
+                                stderr=subprocess.STDOUT, timeout=1800, check=False)
+    output = log.read_text(encoding="utf-8")
+    print(output, end="")
+    lines = output.splitlines()
+    if (result.returncode != 101 or "running 1 test" not in lines
+            or f"test {test} ... FAILED" not in lines or assertion not in output
+            or re.search(r"^test result: FAILED\. 0 passed; 1 failed; 0 ignored; 0 measured; [0-9]+ filtered out;", output, re.MULTILINE) is None):
+        raise ValueError("Persistence control did not fail on the exact neighboring-entity loss assertion")
+    state = json.loads(STATE.read_text(encoding="utf-8"))
+    state["persistenceNegative"] = {**source, "test": test, "assertion": assertion,
+                                    "exitCode": result.returncode, "logSha256": sha256(log)}
+    STATE.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8", newline="\n")
+
+
 # Each focused command must run the expected named tests; zero-test success fails.
 POSITIVE_GATES = {
+    "entity-persistence": [
+        ("pumpkin-core", "world::entity_storage::tests::unload_crossing_frog_keeps_source_and_live_neighbor_records", [
+            "world::entity_storage::tests::unload_crossing_frog_keeps_source_and_live_neighbor_records",
+        ]),
+        ("pumpkin-core", "world::entity_storage::tests::unload_waits_for_cloned_tick_before_classifying_crossing_entities", [
+            "world::entity_storage::tests::unload_waits_for_cloned_tick_before_classifying_crossing_entities",
+        ]),
+        ("pumpkin-core", "world::entity_storage::tests::unload_does_not_resurrect_a_legitimately_removed_crossing_frog", [
+            "world::entity_storage::tests::unload_does_not_resurrect_a_legitimately_removed_crossing_frog",
+        ]),
+        ("pumpkin-core", "world::entity_storage::tests::snapshot_waits_for_tick_and_includes_new_roots_without_blocking_runtime", [
+            "world::entity_storage::tests::snapshot_waits_for_tick_and_includes_new_roots_without_blocking_runtime",
+        ]),
+        ("pumpkin-core", "entity::passive::villager::tests::only_assigned_job_sites_restock_and_respect_the_second_restock_cooldown", [
+            "entity::passive::villager::tests::only_assigned_job_sites_restock_and_respect_the_second_restock_cooldown",
+        ]),
+        ("pumpkin-core", "entity::living::tests::damage_events_use_exact_registry_keys_instead_of_translation_or_debug_names", [
+            "entity::living::tests::damage_events_use_exact_registry_keys_instead_of_translation_or_debug_names",
+        ]),
+    ],
     "save-scheduler": [
         ("pumpkin-world", "chunk_system::schedule::save_lineage_tests::save_lineage_fifo_counts_unload_save_and_no_batch_per_world", [
             "chunk_system::schedule::save_lineage_tests::save_lineage_fifo_counts_unload_save_and_no_batch_per_world",
@@ -242,5 +286,5 @@ def manifest(target):
 
 if __name__ == "__main__":
     mode, *args = sys.argv[1:]
-    {"prepare": prepare, "autosave_negative": autosave_negative, "merchant_negative": merchant_negative, "verify_engine": verify_engine,
+    {"prepare": prepare, "autosave_negative": autosave_negative, "merchant_negative": merchant_negative, "persistence_negative": persistence_negative, "verify_engine": verify_engine,
      "collect": collect, "manifest": manifest, "positive": positive}[mode](*args)

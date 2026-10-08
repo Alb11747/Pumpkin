@@ -29,6 +29,11 @@ on:
         required: false
         type: string
 
+      persistence_baseline_sha:
+        description: Exact test-only baseline expected to lose the neighboring entity during unload
+        required: false
+        type: string
+
 permissions:
   contents: read
 
@@ -53,6 +58,7 @@ env:
   BUILD_EXPORTER: ${{ inputs.build_exporter }}
   AUTOSAVE_BASELINE_SHA: ${{ inputs.autosave_baseline_sha }}
   MERCHANT_BASELINE_SHA: ${{ inputs.merchant_baseline_sha }}
+  PERSISTENCE_BASELINE_SHA: ${{ inputs.persistence_baseline_sha }}
 
 jobs:
   release:
@@ -83,6 +89,9 @@ jobs:
           fi
           if [[ -n "$MERCHANT_BASELINE_SHA" ]]; then
             [[ "$MERCHANT_BASELINE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          fi
+          if [[ -n "$PERSISTENCE_BASELINE_SHA" ]]; then
+            [[ "$PERSISTENCE_BASELINE_SHA" =~ ^[0-9a-f]{40}$ ]]
           fi
           if [[ "$BUILD_EXPORTER" == true ]]; then
             [[ "$EXPORTER_SHA" =~ ^[0-9a-f]{40}$ ]]
@@ -175,6 +184,25 @@ jobs:
           grep -Fx 'running 1 test' "$LOG"
           grep -Fx "test $TEST ... ok" "$LOG"
           grep -E '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$LOG"
+      - name: Prove the test-only baseline fails on neighboring entity loss
+        if: inputs.persistence_baseline_sha != ''
+        working-directory: engine
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/fobbitmc-release-target
+        run: |
+          git fetch --depth=1 origin "$PERSISTENCE_BASELINE_SHA"
+          git checkout --detach "$PERSISTENCE_BASELINE_SHA"
+          cd ..
+          python build-control/.github/scripts/fobbitmc_release.py persistence_negative '${{ matrix.target }}'
+      - name: Restore and verify exact engine after persistence negative gate
+        if: always() && inputs.persistence_baseline_sha != ''
+        run: |
+          git -C engine checkout --detach "$ENGINE_SHA"
+          python build-control/.github/scripts/fobbitmc_release.py verify_engine
+      - name: Prove the four entity snapshot regressions and assigned workstation restock
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/fobbitmc-release-target
+        run: python build-control/.github/scripts/fobbitmc_release.py positive '${{ matrix.target }}' entity-persistence
       - name: Prove save-lineage scheduler counts and FIFO context
         env:
           CARGO_TARGET_DIR: ${{ runner.temp }}/fobbitmc-release-target

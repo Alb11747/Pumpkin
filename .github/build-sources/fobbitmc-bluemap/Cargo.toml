@@ -16,8 +16,8 @@ native = ["dep:pumpkin", "dep:pumpkin-util", "dep:tracing-subscriber"]
 
 [dependencies]
 # Native Rust plugins must use the exact server revision, toolchain and target.
-pumpkin = { git = "https://github.com/Alb11747/Pumpkin.git", rev = "f7e9d6ef1291cc5bb9b8925ad837658808fd96af", package = "pumpkin-core", optional = true }
-pumpkin-util = { git = "https://github.com/Alb11747/Pumpkin.git", rev = "f7e9d6ef1291cc5bb9b8925ad837658808fd96af", package = "pumpkin-util", optional = true }
+pumpkin = { git = "https://github.com/Alb11747/Pumpkin.git", rev = "26c22091d0e8e8b2ef66270f14761706e8c42c05", package = "pumpkin-core", optional = true }
+pumpkin-util = { git = "https://github.com/Alb11747/Pumpkin.git", rev = "26c22091d0e8e8b2ef66270f14761706e8c42c05", package = "pumpkin-util", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
