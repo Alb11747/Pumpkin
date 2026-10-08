@@ -231,6 +231,11 @@ jobs:
         env:
           CARGO_TARGET_DIR: ${{ runner.temp }}/fobbitmc-release-target
         run: python build-control/.github/scripts/fobbitmc_release.py positive '${{ matrix.target }}' preservation
+      - name: Check every core and protocol target and feature with release Clippy
+        working-directory: engine
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/fobbitmc-release-target
+        run: cargo +"$RUST_TOOLCHAIN" clippy --locked --release --target '${{ matrix.target }}' -p pumpkin-core -p pumpkin-protocol --all-targets --all-features -- -D warnings
       - name: Build optimized engine
         working-directory: engine
         env:
@@ -241,16 +246,11 @@ jobs:
         env:
           CARGO_TARGET_DIR: ${{ runner.temp }}/fobbitmc-release-target
         run: cargo +"$RUST_TOOLCHAIN" test --locked --release --target '${{ matrix.target }}' --workspace --lib
-      - name: Check every core and protocol target and feature with release Clippy
-        working-directory: engine
-        env:
-          CARGO_TARGET_DIR: ${{ runner.temp }}/fobbitmc-release-target
-        run: cargo +"$RUST_TOOLCHAIN" clippy --locked --release --target '${{ matrix.target }}' -p pumpkin-core -p pumpkin-protocol --all-targets --all-features -- -D warnings
       - name: Retain engine and release its temporary Cargo products
         run: python build-control/.github/scripts/fobbitmc_release.py collect engine '${{ matrix.target }}'
-      - name: Build bridge JAR before embedding it in the native library
+      - name: Build bridge JAR and verify death mapping before embedding it in the native library
         working-directory: bridge/java
-        run: bash ./gradlew --no-daemon :patchbukkit:jar
+        run: bash ./gradlew --no-daemon :patchbukkit:jar :patchbukkit:test --tests org.patchbukkit.events.EntityDeathMappingTest
       - name: Build optimized native bridge
         working-directory: bridge/rust
         env:
