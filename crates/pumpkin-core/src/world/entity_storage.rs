@@ -369,6 +369,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn frog_tongue_poses_preserve_current_body_and_eye_dimensions() {
+        use pumpkin_data::entity::EntityPose;
+        use pumpkin_util::math::boundingbox::{BoundingBox, EntityDimensions};
+
+        let directory = tempfile::tempdir().unwrap();
+        let world = test_world(directory.path());
+        let position = Vector3::new(0.5, 51.0, 0.5);
+        let mut observations = Vec::new();
+        for (uuid, dimensions) in [
+            (801, EntityDimensions::new(0.5, 0.5, 0.425)),
+            (802, EntityDimensions::new(0.25, 0.25, 0.2125)),
+        ] {
+            let mut fixture = NbtCompound::new();
+            fixture.put_string("id", "minecraft:frog".into());
+            fixture.put_uuid("UUID", Uuid::from_u128(uuid));
+            fixture.put_list("Pos", vec![0.5.into(), 51.0.into(), 0.5.into()]);
+            let loaded = load_entity_tree(&fixture, &world).unwrap();
+            let entity = loaded[0].get_entity();
+            // A resized/baby-sized body is a supported state independent of type defaults.
+            if uuid == 802 {
+                entity.entity_dimension.store(dimensions);
+                entity.bounding_box.store(BoundingBox::new_from_pos(
+                    position.x,
+                    position.y,
+                    position.z,
+                    &dimensions,
+                ));
+            }
+            for pose in [EntityPose::UsingTongue, EntityPose::Standing] {
+                entity.set_pose(pose);
+                observations.push((
+                    pose,
+                    dimensions,
+                    entity.pose.load(),
+                    entity.entity_dimension.load(),
+                    entity.bounding_box.load(),
+                    entity.get_eye_height(),
+                ));
+            }
+        }
+        world.level.shutdown().await;
+        for (pose, expected, actual_pose, actual, body, eye) in observations {
+            assert!(actual_pose == pose);
+            assert_eq!(
+                actual.width, expected.width,
+                "frog width after pose {}",
+                pose as u8
+            );
+            assert_eq!(
+                actual.height, expected.height,
+                "frog height after pose {}",
+                pose as u8
+            );
+            assert_eq!(
+                eye,
+                f64::from(expected.eye_height),
+                "frog eyes after pose {}",
+                pose as u8
+            );
+            assert_eq!(body.min.x, position.x - f64::from(expected.width) / 2.0);
+            assert_eq!(body.min.z, position.z - f64::from(expected.width) / 2.0);
+            assert_eq!(body.min.y, position.y);
+            assert_eq!(body.max.x, position.x + f64::from(expected.width) / 2.0);
+            assert_eq!(body.max.z, position.z + f64::from(expected.width) / 2.0);
+            assert_eq!(body.max.y, position.y + f64::from(expected.height));
+            // A one-block-high clearance must remain clear after either frog animation.
+            assert!(body.max.y < position.y + 1.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn player_poses_still_resize_body_and_eye_dimensions() {
+        use crate::entity::Entity;
+        use pumpkin_data::entity::EntityPose;
+        use pumpkin_util::math::boundingbox::EntityDimensions;
+
+        let directory = tempfile::tempdir().unwrap();
+        let world = test_world(directory.path());
+        let position = Vector3::new(0.5, 64.0, 0.5);
+        let entity = Entity::from_uuid(
+            Uuid::from_u128(803),
+            world.clone(),
+            position,
+            &EntityType::PLAYER,
+        );
+        let mut observations = Vec::new();
+        for (pose, expected) in [
+            (EntityPose::Crouching, EntityDimensions::new(0.6, 1.5, 1.27)),
+            (EntityPose::Swimming, EntityDimensions::new(0.6, 0.6, 0.4)),
+            (EntityPose::Standing, EntityDimensions::new(0.6, 1.8, 1.62)),
+        ] {
+            entity.set_pose(pose);
+            observations.push((
+                expected,
+                entity.entity_dimension.load(),
+                entity.bounding_box.load(),
+                entity.get_eye_height(),
+            ));
+        }
+        world.level.shutdown().await;
+        for (expected, actual, body, eye) in observations {
+            assert_eq!(actual.width, expected.width);
+            assert_eq!(actual.height, expected.height);
+            assert_eq!(eye, f64::from(expected.eye_height));
+            assert_eq!(body.min.x, position.x - f64::from(expected.width) / 2.0);
+            assert_eq!(body.max.x, position.x + f64::from(expected.width) / 2.0);
+            assert_eq!(body.min.y, position.y);
+            assert_eq!(body.max.y, position.y + f64::from(expected.height));
+        }
+    }
+
+    #[tokio::test]
     async fn loaded_farm_mobs_keep_vanilla_distance_policy_and_survive_without_players() {
         let directory = tempfile::tempdir().unwrap();
         let world = test_world(directory.path());
