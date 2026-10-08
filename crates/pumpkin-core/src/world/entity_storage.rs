@@ -1802,7 +1802,7 @@ mod tests {
             assert!(
                 records.iter().all(|entity| entity.get_string("opaque")
                     == Some("retained across unload and reload"))
-            )
+            );
         };
         // A new serializer reads actual committed files, without the world's cache.
         let reader =
