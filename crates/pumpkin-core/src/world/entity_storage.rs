@@ -1706,7 +1706,7 @@ mod tests {
         entity
     }
 
-    async fn load_crossing_frog(world: &World, uuid: Uuid, x: f64) -> Arc<dyn EntityBase> {
+    async fn load_crossing_frog(world: &Arc<World>, uuid: Uuid, x: f64) -> Arc<dyn EntityBase> {
         let position = Vector2::new((x.floor() as i32) >> 4, 0);
         let chunk = world.level.get_entity_chunk(position).await;
         chunk
