@@ -34,11 +34,16 @@ on:
         required: false
         type: string
 
+      pose_baseline_sha:
+        description: Exact test-only baseline expected to give a frog player dimensions
+        required: false
+        type: string
+
 permissions:
   contents: read
 
 concurrency:
-  group: fobbitmc-release-${{ github.ref }}
+  group: fobbitmc-release-${{ github.ref }}-${{ inputs.engine_sha }}
   cancel-in-progress: false
 
 env:
@@ -59,6 +64,7 @@ env:
   AUTOSAVE_BASELINE_SHA: ${{ inputs.autosave_baseline_sha }}
   MERCHANT_BASELINE_SHA: ${{ inputs.merchant_baseline_sha }}
   PERSISTENCE_BASELINE_SHA: ${{ inputs.persistence_baseline_sha }}
+  POSE_BASELINE_SHA: ${{ inputs.pose_baseline_sha }}
 
 jobs:
   release:
@@ -92,6 +98,9 @@ jobs:
           fi
           if [[ -n "$PERSISTENCE_BASELINE_SHA" ]]; then
             [[ "$PERSISTENCE_BASELINE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          fi
+          if [[ -n "$POSE_BASELINE_SHA" ]]; then
+            [[ "$POSE_BASELINE_SHA" =~ ^[0-9a-f]{40}$ ]]
           fi
           if [[ "$BUILD_EXPORTER" == true ]]; then
             [[ "$EXPORTER_SHA" =~ ^[0-9a-f]{40}$ ]]
@@ -203,6 +212,25 @@ jobs:
         run: |
           git -C engine checkout --detach "$ENGINE_SHA"
           python build-control/.github/scripts/fobbitmc_release.py verify_engine
+      - name: Prove the frog pose regression fails on the test-only baseline
+        if: inputs.pose_baseline_sha != ''
+        working-directory: engine
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/fobbitmc-release-target
+        run: |
+          git fetch --depth=1 origin "$POSE_BASELINE_SHA"
+          git checkout --detach "$POSE_BASELINE_SHA"
+          cd ..
+          python build-control/.github/scripts/fobbitmc_release.py pose_negative '${{ matrix.target }}'
+      - name: Restore and verify exact engine after frog pose negative gate
+        if: always() && inputs.pose_baseline_sha != ''
+        run: |
+          git -C engine checkout --detach "$ENGINE_SHA"
+          python build-control/.github/scripts/fobbitmc_release.py verify_engine
+      - name: Prove frog geometry, transient Brain and saved-data compatibility
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/fobbitmc-release-target
+        run: python build-control/.github/scripts/fobbitmc_release.py positive '${{ matrix.target }}' frog-pose-and-brain
       - name: Prove the four entity snapshot regressions and assigned workstation restock
         env:
           CARGO_TARGET_DIR: ${{ runner.temp }}/fobbitmc-release-target
@@ -235,7 +263,7 @@ jobs:
         working-directory: engine
         env:
           CARGO_TARGET_DIR: ${{ runner.temp }}/fobbitmc-release-target
-        run: cargo +"$RUST_TOOLCHAIN" clippy --locked --release --target '${{ matrix.target }}' -p pumpkin-core -p pumpkin-protocol --all-targets --all-features -- -D warnings
+        run: cargo +"$RUST_TOOLCHAIN" clippy --locked --release --target '${{ matrix.target }}' -p pumpkin-core -p pumpkin-protocol -p pumpkin-world --all-targets --all-features -- -D warnings
       - name: Build optimized engine
         working-directory: engine
         env:

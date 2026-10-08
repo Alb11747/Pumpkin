@@ -144,8 +144,56 @@ def persistence_negative(target):
     STATE.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8", newline="\n")
 
 
+def pose_negative(target):
+    test = "world::entity_storage::tests::frog_tongue_poses_preserve_current_body_and_eye_dimensions"
+    source = git_source(ROOT / "engine", os.environ["POSE_BASELINE_SHA"])
+    log = TEMP / f"pose-negative-{target}.log"
+    args = ["cargo", "+" + os.environ["RUST_TOOLCHAIN"], "test", "--locked",
+            "--release", "--target", target, "-p", "pumpkin-core", "--lib", test,
+            "--", "--exact", "--color", "never"]
+    with log.open("w", encoding="utf-8", newline="\n") as stream:
+        result = subprocess.run(args, cwd=ROOT / "engine", stdout=stream,
+                                stderr=subprocess.STDOUT, timeout=1800, check=False)
+    output = log.read_text(encoding="utf-8")
+    print(output, end="")
+    lines = output.splitlines()
+    assertion = "frog width after pose"
+    if (result.returncode != 101 or lines.count("running 1 test") != 1
+            or f"test {test} ... FAILED" not in lines or assertion not in output
+            or re.search(r"^test result: FAILED\. 0 passed; 1 failed; 0 ignored; 0 measured; [0-9]+ filtered out;", output, re.MULTILINE) is None):
+        raise ValueError("Pose control did not fail on the exact frog dimension assertion")
+    state = json.loads(STATE.read_text(encoding="utf-8"))
+    state["poseNegative"] = {**source, "test": test, "assertion": assertion,
+                             "exitCode": result.returncode, "logSha256": sha256(log)}
+    STATE.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8", newline="\n")
+
+
 # Each focused command must run the expected named tests; zero-test success fails.
 POSITIVE_GATES = {
+    "frog-pose-and-brain": [
+        ("pumpkin-core", "world::entity_storage::tests::frog_tongue_poses_preserve_current_body_and_eye_dimensions", [
+            "world::entity_storage::tests::frog_tongue_poses_preserve_current_body_and_eye_dimensions",
+        ]),
+    ] * 3 + [
+        ("pumpkin-core", "world::entity_audit::tests::selector_rejects_partial_or_invalid_uuid_configuration", [
+            "world::entity_audit::tests::selector_rejects_partial_or_invalid_uuid_configuration",
+        ]),
+        ("pumpkin-core", "world::entity_storage::tests::player_poses_still_resize_body_and_eye_dimensions", [
+            "world::entity_storage::tests::player_poses_still_resize_body_and_eye_dimensions",
+        ]),
+        ("pumpkin-core", "entity::ai::brain::memory::tests::pumpkin_tempted_flag_is_transient_while_vanilla_cooldown_round_trips", [
+            "entity::ai::brain::memory::tests::pumpkin_tempted_flag_is_transient_while_vanilla_cooldown_round_trips",
+        ]),
+        ("pumpkin-core", "world::entity_storage::tests::loaded_frog_drops_obsolete_tempted_key_and_preserves_opaque_brain_data", [
+            "world::entity_storage::tests::loaded_frog_drops_obsolete_tempted_key_and_preserves_opaque_brain_data",
+        ]),
+        ("pumpkin-world", "world_info::data_files::atomic_metadata_tests::rules_and_clocks_keep_version_outside_the_resource_key_maps", [
+            "world_info::data_files::atomic_metadata_tests::rules_and_clocks_keep_version_outside_the_resource_key_maps",
+        ]),
+        ("pumpkin-world", "world_info::data_files::atomic_metadata_tests::clocks_read_root_version_and_accept_the_prior_nested_version", [
+            "world_info::data_files::atomic_metadata_tests::clocks_read_root_version_and_accept_the_prior_nested_version",
+        ]),
+    ],
     "entity-persistence": [
         ("pumpkin-core", "world::entity_storage::tests::unload_crossing_frog_keeps_source_and_live_neighbor_records", [
             "world::entity_storage::tests::unload_crossing_frog_keeps_source_and_live_neighbor_records",
@@ -291,5 +339,5 @@ def manifest(target):
 
 if __name__ == "__main__":
     mode, *args = sys.argv[1:]
-    {"prepare": prepare, "autosave_negative": autosave_negative, "merchant_negative": merchant_negative, "persistence_negative": persistence_negative, "verify_engine": verify_engine,
+    {"prepare": prepare, "autosave_negative": autosave_negative, "merchant_negative": merchant_negative, "persistence_negative": persistence_negative, "pose_negative": pose_negative, "verify_engine": verify_engine,
      "collect": collect, "manifest": manifest, "positive": positive}[mode](*args)
