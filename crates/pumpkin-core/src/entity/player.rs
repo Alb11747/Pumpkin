@@ -644,8 +644,10 @@ pub struct Player {
     pub experience_level: AtomicI32,
     /// The player's experience progress (`0.0` to `1.0`)
     pub experience_progress: AtomicCell<f32>,
-    /// The player's total experience points.
+    /// The player's points within the current level.
     pub experience_points: AtomicI32,
+    /// Vanilla's independently tracked XpTotal, including points spent on enchanting.
+    total_experience: AtomicI32,
     pub item_cooldowns: std::sync::Mutex<HashMap<String, ItemCooldown>>,
     pub experience_pick_up_delay: Mutex<u32>,
     pub chunk_sender: Mutex<crate::net::ChunkSender>,
@@ -1016,6 +1018,7 @@ impl Player {
             experience_level: AtomicI32::new(0),
             experience_progress: AtomicCell::new(0.0),
             experience_points: AtomicI32::new(0),
+            total_experience: AtomicI32::new(0),
             item_cooldowns: std::sync::Mutex::new(HashMap::new()),
             chunk_sender: Mutex::new(crate::net::ChunkSender::new()),
             chunk_listener: Mutex::new(world.level.chunk_listener.add_global_chunk_listener()),
@@ -5906,7 +5909,12 @@ impl Player {
     /// Add experience levels to the player.
     pub fn add_experience_levels(&self, added_levels: i32) {
         let current_level = self.experience_level.load(Ordering::Relaxed);
-        let new_level = current_level + added_levels;
+        let new_level = current_level.saturating_add(added_levels);
+        if new_level < 0 {
+            self.total_experience.store(0, Ordering::Relaxed);
+            self.set_experience(0, 0.0, 0);
+            return;
+        }
         self.set_experience_level(new_level, true);
     }
 
@@ -5942,6 +5950,15 @@ impl Player {
         let current_level = self.experience_level.load(Ordering::Relaxed);
         let current_points = self.experience_points.load(Ordering::Relaxed);
 
+        // Level changes/spending do not recompute vanilla's historical XpTotal.
+        let _ = self
+            .total_experience
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |total| {
+                Some(
+                    (i64::from(total) + i64::from(added_points)).clamp(0, i64::from(i32::MAX))
+                        as i32,
+                )
+            });
         let total_exp = experience::points_to_level(current_level) as i64 + current_points as i64;
         let new_total_exp = total_exp + added_points as i64;
         let safe_new_total = new_total_exp.clamp(0, i32::MAX as i64) as i32;
@@ -7406,11 +7423,9 @@ impl EntityBase for Player {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .write_nbt(nbt);
 
-        let total_exp = experience::points_to_level(self.experience_level.load(Ordering::Relaxed))
-            + self.experience_points.load(Ordering::Relaxed);
         nbt.put_float("XpP", self.experience_progress.load());
         nbt.put_int("XpLevel", self.experience_level.load(Ordering::Relaxed));
-        nbt.put_int("XpTotal", total_exp);
+        nbt.put_int("XpTotal", self.total_experience.load(Ordering::Relaxed));
         nbt.put_int("XpSeed", self.enchantment_seed.load(Ordering::Relaxed));
         nbt.put_int("Score", self.score.load(Ordering::Relaxed));
         nbt.put_short("SleepTimer", self.sleeping_since.load().unwrap_or(0) as i16);
@@ -7440,11 +7455,7 @@ impl EntityBase for Player {
         // Store food level, saturation, exhaustion, and tick timer
         self.hunger_manager.write_nbt(nbt);
 
-        let air_supply = self
-            .breath_manager
-            .air_supply
-            .load(Ordering::Relaxed)
-            .clamp(0, super::breath::MAX_AIR);
+        let air_supply = self.breath_manager.air_supply.load(Ordering::Relaxed);
         nbt.put_short("Air", air_supply as i16);
         nbt.put_int("AirSupply", air_supply);
         nbt.put_int(
@@ -7507,6 +7518,7 @@ impl EntityBase for Player {
         let xp_p = nbt.get_float("XpP").unwrap_or(0.0);
         let xp_level = nbt.get_int("XpLevel");
         let total_exp = nbt.get_int("XpTotal").unwrap_or(0);
+        self.total_experience.store(total_exp, Ordering::Relaxed);
 
         if let Some(level) = xp_level {
             self.experience_level.store(level, Ordering::Relaxed);
@@ -7610,9 +7622,7 @@ impl EntityBase for Player {
             .or_else(|| nbt.get_short("Air").map(i32::from))
             .or_else(|| nbt.get_int("AirSupply"))
         {
-            self.breath_manager
-                .air_supply
-                .store(air.clamp(0, super::breath::MAX_AIR), Ordering::Relaxed);
+            self.breath_manager.air_supply.store(air, Ordering::Relaxed);
         }
         if let Some(tick) = nbt.get_int("DrowningTick") {
             self.breath_manager.drowning_tick.store(

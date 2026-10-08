@@ -83,7 +83,8 @@ impl NBTStorage for pumpkin_data::potion::Effect {
     fn write_nbt(&self, nbt: &mut NbtCompound) {
         nbt.put("id", self.effect_type.minecraft_name);
         if self.amplifier > 0 {
-            nbt.put("amplifier", NbtTag::Int(i32::from(self.amplifier)));
+            // Vanilla ExtraCodecs.UNSIGNED_BYTE uses the signed NBT byte's raw bits.
+            nbt.put("amplifier", NbtTag::Byte(self.amplifier as i8));
         }
         nbt.put("duration", NbtTag::Int(self.duration));
         if self.ambient {
@@ -107,15 +108,28 @@ impl NBTStorageInit for pumpkin_data::potion::Effect {
             warn!("Unable to read effect. Unknown effect type: {effect_id}");
             return None;
         };
-        let Some(show_icon) = nbt.get_byte("show_icon") else {
-            warn!("Unable to read effect. Show icon is not present");
-            return None;
+        let amplifier = match nbt.get("amplifier") {
+            None => 0,
+            Some(NbtTag::Byte(value)) => *value as u8,
+            // Accept older Pumpkin saves, which incorrectly wrote an int.
+            Some(NbtTag::Int(value)) => match u8::try_from(*value) {
+                Ok(value) => value,
+                Err(_) => {
+                    warn!("Unable to read effect. Amplifier is outside the unsigned byte range");
+                    return None;
+                }
+            },
+            Some(_) => {
+                warn!("Unable to read effect. Amplifier has an unsupported NBT type");
+                return None;
+            }
         };
-        let amplifier = nbt.get_int("amplifier").unwrap_or(0) as u8;
         let duration = nbt.get_int("duration").unwrap_or(0);
         let ambient = nbt.get_byte("ambient").unwrap_or(0) == 1;
         let show_particles = nbt.get_byte("show_particles").unwrap_or(1) == 1;
-        let show_icon = show_icon == 1;
+        let show_icon = nbt
+            .get_byte("show_icon")
+            .map_or(show_particles, |value| value == 1);
         Some(Self {
             effect_type,
             duration,
@@ -125,5 +139,67 @@ impl NBTStorageInit for pumpkin_data::potion::Effect {
             show_icon,
             blend: false,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pumpkin_data::potion::Effect;
+
+    #[test]
+    fn amplifier_reads_unsigned_bytes_and_legacy_ints_and_writes_bytes() {
+        for amplifier in [0_u8, 1, 127, 128, 255] {
+            for tag in [
+                NbtTag::Byte(amplifier as i8),
+                NbtTag::Int(i32::from(amplifier)),
+            ] {
+                let mut input = NbtCompound::new();
+                input.put_string("id", "minecraft:speed".to_owned());
+                input.put("amplifier", tag);
+                let effect = Effect::create_from_nbt(&mut input).unwrap();
+                assert_eq!(effect.amplifier, amplifier);
+                let mut saved = NbtCompound::new();
+                effect.write_nbt(&mut saved);
+                if amplifier == 0 {
+                    assert!(saved.get("amplifier").is_none());
+                } else {
+                    assert_eq!(saved.get_byte("amplifier"), Some(amplifier as i8));
+                    assert!(saved.get_int("amplifier").is_none());
+                }
+                assert_eq!(
+                    Effect::create_from_nbt(&mut saved).unwrap().amplifier,
+                    amplifier
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn missing_show_icon_defaults_to_particles_and_explicit_icon_wins() {
+        for particles in [false, true] {
+            let mut input = NbtCompound::new();
+            input.put_string("id", "minecraft:speed".to_owned());
+            input.put_bool("show_particles", particles);
+            assert_eq!(
+                Effect::create_from_nbt(&mut input).unwrap().show_icon,
+                particles
+            );
+            input.put_bool("show_icon", !particles);
+            assert_eq!(
+                Effect::create_from_nbt(&mut input).unwrap().show_icon,
+                !particles
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_amplifiers_do_not_wrap_or_default() {
+        for tag in [NbtTag::Int(-1), NbtTag::Int(256), NbtTag::Short(1)] {
+            let mut input = NbtCompound::new();
+            input.put_string("id", "minecraft:speed".to_owned());
+            input.put("amplifier", tag);
+            assert!(Effect::create_from_nbt(&mut input).is_none());
+        }
     }
 }
