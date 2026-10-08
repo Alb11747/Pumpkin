@@ -550,6 +550,11 @@ impl Server {
             ));
         }
 
+        if !world_to_unload.stop_entity_ticks_for_unload() {
+            return Err(format!(
+                "Cannot unload world '{name}' during an entity tick or another unload; retry outside the event callback"
+            ));
+        }
         world_to_unload.shutdown().await;
         world_to_unload.unload().await;
 

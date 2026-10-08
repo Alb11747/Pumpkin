@@ -12,7 +12,7 @@ use pumpkin_protocol::bedrock::network_item::NetworkItemDescriptor;
 use pumpkin_protocol::codec::data_component::data_to_proto_sound;
 use pumpkin_world::generation::proto_chunk::GenerationCache;
 use rayon::prelude::*;
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, RwLock, Weak};
 use std::{
     collections::{BTreeMap, HashMap},
@@ -22,6 +22,67 @@ use tracing::{debug, error, info, trace, warn};
 
 // Diagnostic IDs never participate in save scheduling or queue association.
 static SAVE_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+
+/// The synchronous tick may wait for a short NBT snapshot, but asynchronous
+/// saves must leave Tokio workers available for events awaited by that tick.
+#[derive(Default)]
+struct EntityTickFence {
+    mutex: std::sync::Mutex<()>,
+    released: tokio::sync::Notify,
+}
+
+struct EntityTickGuard<'a> {
+    fence: &'a EntityTickFence,
+    guard: Option<std::sync::MutexGuard<'a, ()>>,
+}
+
+impl EntityTickFence {
+    fn lock(&self) -> EntityTickGuard<'_> {
+        EntityTickGuard {
+            fence: self,
+            guard: Some(
+                self.mutex
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            ),
+        }
+    }
+
+    fn try_lock(&self) -> Option<EntityTickGuard<'_>> {
+        let guard = match self.mutex.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
+        Some(EntityTickGuard {
+            fence: self,
+            guard: Some(guard),
+        })
+    }
+
+    async fn lock_async(&self) -> EntityTickGuard<'_> {
+        loop {
+            let released = self.released.notified();
+            tokio::pin!(released);
+            // Register before trying the lock, so a release cannot be missed.
+            released.as_mut().enable();
+            if let Some(guard) = self.try_lock() {
+                return guard;
+            }
+            released.await;
+        }
+    }
+}
+
+impl Drop for EntityTickGuard<'_> {
+    fn drop(&mut self) {
+        drop(self.guard.take());
+        self.fence.released.notify_waiters();
+    }
+}
+
+#[cfg(test)]
+type EntityUnloadSnapshotHook = Box<dyn FnOnce() + Send>;
 
 mod active_chunks;
 mod block_entity_storage;
@@ -268,6 +329,13 @@ pub struct World {
     // Serialize dormant/live transitions with snapshots. In particular, an
     // unload detaches entities before its asynchronous snapshot is complete.
     entity_storage_lock: tokio::sync::Mutex<()>,
+    /// Finish already-cloned entity ticks before detaching and snapshotting an unload.
+    entity_tick_fence: EntityTickFence,
+    /// Unload reserves an idle fence before awaiting shutdown; event callbacks
+    /// must fail rather than waiting for the tick that invoked them.
+    entity_ticks_stopped: AtomicBool,
+    #[cfg(test)]
+    entity_unload_snapshot_hook: std::sync::Mutex<Option<EntityUnloadSnapshotHook>>,
     /// Actual player-owned watcher references, updated under `entity_storage_lock`.
     player_entity_chunk_watches: DashMap<i32, FxHashSet<Vector2<i32>>>,
     /// The world's scoreboard, used for tracking scores, objectives, and display information.
@@ -426,6 +494,10 @@ impl World {
             entities: ArcSwap::new(Arc::new(Vec::new())),
             preserved_entity_records: DashMap::new(),
             entity_storage_lock: tokio::sync::Mutex::new(()),
+            entity_tick_fence: EntityTickFence::default(),
+            entity_ticks_stopped: AtomicBool::new(false),
+            #[cfg(test)]
+            entity_unload_snapshot_hook: std::sync::Mutex::new(None),
             player_entity_chunk_watches: DashMap::new(),
             scoreboard: std::sync::Mutex::new(Scoreboard::default()),
             worldborder: std::sync::Mutex::new(Worldborder::new(
@@ -617,9 +689,7 @@ impl World {
         }
         self.save_dragon_fight().await;
         let entity_storage = self.entity_storage_lock.lock().await;
-        let entities = self.entities.load_full();
-        self.save_entities_by_chunk(&entities, self.level.live_entity_chunk_positions())
-            .await;
+        self.save_live_entity_chunks().await;
 
         let chunks: Vec<Vector2<i32>> = self
             .block_entities
@@ -645,28 +715,82 @@ impl World {
         self.level.shutdown().await;
     }
 
+    async fn save_live_entity_chunks(&self) {
+        let (groups, snapshot_chunks) = {
+            let _entity_ticks = self.entity_tick_fence.lock_async().await;
+            // Membership must be captured after the preceding tick finishes,
+            // including entities spawned by that tick.
+            let entities = self.entities.load();
+            let snapshot_chunks: FxHashSet<_> = self
+                .level
+                .live_entity_chunk_positions()
+                .into_iter()
+                .collect();
+            let groups = Self::snapshot_entity_groups(
+                entities
+                    .iter()
+                    .map(|entity| (entity.clone(), entity_storage::entity_storage_chunk(entity))),
+                &snapshot_chunks,
+            );
+            (groups, snapshot_chunks)
+        };
+        self.write_entity_groups(groups, &snapshot_chunks).await;
+    }
+
+    /// Reserve an idle tick phase before asynchronous world shutdown. A Bukkit
+    /// event can request unload synchronously from this world's entity tick;
+    /// blocking here would make that tick wait for its own completion.
+    pub(crate) fn stop_entity_ticks_for_unload(&self) -> bool {
+        let Some(_entity_ticks) = self.entity_tick_fence.try_lock() else {
+            return false;
+        };
+        !self.entity_ticks_stopped.swap(true, Relaxed)
+    }
+
     /// Writes `entities` into the saved data of the chunks they are in. A live chunk is
     /// rebuilt from scratch, so `snapshot_chunks` lists the live chunks that must be rewritten
     /// even when nothing is left in them; a chunk that never went live keeps its records.
+    #[cfg(test)]
     async fn save_entities_by_chunk(
         &self,
         entities: &[Arc<dyn EntityBase>],
         snapshot_chunks: impl IntoIterator<Item = Vector2<i32>>,
     ) {
+        let snapshot_chunks: FxHashSet<_> = snapshot_chunks.into_iter().collect();
+        let groups = {
+            let _entity_ticks = self.entity_tick_fence.lock_async().await;
+            Self::snapshot_entity_groups(
+                entities
+                    .iter()
+                    .map(|entity| (entity.clone(), entity_storage::entity_storage_chunk(entity))),
+                &snapshot_chunks,
+            )
+        };
+        self.write_entity_groups(groups, &snapshot_chunks).await;
+    }
+
+    fn snapshot_entity_groups(
+        entities: impl IntoIterator<Item = (Arc<dyn EntityBase>, Vector2<i32>)>,
+        snapshot_chunks: &FxHashSet<Vector2<i32>>,
+    ) -> FxHashMap<Vector2<i32>, Vec<NbtCompound>> {
         let mut groups: FxHashMap<Vector2<i32>, Vec<NbtCompound>> = FxHashMap::default();
-        for entity in entities {
-            let Some(nbt) = entity_storage::save_entity_tree(entity) else {
+        for (entity, position) in entities {
+            let Some(nbt) = entity_storage::save_entity_tree(&entity) else {
                 continue;
             };
-            groups
-                .entry(entity_storage::entity_storage_chunk(entity))
-                .or_default()
-                .push(nbt);
+            groups.entry(position).or_default().push(nbt);
         }
         for pos in snapshot_chunks {
-            groups.entry(pos).or_default();
+            groups.entry(*pos).or_default();
         }
+        groups
+    }
 
+    async fn write_entity_groups(
+        &self,
+        groups: FxHashMap<Vector2<i32>, Vec<NbtCompound>>,
+        snapshot_chunks: &FxHashSet<Vector2<i32>>,
+    ) {
         for (pos, mut records) in groups {
             if let Some(preserved) = self.preserved_entity_records.get(&pos) {
                 records.extend(preserved.iter().cloned());
@@ -680,6 +804,10 @@ impl World {
                 self.level.get_entity_chunk(pos).await
             };
             let live = chunk.live.load(Relaxed);
+            debug_assert!(
+                !live || snapshot_chunks.contains(&pos),
+                "live entity chunks require a complete snapshot"
+            );
             if !live && records.is_empty() {
                 continue;
             }
@@ -1574,6 +1702,9 @@ impl World {
 
     #[expect(clippy::too_many_lines)]
     pub fn tick(self: &Arc<Self>, server: &Arc<Server>) {
+        if self.entity_ticks_stopped.load(Relaxed) {
+            return;
+        }
         const ENTITY_TICK_BATCH_SIZE: usize = 16;
 
         let start = std::time::Instant::now();
@@ -1629,12 +1760,21 @@ impl World {
         players.par_iter().for_each(|player| {
             let _guard = player_handle.enter();
             player.tick(server);
+        });
+        let player_elapsed = t_players.elapsed();
+
+        let entity_ticks = self.entity_tick_fence.lock();
+        if self.entity_ticks_stopped.load(Relaxed) {
+            return;
+        }
+        // Nonplayer passengers riding a player are standalone persistence roots.
+        // Their recursion needs the same fence as ordinary nonplayer mounts.
+        players.par_iter().for_each(|player| {
+            let _guard = player_handle.enter();
             if !player.get_entity().has_vehicle() {
                 player.tick_passengers(server);
             }
         });
-        let player_elapsed = t_players.elapsed();
-
         let entities_to_tick = self.entities.load();
         let entity_count = entities_to_tick.len();
         let active_chunks = self
@@ -1704,6 +1844,7 @@ impl World {
                 }
             });
         let entity_elapsed = t_entities.elapsed();
+        drop(entity_ticks);
 
         self.entity_tracker.update_all(self);
 
@@ -5283,50 +5424,60 @@ impl World {
         if chunks_set.is_empty() {
             return;
         }
-        let mut entities_to_remove = Vec::new();
-
-        self.entities.rcu(|current_entities| {
-            entities_to_remove.clear();
-            let mut new_entities = (**current_entities).clone();
-            new_entities.retain(|entity| {
-                let pos = entity_storage::entity_storage_chunk(entity);
-                if chunks_set.contains(&pos) {
-                    entities_to_remove.push(entity.clone());
-                    false
-                } else {
-                    true
-                }
+        let (entities_to_remove, snapshot_chunks, groups) = {
+            let _entity_ticks = self.entity_tick_fence.lock_async().await;
+            let mut entities_to_remove = Vec::new();
+            self.entities.rcu(|current_entities| {
+                entities_to_remove.clear();
+                let mut new_entities = (**current_entities).clone();
+                new_entities.retain(|entity| {
+                    let pos = entity_storage::entity_storage_chunk(entity);
+                    if chunks_set.contains(&pos) {
+                        entities_to_remove.push((entity.clone(), pos));
+                        false
+                    } else {
+                        true
+                    }
+                });
+                new_entities
             });
-            new_entities
-        });
 
-        // A mounted passenger can still have a standalone snapshot in its
-        // previous chunk. Refresh those live chunks without unloading their roots.
-        let mut snapshot_chunks = chunks_set.clone();
-        for entity in &entities_to_remove {
-            let position = entity.get_entity().chunk_pos.load();
-            if self
-                .level
-                .get_entity_chunk_sync(&position)
-                .is_some_and(|chunk| chunk.live.load(Relaxed))
-            {
-                snapshot_chunks.insert(position);
+            // A mounted passenger can still have a standalone snapshot in its
+            // previous chunk. Refresh those live chunks without unloading their roots.
+            let mut snapshot_chunks = chunks_set.clone();
+            for (entity, _) in &entities_to_remove {
+                let position = entity.get_entity().chunk_pos.load();
+                if self
+                    .level
+                    .get_entity_chunk_sync(&position)
+                    .is_some_and(|chunk| chunk.live.load(Relaxed))
+                {
+                    snapshot_chunks.insert(position);
+                }
             }
-        }
-        let mut entities_to_save = entities_to_remove.clone();
-        entities_to_save.extend(
-            self.entities
-                .load()
-                .iter()
-                .filter(|entity| {
-                    snapshot_chunks.contains(&entity_storage::entity_storage_chunk(entity))
-                })
-                .cloned(),
-        );
-        self.save_entities_by_chunk(&entities_to_save, snapshot_chunks)
-            .await;
+            let mut entities_to_save = entities_to_remove.clone();
+            entities_to_save.extend(self.entities.load().iter().filter_map(|entity| {
+                let position = entity_storage::entity_storage_chunk(entity);
+                snapshot_chunks
+                    .contains(&position)
+                    .then(|| (entity.clone(), position))
+            }));
+            #[cfg(test)]
+            if let Some(hook) = self
+                .entity_unload_snapshot_hook
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+            {
+                hook();
+            }
+            let groups = Self::snapshot_entity_groups(entities_to_save, &snapshot_chunks);
+            (entities_to_remove, snapshot_chunks, groups)
+        };
+        // No synchronous tick fence is held during cache fetches or disk I/O.
+        self.write_entity_groups(groups, &snapshot_chunks).await;
 
-        for entity in entities_to_remove {
+        for (entity, _) in entities_to_remove {
             // Saved mounts hold references in both directions. Break them only
             // after the complete tree has been serialized.
             let base = entity.get_entity();
@@ -7402,9 +7553,7 @@ impl World {
         self.log_save_request("request_begin", request_id, origin, cycle);
         self.save_dragon_fight().await;
         let entity_storage = self.entity_storage_lock.lock().await;
-        let entities = self.entities.load_full();
-        self.save_entities_by_chunk(&entities, self.level.live_entity_chunk_positions())
-            .await;
+        self.save_live_entity_chunks().await;
         if let Err(error) = self.level.save_entity_chunks().await {
             error!("Failed to save entity snapshots: {error}");
         }
