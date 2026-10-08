@@ -166,6 +166,11 @@ POSITIVE_GATES = {
             "entity::living::tests::damage_events_use_exact_registry_keys_instead_of_translation_or_debug_names",
         ]),
     ],
+    "entity-crossing-repeat": [
+        ("pumpkin-core", "world::entity_storage::tests::unload_crossing_frog_keeps_source_and_live_neighbor_records", [
+            "world::entity_storage::tests::unload_crossing_frog_keeps_source_and_live_neighbor_records",
+        ]),
+    ] * 3,
     "save-scheduler": [
         ("pumpkin-world", "chunk_system::schedule::save_lineage_tests::save_lineage_fifo_counts_unload_save_and_no_batch_per_world", [
             "chunk_system::schedule::save_lineage_tests::save_lineage_fifo_counts_unload_save_and_no_batch_per_world",

@@ -207,6 +207,10 @@ jobs:
         env:
           CARGO_TARGET_DIR: ${{ runner.temp }}/fobbitmc-release-target
         run: python build-control/.github/scripts/fobbitmc_release.py positive '${{ matrix.target }}' entity-persistence
+      - name: Prove entity crossing in three fresh test processes
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/fobbitmc-release-target
+        run: python build-control/.github/scripts/fobbitmc_release.py positive '${{ matrix.target }}' entity-crossing-repeat
       - name: Prove save-lineage scheduler counts and FIFO context
         env:
           CARGO_TARGET_DIR: ${{ runner.temp }}/fobbitmc-release-target
