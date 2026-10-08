@@ -449,7 +449,9 @@ impl EntityBase for ArrowEntity {
             self.life.store(life.max(0) as u32, Ordering::Relaxed);
         }
         if let Some(shake) = nbt.get_byte("shake") {
-            self.shake_time.store(shake.max(0) as u8, Ordering::Relaxed);
+            // AbstractArrow reads this byte with an unsigned mask.
+            self.shake_time
+                .store(shake.cast_unsigned(), Ordering::Relaxed);
         }
         if let Some(pierce) = nbt.get_byte("PierceLevel") {
             self.pierce_level
@@ -1120,6 +1122,7 @@ fn get_hit_face(hit_pos: Vector3<f64>, block_pos: BlockPos) -> pumpkin_data::Blo
 #[cfg(test)]
 mod tests {
     use super::ArrowEntity;
+    use crate::entity::{Entity, EntityBase, vehicle::tests::test_world};
     use pumpkin_data::data_component::DataComponent;
     use pumpkin_data::data_component_impl::{
         DataComponentImpl, PotionContentsImpl, PotionDurationScaleImpl,
@@ -1127,6 +1130,28 @@ mod tests {
     use pumpkin_data::entity::EntityType;
     use pumpkin_data::item::Item;
     use pumpkin_data::item_stack::ItemStack;
+    use pumpkin_nbt::compound::NbtCompound;
+    use pumpkin_util::math::vector3::Vector3;
+    use std::sync::atomic::Ordering;
+
+    #[tokio::test]
+    async fn arrow_shake_nbt_preserves_unsigned_byte_values() {
+        let directory = tempfile::tempdir().unwrap();
+        let world = test_world(directory.path());
+        let arrow = ArrowEntity::new(
+            Entity::new(world, Vector3::default(), &EntityType::ARROW),
+            None,
+        );
+        for shake in [0u8, 1, 127, 128, 255] {
+            let mut imported = NbtCompound::new();
+            imported.put_byte("shake", shake.cast_signed());
+            arrow.read_custom_nbt(&imported);
+            assert_eq!(arrow.shake_time.load(Ordering::Relaxed), shake);
+            let mut saved = NbtCompound::new();
+            arrow.write_custom_nbt(&mut saved);
+            assert_eq!(saved.get_byte("shake"), Some(shake.cast_signed()));
+        }
+    }
 
     fn tipped_payload(count: u8) -> ItemStack {
         let mut tipped = ItemStack::new(32, &Item::TIPPED_ARROW);

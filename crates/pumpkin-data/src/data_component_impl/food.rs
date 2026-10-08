@@ -63,11 +63,20 @@ impl StatusEffectInstance {
     pub fn read_data(nbt: &NbtTag) -> Option<Self> {
         let compound = nbt.extract_compound()?;
         let effect_id = Cow::Owned(compound.get_string("id")?.to_string());
-        let amplifier = compound.get_int("amplifier")?;
-        let duration = compound.get_int("duration")?;
-        let ambient = compound.get_bool("ambient")?;
-        let show_particles = compound.get_bool("show_particles")?;
-        let show_icon = compound.get_bool("show_icon")?;
+        // MobEffectInstance.Details uses ExtraCodecs.UNSIGNED_BYTE; older Pumpkin saves used Int.
+        let amplifier = match compound.get("amplifier") {
+            None => 0,
+            Some(NbtTag::Byte(value)) => i32::from(value.cast_unsigned()),
+            Some(NbtTag::Int(value)) => i32::from(u8::try_from(*value).ok()?),
+            Some(_) => return None,
+        };
+        let duration = compound
+            .get_int("duration")
+            .or_else(|| compound.get_byte("duration").map(i32::from))
+            .unwrap_or(0);
+        let ambient = compound.get_bool("ambient").unwrap_or(false);
+        let show_particles = compound.get_bool("show_particles").unwrap_or(true);
+        let show_icon = compound.get_bool("show_icon").unwrap_or(show_particles);
         Some(Self {
             effect_id,
             amplifier,
@@ -81,7 +90,7 @@ impl StatusEffectInstance {
     pub fn as_nbt(&self) -> NbtTag {
         let mut compound = NbtCompound::new();
         compound.put_string("id", self.effect_id.to_string());
-        compound.put_int("amplifier", self.amplifier);
+        compound.put_byte("amplifier", self.amplifier as i8);
         compound.put_int("duration", self.duration);
         compound.put_bool("ambient", self.ambient);
         compound.put_bool("show_particles", self.show_particles);
@@ -478,30 +487,7 @@ impl PotionContentsImpl {
             .get_list("custom_effects")
             .map(|list| {
                 list.iter()
-                    .filter_map(|item| {
-                        let effect_tag = item.extract_compound()?;
-                        let id: Cow<'static, str> =
-                            Cow::Owned(effect_tag.get_string("id")?.to_string());
-                        let amplifier = effect_tag
-                            .get_int("amplifier")
-                            .or_else(|| effect_tag.get_byte("amplifier").map(i32::from))
-                            .unwrap_or(0);
-                        let duration = effect_tag
-                            .get_int("duration")
-                            .or_else(|| effect_tag.get_byte("duration").map(i32::from))
-                            .unwrap_or(0);
-                        let ambient = effect_tag.get_bool("ambient").unwrap_or(false);
-                        let show_particles = effect_tag.get_bool("show_particles").unwrap_or(true);
-                        let show_icon = effect_tag.get_bool("show_icon").unwrap_or(true);
-                        Some(StatusEffectInstance {
-                            effect_id: id,
-                            amplifier,
-                            duration,
-                            ambient,
-                            show_particles,
-                            show_icon,
-                        })
-                    })
+                    .filter_map(StatusEffectInstance::read_data)
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
@@ -525,14 +511,7 @@ impl DataComponentImpl for PotionContentsImpl {
         if !self.custom_effects.is_empty() {
             let mut effects_list = Vec::new();
             for effect in &self.custom_effects {
-                let mut effect_compound = NbtCompound::new();
-                effect_compound.put_string("id", effect.effect_id.to_string());
-                effect_compound.put_int("amplifier", effect.amplifier);
-                effect_compound.put_int("duration", effect.duration);
-                effect_compound.put_byte("ambient", effect.ambient as i8);
-                effect_compound.put_byte("show_particles", effect.show_particles as i8);
-                effect_compound.put_byte("show_icon", effect.show_icon as i8);
-                effects_list.push(NbtTag::Compound(effect_compound));
+                effects_list.push(effect.as_nbt());
             }
             compound.put("custom_effects", NbtTag::List(effects_list));
         }
@@ -592,8 +571,70 @@ impl Hash for PotionDurationScaleImpl {
 
 #[cfg(test)]
 mod tests {
-    use super::{DataComponentImpl, PotionDurationScaleImpl};
+    use super::{
+        DataComponentImpl, PotionContentsImpl, PotionDurationScaleImpl, StatusEffectInstance,
+    };
     use crate::item::Item;
+    use pumpkin_nbt::{compound::NbtCompound, tag::NbtTag};
+
+    #[test]
+    fn potion_custom_effects_use_unsigned_byte_amplifiers_and_vanilla_defaults() {
+        for amplifier in [0, 1, 127, 128, 255] {
+            let mut effect = NbtCompound::new();
+            effect.put_string("id", "minecraft:speed".to_owned());
+            effect.put_byte("amplifier", amplifier as i8);
+            effect.put_bool("show_particles", false);
+            let effect = NbtTag::Compound(effect);
+            let mut potion = NbtCompound::new();
+            potion.put_list("custom_effects", vec![effect.clone()]);
+            let decoded = PotionContentsImpl::read_data(&NbtTag::Compound(potion))
+                .expect("vanilla effect should decode");
+            let decoded_effect = &decoded.custom_effects[0];
+            assert_eq!(decoded_effect.amplifier, amplifier);
+            assert_eq!(decoded_effect.duration, 0);
+            assert!(!decoded_effect.ambient);
+            assert!(!decoded_effect.show_icon);
+            assert_eq!(
+                StatusEffectInstance::read_data(&effect).as_ref(),
+                Some(decoded_effect)
+            );
+            let written = decoded.write_data();
+            let written_effect = written
+                .extract_compound()
+                .unwrap()
+                .get_list("custom_effects")
+                .unwrap()[0]
+                .extract_compound()
+                .unwrap();
+            assert_eq!(written_effect.get_byte("amplifier"), Some(amplifier as i8));
+        }
+    }
+
+    #[test]
+    fn effect_components_accept_bounded_legacy_amplifiers_and_default_icons() {
+        let mut effect = NbtCompound::new();
+        effect.put_string("id", "minecraft:speed".to_owned());
+        let defaults = StatusEffectInstance::read_data(&NbtTag::Compound(effect.clone())).unwrap();
+        assert_eq!(defaults.amplifier, 0);
+        assert!(defaults.show_particles && defaults.show_icon);
+        for amplifier in [0, 1, 127, 128, 255] {
+            effect.put_int("amplifier", amplifier);
+            let decoded =
+                StatusEffectInstance::read_data(&NbtTag::Compound(effect.clone())).unwrap();
+            assert_eq!(decoded.amplifier, amplifier);
+        }
+        for amplifier in [-1, 256] {
+            effect.put_int("amplifier", amplifier);
+            assert!(StatusEffectInstance::read_data(&NbtTag::Compound(effect.clone())).is_none());
+        }
+        effect.put_float("amplifier", 1.0);
+        assert!(StatusEffectInstance::read_data(&NbtTag::Compound(effect.clone())).is_none());
+        effect.put_byte("amplifier", 1);
+        effect.put_bool("show_particles", false);
+        effect.put_bool("show_icon", true);
+        let explicit = StatusEffectInstance::read_data(&NbtTag::Compound(effect)).unwrap();
+        assert!(explicit.show_icon);
+    }
 
     #[test]
     fn potion_duration_scale_round_trips_as_a_float() {
