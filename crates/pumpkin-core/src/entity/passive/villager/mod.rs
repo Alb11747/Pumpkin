@@ -1036,6 +1036,14 @@ impl VillagerEntity {
         }
         self.last_worked_at_poi.store(game_time, Ordering::Relaxed);
 
+        self.work_at_poi(game_time, day);
+    }
+
+    fn work_at_poi(&self, game_time: i64, day: i64) {
+        // WorkAtPoi requires JOB_SITE; a pending claim is still POTENTIAL_JOB_SITE.
+        if self.job_site_pending.load(Ordering::Relaxed) {
+            return;
+        }
         let Some(job_site) = self.get_job_site() else {
             return;
         };
@@ -2607,6 +2615,78 @@ mod tests {
         assert_eq!(villager.offers.lock().unwrap()[0].uses, 1);
         assert_eq!(villager.xp.load(Ordering::Relaxed), 2);
         server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn only_assigned_job_sites_restock_and_respect_the_second_restock_cooldown() {
+        use crate::block::registry::BlockRegistry;
+        use pumpkin_config::world::LevelConfig;
+        use pumpkin_world::{level::Level, world_info::LevelData};
+
+        let directory = tempfile::tempdir().unwrap();
+        let dimension = Dimension::THE_END;
+        let level = Level::from_root_folder(
+            &LevelConfig::default(),
+            directory.path().to_path_buf(),
+            0,
+            dimension.clone(),
+        )
+        .unwrap();
+        let world = Arc::new(
+            World::load(
+                level,
+                Arc::new(ArcSwap::from_pointee(LevelData::default(Seed(0)))),
+                dimension,
+                Arc::new(BlockRegistry::default()),
+                Weak::new(),
+            )
+            .unwrap(),
+        );
+        let site = BlockPos::new(0, 80, 0);
+        let villager = VillagerEntity::new(Entity::new(
+            world.clone(),
+            site.to_centered_f64(),
+            &EntityType::VILLAGER,
+        ));
+        *villager.job_site.lock().unwrap() = Some(site);
+        villager.job_site_pending.store(true, Ordering::Relaxed);
+        villager.offers.lock().unwrap().push(MerchantOffer {
+            base_cost_a: ItemStackSerializer(Cow::Owned(ItemStack::new(1, &Item::EMERALD))),
+            output: ItemStackSerializer(Cow::Owned(ItemStack::new(1, &Item::REDSTONE))),
+            cost_b: None,
+            reward_exp: false,
+            uses: 12,
+            max_uses: 12,
+            xp: 2,
+            special_price: 0,
+            price_multiplier: 0.0,
+            demand: 0,
+        });
+
+        // Invoke the work phase directly so the random start check cannot hide the regression.
+        villager.work_at_poi(3_000, 0);
+        assert_eq!(villager.offers.lock().unwrap()[0].uses, 12);
+        assert_eq!(villager.restocks_today.load(Ordering::Relaxed), 0);
+        assert_eq!(villager.last_restock_time.load(Ordering::Relaxed), 0);
+
+        villager.job_site_pending.store(false, Ordering::Relaxed);
+        villager.work_at_poi(3_000, 0);
+        assert_eq!(villager.offers.lock().unwrap()[0].uses, 0);
+        assert_eq!(villager.restocks_today.load(Ordering::Relaxed), 1);
+        assert_eq!(villager.last_restock_time.load(Ordering::Relaxed), 3_000);
+
+        villager.offers.lock().unwrap()[0].uses = 12;
+        villager.work_at_poi(5_400, 0);
+        assert_eq!(villager.offers.lock().unwrap()[0].uses, 12);
+        villager.work_at_poi(5_401, 0);
+        assert_eq!(villager.offers.lock().unwrap()[0].uses, 0);
+        assert_eq!(villager.restocks_today.load(Ordering::Relaxed), 2);
+
+        villager.offers.lock().unwrap()[0].uses = 12;
+        villager.work_at_poi(7_802, 0);
+        assert_eq!(villager.offers.lock().unwrap()[0].uses, 12);
+        assert_eq!(villager.restocks_today.load(Ordering::Relaxed), 2);
+        world.level.shutdown().await;
     }
 
     #[tokio::test]
