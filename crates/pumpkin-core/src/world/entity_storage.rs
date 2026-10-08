@@ -1738,6 +1738,13 @@ mod tests {
 
     #[tokio::test]
     async fn unload_crossing_frog_keeps_source_and_live_neighbor_records() {
+        use pumpkin_config::chunk::AnvilChunkConfig;
+        use pumpkin_world::chunk::{
+            ChunkEntityData,
+            format::anvil::AnvilChunkFile,
+            io::{FileIO, LoadedData, file_manager::ChunkFileManager},
+        };
+
         let directory = tempfile::tempdir().unwrap();
         let world = test_world(directory.path());
         let a = Vector2::new(0, 0);
@@ -1795,15 +1802,9 @@ mod tests {
             assert!(
                 records.iter().all(|entity| entity.get_string("opaque")
                     == Some("retained across unload and reload"))
-            );
-        }
-        // A new serializer reads actual committed files, without the world's cache.
-        use pumpkin_config::chunk::AnvilChunkConfig;
-        use pumpkin_world::chunk::{
-            ChunkEntityData,
-            format::anvil::AnvilChunkFile,
-            io::{FileIO, LoadedData, file_manager::ChunkFileManager},
+            )
         };
+        // A new serializer reads actual committed files, without the world's cache.
         let reader =
             ChunkFileManager::<AnvilChunkFile<ChunkEntityData>>::new(AnvilChunkConfig::default());
         let (send, mut stream) = tokio::sync::mpsc::channel(2);

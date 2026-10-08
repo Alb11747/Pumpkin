@@ -1702,10 +1702,11 @@ impl World {
 
     #[expect(clippy::too_many_lines)]
     pub fn tick(self: &Arc<Self>, server: &Arc<Server>) {
+        const ENTITY_TICK_BATCH_SIZE: usize = 16;
+
         if self.entity_ticks_stopped.load(Relaxed) {
             return;
         }
-        const ENTITY_TICK_BATCH_SIZE: usize = 16;
 
         let start = std::time::Instant::now();
 
