@@ -646,7 +646,7 @@ pub struct Player {
     pub experience_progress: AtomicCell<f32>,
     /// The player's points within the current level.
     pub experience_points: AtomicI32,
-    /// Vanilla's independently tracked XpTotal, including points spent on enchanting.
+    /// Vanilla's independently tracked `XpTotal`, including points spent on enchanting.
     total_experience: AtomicI32,
     pub item_cooldowns: std::sync::Mutex<HashMap<String, ItemCooldown>>,
     pub experience_pick_up_delay: Mutex<u32>,

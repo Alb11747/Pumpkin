@@ -112,13 +112,14 @@ impl NBTStorageInit for pumpkin_data::potion::Effect {
             None => 0,
             Some(NbtTag::Byte(value)) => *value as u8,
             // Accept older Pumpkin saves, which incorrectly wrote an int.
-            Some(NbtTag::Int(value)) => match u8::try_from(*value) {
-                Ok(value) => value,
-                Err(_) => {
+            Some(NbtTag::Int(value)) => {
+                if let Ok(value) = u8::try_from(*value) {
+                    value
+                } else {
                     warn!("Unable to read effect. Amplifier is outside the unsigned byte range");
                     return None;
                 }
-            },
+            }
             Some(_) => {
                 warn!("Unable to read effect. Amplifier has an unsupported NBT type");
                 return None;
@@ -149,7 +150,7 @@ mod tests {
 
     #[test]
     fn amplifier_reads_unsigned_bytes_and_legacy_ints_and_writes_bytes() {
-        for amplifier in [0_u8, 1, 127, 128, 255] {
+        for amplifier in [0u8, 1, 127, 128, 255] {
             for tag in [
                 NbtTag::Byte(amplifier as i8),
                 NbtTag::Int(i32::from(amplifier)),
