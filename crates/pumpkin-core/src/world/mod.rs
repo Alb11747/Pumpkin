@@ -88,6 +88,7 @@ mod active_chunks;
 mod block_entity_storage;
 pub mod brightness;
 pub mod chunker;
+mod entity_audit;
 pub mod explosion;
 pub mod generation_cache;
 pub mod loot;
@@ -451,6 +452,7 @@ impl World {
         block_registry: Arc<BlockRegistry>,
         server: Weak<Server>,
     ) -> Result<Self, pumpkin_world::world_info::WorldInfoError> {
+        entity_audit::configure()?;
         // TODO
         let generation_settings = NoiseSettings::from_dimension(&dimension);
 
@@ -689,6 +691,12 @@ impl World {
         }
         self.save_dragon_fight().await;
         let entity_storage = self.entity_storage_lock.lock().await;
+        if entity_audit::enabled() {
+            let _entity_ticks = self.entity_tick_fence.lock_async().await;
+            for entity in self.entities.load().iter() {
+                entity_audit::live(self, entity, "shutdown_live", "final_save_pending");
+            }
+        }
         self.save_live_entity_chunks().await;
 
         let chunks: Vec<Vector2<i32>> = self
@@ -4679,13 +4687,23 @@ impl World {
                 Ok(entities)
                     if self.add_entity_tree_silent_excluding(&entities, excluded_viewer) =>
                 {
+                    for entity in &entities {
+                        entity_audit::live(self, entity, "admission", "Admitted");
+                    }
                     loaded.extend(entities);
                 }
                 Ok(_) | Err(entity_storage::EntityLoadError::AlreadyLive) => {
+                    entity_audit::rejected(
+                        self,
+                        &record,
+                        "AlreadyLiveOrDuplicateDelivery",
+                        "duplicate live entity tree",
+                    );
                     duplicate_delivery = true;
                     debug!("Skipping duplicate live entity tree in chunk {position:?}");
                 }
                 Err(entity_storage::EntityLoadError::Unsupported(reason)) => {
+                    entity_audit::rejected(self, &record, "Unsupported", reason);
                     warn!("Preserving unloaded entity tree in chunk {position:?}: {reason}");
                     preserved.push(record);
                 }
@@ -5331,6 +5349,7 @@ impl World {
         {
             return;
         }
+        entity_audit::removal(self, entity, reason);
         base_entity.removed.store(true, Ordering::Release);
 
         self.spawn_state.load().remove_entity(self, entity);
@@ -5476,9 +5495,13 @@ impl World {
             (entities_to_remove, snapshot_chunks, groups)
         };
         // No synchronous tick fence is held during cache fetches or disk I/O.
+        for (entity, _) in &entities_to_remove {
+            entity_audit::live(self, entity, "unload_snapshot_begin", "UnloadedToChunk");
+        }
         self.write_entity_groups(groups, &snapshot_chunks).await;
 
         for (entity, _) in entities_to_remove {
+            entity_audit::live(self, &entity, "unload_snapshot_queued", "UnloadedToChunk");
             // Saved mounts hold references in both directions. Break them only
             // after the complete tree has been serialized.
             let base = entity.get_entity();

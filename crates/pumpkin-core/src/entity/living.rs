@@ -23,7 +23,7 @@ use std::sync::atomic::{
 use tracing::warn;
 
 use super::experience_orb::ExperienceOrbEntity;
-use super::{Entity, EntityBase, NBTStorageInit};
+use super::{Entity, EntityBase, NBTStorageInit, RemovalReason};
 use crate::block::OnLandedUponArgs;
 use crate::entity::NBTStorage;
 use crate::entity::ageable::AgeableMob;
@@ -2584,6 +2584,18 @@ impl LivingEntity {
         *last
     }
 
+    /// Read-only diagnostics; unlike the gameplay getter, never expires state.
+    pub(crate) fn last_damage_snapshot(&self) -> (Option<String>, i64) {
+        let last = *self
+            .last_damage_type
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (
+            last.and_then(damage_type_key),
+            self.last_damage_stamp.load(Relaxed),
+        )
+    }
+
     pub fn can_take_damage(&self) -> bool {
         !self.entity.invulnerable.load(Ordering::Relaxed) && self.is_part_of_game()
     }
@@ -3644,7 +3656,10 @@ impl EntityBase for LivingEntity {
                     .world
                     .load()
                     .send_entity_status(&self.entity, EntityStatus::Poof, None);
-                self.entity.remove();
+                self.entity
+                    .world
+                    .load()
+                    .remove_entity_with_reason(self, RemovalReason::Killed);
             }
         }
     }
