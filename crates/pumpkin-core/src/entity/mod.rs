@@ -1370,7 +1370,7 @@ impl Entity {
     }
 
     pub fn get_eye_height(&self) -> f64 {
-        f64::from(Self::get_entity_dimensions(self.pose.load()).eye_height)
+        f64::from(self.entity_dimension.load().eye_height)
     }
 
     /// Updates the entity's position, block position, and chunk position.
@@ -3102,7 +3102,12 @@ impl Entity {
             }
         }
 
-        let dimension = Self::get_entity_dimensions(pose);
+        // Player poses change body size; mob animations retain their own dimensions.
+        let dimension = if self.entity_type == &EntityType::PLAYER {
+            Self::get_entity_dimensions(pose)
+        } else {
+            self.entity_dimension.load()
+        };
         let position = self.pos.load();
         let aabb = BoundingBox::new_from_pos(position.x, position.y, position.z, &dimension);
         self.pose.store(pose);
