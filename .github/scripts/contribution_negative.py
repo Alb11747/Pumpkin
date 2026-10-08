@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 import subprocess
 
-BASE = "f1c0871f492182a228fa585e9d7c74e683e242f9"
+BASE = "d44f0c6a44e3b28bc581cb6962adf75d1f555c83"
 kind = os.environ["CONTRIBUTION_KIND"]
 package = os.environ["CONTRIBUTION_PACKAGE"]
 test = os.environ["CONTRIBUTION_TEST"]

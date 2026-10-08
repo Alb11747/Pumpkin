@@ -6,11 +6,11 @@ on:
       region_ref:
         type: string
         required: true
-        default: 2b2b474d046c5aa1b5dbf7befae2cd4c33d4824f
+        default: 6d10390d3d8f5835313c1eab5294ac71f1972360
       teleport_ref:
         type: string
         required: true
-        default: e93424943cec662cf06bf9d21ecd05c405b3bac8
+        default: 33734b626d97ffdab36a9a28a2cdc9969960444f
 
 permissions:
   contents: read
