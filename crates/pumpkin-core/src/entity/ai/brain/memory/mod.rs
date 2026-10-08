@@ -504,6 +504,31 @@ mod tests {
     }
 
     #[test]
+    fn pumpkin_tempted_flag_is_transient_while_vanilla_cooldown_round_trips() {
+        let mut store = MemoryStore::default();
+        store.register(types::IS_TEMPTED.id());
+        store.register(types::LONG_JUMP_COOLDOWN_TICKS.id());
+        store.set(types::IS_TEMPTED, true);
+        store.set_with_expiry(types::LONG_JUMP_COOLDOWN_TICKS, 37, 81);
+        let written = store.pack().into_nbt();
+        let memories = written.get_compound("memories").unwrap();
+        assert!(memories.get(types::IS_TEMPTED.id().name()).is_none());
+        assert_eq!(memories.child_tags.len(), 1);
+        assert_eq!(store.get(types::IS_TEMPTED), Some(&true));
+
+        let mut restored = MemoryStore::default();
+        restored.register(types::IS_TEMPTED.id());
+        restored.register(types::LONG_JUMP_COOLDOWN_TICKS.id());
+        restored.load_packed(&PackedMemories::from_nbt(&written));
+        assert_eq!(restored.get(types::IS_TEMPTED), None);
+        assert_eq!(restored.get(types::LONG_JUMP_COOLDOWN_TICKS), Some(&37));
+        assert_eq!(
+            restored.time_until_expiry(types::LONG_JUMP_COOLDOWN_TICKS.id()),
+            Some(81)
+        );
+    }
+
+    #[test]
     fn ttl_is_packed_only_when_the_slot_can_expire() {
         let mut store = MemoryStore::default();
         store.register(types::ADMIRING_ITEM.id());

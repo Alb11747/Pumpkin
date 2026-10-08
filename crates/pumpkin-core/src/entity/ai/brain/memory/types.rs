@@ -83,7 +83,8 @@ memory_module_types! {
     40 TEMPTING_PLAYER: Arc<Player> = "minecraft:tempting_player", None;
     41 TEMPTATION_COOLDOWN_TICKS: i32 = "minecraft:temptation_cooldown_ticks", Some(&codec::INT);
     42 GAZE_COOLDOWN_TICKS: i32 = "minecraft:gaze_cooldown_ticks", Some(&codec::INT);
-    43 IS_TEMPTED: bool = "minecraft:is_tempted", Some(&codec::BOOL);
+    // Pumpkin runtime flag; this key is absent from the 26.3 memory registry.
+    43 IS_TEMPTED: bool = "minecraft:is_tempted", None;
     44 LONG_JUMP_COOLDOWN_TICKS: i32 = "minecraft:long_jump_cooling_down", Some(&codec::INT);
     45 LONG_JUMP_MID_JUMP: bool = "minecraft:long_jump_mid_jump", None;
     46 HAS_HUNTING_COOLDOWN: bool = "minecraft:has_hunting_cooldown", Some(&codec::BOOL);
@@ -178,7 +179,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn registry_has_every_vanilla_type_in_declaration_order() {
+    fn registry_keeps_runtime_types_in_declaration_order() {
         assert_eq!(MEMORY_TYPE_COUNT, 116);
         for (index, declared) in DECLARED_IDS.iter().enumerate() {
             assert_eq!(usize::from(*declared), index);
@@ -210,6 +211,6 @@ mod tests {
     #[test]
     fn persistent_type_count_matches_vanilla() {
         let persistent = CODECS.iter().filter(|codec| codec.is_some()).count();
-        assert_eq!(persistent, 53);
+        assert_eq!(persistent, 52);
     }
 }

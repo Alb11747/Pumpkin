@@ -44,6 +44,20 @@ impl PreservedNbt {
         }
     }
 
+    pub(crate) fn discard_path(&mut self, path: &[&str]) {
+        let Some((name, parents)) = path.split_last() else {
+            return;
+        };
+        let mut compound = &mut self.raw;
+        for parent in parents {
+            let Some(NbtTag::Compound(child)) = compound.child_tags.get_mut(*parent) else {
+                return;
+            };
+            compound = child;
+        }
+        compound.child_tags.remove(*name);
+    }
+
     pub(crate) fn discard_aliases(&mut self, current: &NbtCompound, aliases: &[(&str, &str)]) {
         for (alias, canonical) in aliases {
             if current.get(canonical).is_some() || self.modeled.0.contains_key(*canonical) {

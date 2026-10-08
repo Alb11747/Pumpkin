@@ -91,6 +91,14 @@ pub(super) fn load_entity_tree(
         entity.write_nbt(&mut modeled);
         let mut preserved = crate::data::preserved_nbt::PreservedNbt::new(nbt, &modeled);
         preserved.discard(&["Passengers"]);
+        // Remove only Pumpkin's obsolete serialized flag; keep opaque Brain data.
+        preserved.discard_path(&[
+            "Brain",
+            "memories",
+            crate::entity::ai::brain::memory::types::IS_TEMPTED
+                .id()
+                .name(),
+        ]);
         preserved.discard_aliases(&modeled, &[("BukkitValues", "PumpkinCustomData")]);
         preserved.discard_aliases(&modeled, entity.nbt_aliases());
         let base = entity.get_entity();
@@ -366,6 +374,45 @@ mod tests {
             )
             .unwrap(),
         )
+    }
+
+    #[tokio::test]
+    async fn loaded_frog_drops_obsolete_tempted_key_and_preserves_opaque_brain_data() {
+        let directory = tempfile::tempdir().unwrap();
+        let world = test_world(directory.path());
+        let mut raw = NbtCompound::new();
+        raw.put_string("id", "minecraft:frog".into());
+        raw.put_uuid("UUID", Uuid::from_u128(710));
+        raw.put_list("Pos", vec![0.5.into(), 64.0.into(), 0.5.into()]);
+        let mut flag = NbtCompound::new();
+        flag.put_bool("value", true);
+        let mut cooldown = NbtCompound::new();
+        cooldown.put_int("value", 37);
+        cooldown.put_long("ttl", 81);
+        cooldown.put_string("opaque_entry_metadata", "retain".into());
+        let mut memories = NbtCompound::new();
+        memories.put_compound("minecraft:is_tempted", flag);
+        memories.put_compound("minecraft:long_jump_cooling_down", cooldown.clone());
+        memories.put_string("example:opaque_memory", "retain".into());
+        let mut brain = NbtCompound::new();
+        brain.put_compound("memories", memories);
+        brain.put_string("opaque_brain_metadata", "retain".into());
+        raw.put_compound("Brain", brain);
+        for _ in 0..2 {
+            let loaded = load_entity_tree(&raw, &world).unwrap();
+            let saved = save_entity_tree(&loaded[0]).unwrap();
+            let brain = saved.get_compound("Brain").unwrap();
+            assert_eq!(brain.get_string("opaque_brain_metadata"), Some("retain"));
+            let memories = brain.get_compound("memories").unwrap();
+            assert!(memories.get("minecraft:is_tempted").is_none());
+            assert_eq!(
+                memories.get_compound("minecraft:long_jump_cooling_down"),
+                Some(&cooldown)
+            );
+            assert_eq!(memories.get_string("example:opaque_memory"), Some("retain"));
+            raw = saved;
+        }
+        world.level.shutdown().await;
     }
 
     #[tokio::test]
