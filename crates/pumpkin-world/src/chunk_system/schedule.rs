@@ -1941,20 +1941,15 @@ mod save_lineage_tests {
     #[tokio::test]
     async fn save_lineage_fifo_counts_unload_save_and_no_batch_per_world() {
         let directory = tempfile::tempdir().unwrap();
-        let a = Level::from_root_folder(
-            &LevelConfig::default(),
-            directory.path().into(),
-            0,
-            Dimension::OVERWORLD,
-        )
-        .unwrap();
-        let b = Level::from_root_folder(
-            &LevelConfig::default(),
-            directory.path().into(),
-            0,
-            Dimension::THE_NETHER,
-        )
-        .unwrap();
+        let [a, b] = [Dimension::OVERWORLD, Dimension::THE_NETHER].map(|dimension| {
+            Level::from_root_folder(
+                &LevelConfig::default(),
+                directory.path().into(),
+                0,
+                dimension,
+            )
+            .unwrap()
+        });
         let (mut sched_a, recv_a) = scheduler(&a);
         let (mut sched_b, recv_b) = scheduler(&b);
         let locks = [sched_a.io_lock.clone(), sched_b.io_lock.clone()];
@@ -1977,20 +1972,20 @@ mod save_lineage_tests {
                 sched_a.save_all_chunk(&a_for_thread, false, "request");
                 assert_eq!(sched_a.save_batch_ordinal, 2);
                 assert_eq!(sched_b.save_batch_ordinal, 1);
-            })
+            });
         })
         .join()
         .unwrap();
-        let captured = events.0.lock().unwrap();
+        let captured = events.0.lock().unwrap().clone();
         let emitted: Vec<_> = captured
             .iter()
             .filter(|e| e["kind"] == "send_ok")
             .map(|e| {
                 (
-                    e["world"].clone(),
-                    e["batch"].clone(),
-                    e["origin"].clone(),
-                    e["site"].clone(),
+                    e["world"].as_str(),
+                    e["batch"].as_str(),
+                    e["origin"].as_str(),
+                    e["site"].as_str(),
                 )
             })
             .collect();
@@ -1999,31 +1994,20 @@ mod save_lineage_tests {
         assert_eq!(
             emitted,
             vec![
-                (
-                    world_a.clone(),
-                    "1".into(),
-                    "unload".into(),
-                    "unload".into()
-                ),
-                (world_b, "1".into(), "request".into(), "save_all".into()),
-                (
-                    world_a.clone(),
-                    "2".into(),
-                    "request".into(),
-                    "save_all".into()
-                ),
+                (world_a.as_str(), "1", "unload", "unload"),
+                (world_b.as_str(), "1", "request", "save_all"),
+                (world_a.as_str(), "2", "request", "save_all"),
             ]
         );
         let empty = captured.iter().find(|e| e["kind"] == "no_batch").unwrap();
         assert_eq!(empty["world"], world_a);
         assert!(!empty.contains_key("batch"));
         assert!(!captured.iter().any(|e| e["kind"] == "complete"));
-        drop(captured);
         tokio::join!(
             io_write_work(recv_a, a.clone(), locks[0].clone()).with_subscriber(events.clone()),
             io_write_work(recv_b, b.clone(), locks[1].clone()).with_subscriber(events.clone()),
         );
-        let captured = events.0.lock().unwrap();
+        let captured = events.0.lock().unwrap().clone();
         for kind in ["receive", "complete"] {
             let outcomes: Vec<_> = captured
                 .iter()
@@ -2051,7 +2035,6 @@ mod save_lineage_tests {
             }
         }
         assert!(locks.iter().all(|lock| lock.0.lock().unwrap().is_empty()));
-        drop(captured);
         a.shutdown().await;
         b.shutdown().await;
     }
