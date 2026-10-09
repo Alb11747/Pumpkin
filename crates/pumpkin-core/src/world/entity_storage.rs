@@ -1731,6 +1731,7 @@ mod tests {
             position: &pos,
             direction: None,
             player: None,
+            use_item_on: None,
         }));
         behavior.on_neighbor_update(OnNeighborUpdateArgs {
             world,
@@ -1749,7 +1750,7 @@ mod tests {
             comparator::ComparatorBlock, repeater::RepeaterBlock,
         };
         use pumpkin_data::Block;
-        use pumpkin_world::{chunk::io::LoadedData, world::BlockAccessor};
+        use pumpkin_world::chunk::io::{FileIO, LoadedData};
 
         let directory = tempfile::tempdir().unwrap();
         let world = test_world_in_dimension(directory.path(), Dimension::OVERWORLD);
@@ -1836,8 +1837,6 @@ mod tests {
             entity::item::ItemEntity,
         };
         use pumpkin_data::{Block, BlockDirection};
-        use pumpkin_world::world::BlockAccessor;
-
         let directory = tempfile::tempdir().unwrap();
         let world = test_world_in_dimension(directory.path(), Dimension::OVERWORLD);
         let terrain = imported_diode_support_fixture(&world);
