@@ -259,6 +259,12 @@ jobs:
         env:
           CARGO_TARGET_DIR: ${{ runner.temp }}/fobbitmc-release-target
         run: python build-control/.github/scripts/fobbitmc_release.py positive '${{ matrix.target }}' preservation
+      - name: Prove bucket persistence and hopper support detect the old behavior
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/fobbitmc-release-target
+        run: python build-control/.github/scripts/fobbitmc_bucket_diode_gate.py '${{ matrix.target }}'
+      - name: Verify production bytes after negative controls
+        run: python build-control/.github/scripts/fobbitmc_release.py verify_engine
       - name: Check every core and protocol target and feature with release Clippy
         working-directory: engine
         env:
