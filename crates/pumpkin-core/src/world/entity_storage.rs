@@ -1405,6 +1405,227 @@ mod tests {
         terrain
     }
 
+    fn imported_diode_support_fixture(world: &World) -> Arc<ChunkData> {
+        use pumpkin_data::{Block, block_properties::HopperLikeProperties};
+
+        let terrain = Arc::new(ChunkData::empty(0, 0));
+        terrain.light_populated.store(true, Ordering::Relaxed);
+        let mut hopper = HopperLikeProperties::from_state_id(Block::HOPPER.default_state.id);
+        hopper.enabled = false;
+        for (x, block) in [(4, &Block::COMPARATOR), (8, &Block::REPEATER)] {
+            terrain.set_block_absolute_y(x, 63, 4, hopper.to_state_id(&Block::HOPPER));
+            terrain.set_block_absolute_y(x, 64, 4, block.default_state.id);
+        }
+        let pos = BlockPos::new(4, 64, 4);
+        let mut nbt = NbtCompound::new();
+        nbt.put_string("id", "minecraft:comparator".into());
+        nbt.put_int("x", 4);
+        nbt.put_int("y", 64);
+        nbt.put_int("z", 4);
+        nbt.put_int("OutputSignal", 0);
+        nbt.put_byte("keepPacked", 0);
+        terrain
+            .pending_block_entities
+            .lock()
+            .unwrap()
+            .insert(pos, nbt);
+        world
+            .level
+            .loaded_chunks
+            .insert(pos.chunk_position(), terrain.clone());
+        terrain
+    }
+
+    fn assert_diode_survives_neighbor_updates(
+        world: &Arc<World>,
+        behavior: &dyn crate::block::BlockBehaviour,
+        block: &'static pumpkin_data::Block,
+        pos: BlockPos,
+    ) {
+        use crate::block::{CanPlaceAtArgs, GetStateForNeighborUpdateArgs, OnNeighborUpdateArgs};
+        use pumpkin_data::{Block, BlockDirection};
+
+        let state = world.get_block_state(&pos);
+        let support = pos.down();
+        assert_eq!(
+            behavior.get_state_for_neighbor_update(GetStateForNeighborUpdateArgs {
+                world,
+                block,
+                state_id: state.id,
+                position: &pos,
+                direction: BlockDirection::Down,
+                neighbor_position: &support,
+                neighbor_state_id: world.get_block_state_id(&support),
+            }),
+            state.id,
+        );
+        assert!(behavior.can_place_at(CanPlaceAtArgs {
+            server: None,
+            world: Some(world),
+            block_accessor: world.as_ref(),
+            block,
+            state,
+            position: &pos,
+            direction: None,
+            player: None,
+        }));
+        behavior.on_neighbor_update(OnNeighborUpdateArgs {
+            world,
+            block,
+            position: &pos,
+            source_block: &Block::HOPPER,
+            notify: false,
+        });
+        assert_eq!(world.get_block_state_id(&pos), state.id);
+        assert!(world.entities.load().is_empty());
+    }
+
+    #[tokio::test]
+    async fn imported_diodes_survive_all_hopper_states_and_disk_reload() {
+        use crate::block::blocks::redstone::{
+            comparator::ComparatorBlock, repeater::RepeaterBlock,
+        };
+        use pumpkin_data::Block;
+        use pumpkin_world::{chunk::io::LoadedData, world::BlockAccessor};
+
+        let directory = tempfile::tempdir().unwrap();
+        let world = test_world_in_dimension(directory.path(), Dimension::OVERWORLD);
+        let terrain = imported_diode_support_fixture(&world);
+        let comparator_pos = BlockPos::new(4, 64, 4);
+        let repeater_pos = BlockPos::new(8, 64, 4);
+        // Exercise both the downward shape update and the generic neighbor route.
+        for support in
+            std::iter::once(Block::STONE.default_state).chain(Block::HOPPER.states.iter())
+        {
+            terrain.set_block_absolute_y(4, 63, 4, support.id);
+            terrain.set_block_absolute_y(8, 63, 4, support.id);
+            assert_diode_survives_neighbor_updates(
+                &world,
+                &ComparatorBlock,
+                &Block::COMPARATOR,
+                comparator_pos,
+            );
+            assert_diode_survives_neighbor_updates(
+                &world,
+                &RepeaterBlock,
+                &Block::REPEATER,
+                repeater_pos,
+            );
+            let entity = world.get_block_entity(&comparator_pos).unwrap();
+            assert_eq!(
+                world
+                    .snapshot_block_entity_nbt(&entity)
+                    .get_int("OutputSignal"),
+                Some(0)
+            );
+        }
+
+        let chunk_pos = comparator_pos.chunk_position();
+        world.save_block_entities(chunk_pos);
+        world
+            .level
+            .write_chunks(vec![(chunk_pos, terrain)])
+            .await
+            .unwrap();
+        world.level.shutdown().await;
+
+        let reloaded = test_world_in_dimension(directory.path(), Dimension::OVERWORLD);
+        let (send, mut receive) = tokio::sync::mpsc::channel(1);
+        reloaded
+            .level
+            .chunk_saver
+            .fetch_chunks(&reloaded.level.level_folder, &[chunk_pos], send)
+            .await;
+        let Some(LoadedData::Loaded(terrain)) = receive.recv().await else {
+            panic!("saved diode fixture must reload successfully");
+        };
+        reloaded.level.loaded_chunks.insert(chunk_pos, terrain);
+        assert_diode_survives_neighbor_updates(
+            &reloaded,
+            &ComparatorBlock,
+            &Block::COMPARATOR,
+            comparator_pos,
+        );
+        assert_diode_survives_neighbor_updates(
+            &reloaded,
+            &RepeaterBlock,
+            &Block::REPEATER,
+            repeater_pos,
+        );
+        assert_eq!(reloaded.get_block(&comparator_pos), &Block::COMPARATOR);
+        let entity = reloaded.get_block_entity(&comparator_pos).unwrap();
+        assert_eq!(
+            reloaded
+                .snapshot_block_entity_nbt(&entity)
+                .get_int("OutputSignal"),
+            Some(0)
+        );
+        reloaded.level.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn unsupported_diodes_still_break_and_drop_one_item() {
+        use crate::{
+            block::{
+                BlockBehaviour, GetStateForNeighborUpdateArgs, OnNeighborUpdateArgs,
+                blocks::redstone::{comparator::ComparatorBlock, repeater::RepeaterBlock},
+            },
+            entity::item::ItemEntity,
+        };
+        use pumpkin_data::{Block, BlockDirection};
+        use pumpkin_world::world::BlockAccessor;
+
+        let directory = tempfile::tempdir().unwrap();
+        let world = test_world_in_dimension(directory.path(), Dimension::OVERWORLD);
+        let terrain = imported_diode_support_fixture(&world);
+        let fixtures: [(&dyn BlockBehaviour, &Block, BlockPos); 2] = [
+            (
+                &ComparatorBlock,
+                &Block::COMPARATOR,
+                BlockPos::new(4, 64, 4),
+            ),
+            (&RepeaterBlock, &Block::REPEATER, BlockPos::new(8, 64, 4)),
+        ];
+        for (behavior, block, pos) in fixtures {
+            let support = pos.down();
+            terrain.set_block_absolute_y(pos.0.x as usize, 63, 4, Block::AIR.default_state.id);
+            assert_eq!(
+                behavior.get_state_for_neighbor_update(GetStateForNeighborUpdateArgs {
+                    world: &world,
+                    block,
+                    state_id: block.default_state.id,
+                    position: &pos,
+                    direction: BlockDirection::Down,
+                    neighbor_position: &support,
+                    neighbor_state_id: Block::AIR.default_state.id,
+                }),
+                Block::AIR.default_state.id,
+            );
+            behavior.on_neighbor_update(OnNeighborUpdateArgs {
+                world: &world,
+                block,
+                position: &pos,
+                source_block: &Block::AIR,
+                notify: false,
+            });
+            assert_eq!(world.get_block(&pos), &Block::AIR);
+            assert!(world.get_block_entity(&pos).is_none());
+            let item_count: u16 = world
+                .entities
+                .load()
+                .iter()
+                .filter_map(|entity| {
+                    let item = entity.cast_any().downcast_ref::<ItemEntity>()?;
+                    let stack = item.get_item_stack().lock().unwrap();
+                    (Block::from_item_id(stack.item.id) == Some(block))
+                        .then_some(u16::from(stack.item_count))
+                })
+                .sum();
+            assert_eq!(item_count, 1);
+        }
+        world.level.shutdown().await;
+    }
+
     // A single blocking worker makes filesystem and serialization pauses controlled.
     fn storage_race_runtime() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_multi_thread()

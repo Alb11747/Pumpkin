@@ -43,7 +43,8 @@ pub trait RedstoneGateBlock<T: Send + Sync + BlockProperties + RedstoneGateBlock
         _pos: BlockPos,
         state: &BlockState,
     ) -> bool {
-        state.is_side_solid(BlockDirection::Up)
+        // Vanilla's RIGID support accepts a hopper's rim; the exported FULL flag does not.
+        state.is_side_solid(BlockDirection::Up) || state.id.to_block() == &Block::HOPPER
     }
 
     fn get_weak_redstone_power(&self, args: GetRedstonePowerArgs<'_>) -> u8
