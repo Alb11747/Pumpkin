@@ -738,7 +738,7 @@ impl MobEntity {
     pub fn check_despawn(&self, mob: &dyn Mob) {
         let entity = &self.living_entity.entity;
 
-        if self.persistence_required.load(Relaxed) {
+        if self.persistence_required.load(Relaxed) || mob.requires_custom_persistence() {
             return;
         }
 

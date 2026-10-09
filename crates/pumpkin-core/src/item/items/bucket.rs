@@ -13,6 +13,7 @@ use pumpkin_data::{
     item_stack::ItemStack,
     sound::{Sound, SoundCategory},
 };
+use pumpkin_nbt::compound::NbtCompound;
 use pumpkin_util::{
     GameMode,
     math::{position::BlockPos, vector3::Vector3},
@@ -25,6 +26,21 @@ use crate::world::World;
 pub struct EmptyBucketItem;
 pub struct FilledBucketItem;
 pub struct MilkBucketItem;
+
+pub(crate) fn create_bucket_entity(
+    entity_type: &'static EntityType,
+    position: Vector3<f64>,
+    world: &Arc<World>,
+) -> Arc<dyn EntityBase> {
+    let entity = from_type(entity_type, position, world, Uuid::new_v4());
+    if let Some(mob) = entity.get_mob() {
+        // MobBucketItem marks bucket provenance after creating the released mob.
+        let mut data = NbtCompound::new();
+        data.put_bool("FromBucket", true);
+        mob.mob_read_nbt(&data);
+    }
+    entity
+}
 
 impl ItemMetadata for EmptyBucketItem {
     fn ids() -> Box<[u16]> {
@@ -435,7 +451,7 @@ impl ItemBehaviour for FilledBucketItem {
                 f64::from(place_pos.0.y),
                 f64::from(place_pos.0.z) + 0.5,
             );
-            let mob = from_type(entity_type, spawn_coord, &world, Uuid::new_v4());
+            let mob = create_bucket_entity(entity_type, spawn_coord, &world);
             world.spawn_entity(mob);
         }
 

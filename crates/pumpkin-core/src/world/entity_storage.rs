@@ -576,6 +576,269 @@ mod tests {
         }
     }
 
+    async fn bucket_test_player() -> (
+        tempfile::TempDir,
+        Arc<crate::server::Server>,
+        tokio::net::TcpStream,
+        Arc<crate::entity::player::Player>,
+        Arc<World>,
+    ) {
+        use crate::{
+            data::VanillaData,
+            entity::player::Player,
+            net::{
+                ClientPlatform, GameProfile, PacketRateLimiter, PlayerConfig,
+                java::{JavaClient, pending::PendingConnection},
+            },
+            server::Server,
+        };
+        use pumpkin_config::{AdvancedConfiguration, BasicConfiguration, TelemetryConfig};
+        use pumpkin_protocol::ConnectionState;
+        use pumpkin_util::GameMode;
+        use tokio::net::{TcpListener, TcpStream};
+
+        let directory = tempfile::tempdir().unwrap();
+        let basic = BasicConfiguration {
+            default_level_name: directory.path().to_string_lossy().into_owned(),
+            seed: Seed(0),
+            allow_nether: false,
+            allow_end: false,
+            allow_chat_reports: false,
+            ..BasicConfiguration::default()
+        };
+        let mut advanced = AdvancedConfiguration::default();
+        advanced.networking.bedrock.online_mode = false;
+        advanced.networking.java.online_mode = false;
+        let view_distance = std::num::NonZero::new(2).unwrap();
+        advanced.networking.java.view_distance = view_distance;
+        advanced.networking.java.simulation_distance = view_distance;
+        let data = VanillaData {
+            banned_ip_list: std::sync::RwLock::default(),
+            banned_player_list: std::sync::RwLock::default(),
+            operator_config: std::sync::RwLock::default(),
+            user_cache: std::sync::RwLock::default(),
+            whitelist_config: std::sync::RwLock::default(),
+        };
+        let server = Server::new(
+            basic,
+            advanced,
+            TelemetryConfig::default(),
+            data,
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        let world = server.get_world_from_dimension(&Dimension::OVERWORLD);
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let (peer, accepted) = tokio::join!(
+            TcpStream::connect(listener.local_addr().unwrap()),
+            listener.accept()
+        );
+        let peer = peer.unwrap();
+        let (stream, address) = accepted.unwrap();
+        let pending = PendingConnection::new(
+            stream,
+            address,
+            0,
+            PacketRateLimiter::new(false, 0.0, 0.0),
+            Arc::downgrade(&server),
+        );
+        let profile = GameProfile {
+            id: Uuid::new_v4(),
+            name: "BucketPersistenceTest".into(),
+            properties: ArcSwap::from_pointee(Vec::new()),
+            profile_actions: None,
+        };
+        let config = PlayerConfig {
+            view_distance,
+            ..PlayerConfig::default()
+        };
+        let client = JavaClient::from_pending(pending, profile.clone(), config.clone());
+        client.connection_state.store(ConnectionState::Play);
+        let player = Arc::new(Player::new(
+            Arc::new(ClientPlatform::Java(client)),
+            profile,
+            config,
+            &world,
+            GameMode::Survival,
+        ));
+        player.get_entity().set_pos(Vector3::new(130.5, 64.0, 0.5));
+        // Only the player list is needed for distance checks; no chunks or trackers are started.
+        world.players.store(Arc::new(vec![player.clone()]));
+
+        (directory, server, peer, player, world)
+    }
+
+    #[tokio::test]
+    async fn loaded_bucket_mobs_survive_distant_players_and_round_trip_vanilla_data() {
+        let (_directory, server, _peer, _player, world) = bucket_test_player().await;
+        let mut outcomes = Vec::new();
+        for (index, id) in [
+            "cod",
+            "salmon",
+            "tropical_fish",
+            "pufferfish",
+            "tadpole",
+            "axolotl",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for from_bucket in [false, true] {
+                let mut fixture = NbtCompound::new();
+                fixture.put_string("id", format!("minecraft:{id}"));
+                fixture.put_uuid(
+                    "UUID",
+                    Uuid::from_u128(900 + index as u128 * 2 + u128::from(from_bucket)),
+                );
+                fixture.put_list("Pos", vec![0.5.into(), 64.0.into(), 0.5.into()]);
+                fixture.put_bool("PersistenceRequired", false);
+                fixture.put_bool("FromBucket", from_bucket);
+                fixture.put_int(
+                    "Variant",
+                    if id == "tropical_fish" {
+                        0x0e_04_05_01
+                    } else {
+                        3
+                    },
+                );
+                fixture.put_int("PuffState", 2);
+                fixture.put_string("type", "large".into());
+                fixture.put_int("Age", -1200);
+                fixture.put_bool("AgeLocked", true);
+                fixture.put_string("example:opaque_fish_data", "retain".into());
+                for _ in 0..2 {
+                    let loaded = load_entity_tree(&fixture, &world).unwrap();
+                    let mob = loaded[0].get_mob().unwrap();
+                    let saved = save_entity_tree(&loaded[0]).unwrap();
+                    mob.get_mob_entity().check_despawn(mob);
+                    outcomes.push((
+                        id,
+                        from_bucket,
+                        mob.requires_custom_persistence(),
+                        mob.remove_when_far_away(130.0 * 130.0),
+                        loaded[0].get_entity().is_removed(),
+                        saved.clone(),
+                    ));
+                    fixture = saved;
+                }
+            }
+        }
+        world.players.store(Arc::new(Vec::new()));
+        server.shutdown().await;
+        for (id, from_bucket, custom_persistence, far_despawn, removed, saved) in outcomes {
+            assert_eq!(custom_persistence, from_bucket, "{id} custom persistence");
+            assert_eq!(far_despawn, !from_bucket, "{id} far-away policy");
+            assert_eq!(removed, !from_bucket, "{id} at 130 blocks");
+            assert_eq!(
+                saved.get_bool("FromBucket"),
+                Some(from_bucket),
+                "{id} saved bucket flag"
+            );
+            assert_eq!(
+                saved.get_bool("PersistenceRequired"),
+                Some(false),
+                "{id} custom persistence must not promote the saved flag"
+            );
+            assert_eq!(saved.get_string("example:opaque_fish_data"), Some("retain"));
+            if id == "tropical_fish" {
+                assert_eq!(saved.get_int("Variant"), Some(0x0e_04_05_01));
+            }
+            if id == "pufferfish" {
+                assert_eq!(saved.get_int("PuffState"), Some(2));
+            }
+            if id == "salmon" {
+                assert_eq!(saved.get_string("type"), Some("large"));
+            }
+            if matches!(id, "tadpole" | "axolotl") {
+                assert_eq!(saved.get_int("Age"), Some(-1200));
+                assert_eq!(saved.get_bool("AgeLocked"), Some(true));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn newly_released_bucket_mobs_gain_persistent_provenance() {
+        use crate::item::items::bucket::create_bucket_entity;
+
+        let (_directory, server, _peer, _player, world) = bucket_test_player().await;
+        let mut outcomes = Vec::new();
+        for entity_type in [
+            &EntityType::COD,
+            &EntityType::SALMON,
+            &EntityType::TROPICAL_FISH,
+            &EntityType::PUFFERFISH,
+            &EntityType::TADPOLE,
+            &EntityType::AXOLOTL,
+        ] {
+            // Use the constructor called by FilledBucketItem, without any item payload.
+            let released = create_bucket_entity(entity_type, Vector3::new(0.5, 64.0, 0.5), &world);
+            let mob = released.get_mob().unwrap();
+            assert!(
+                !mob.get_mob_entity()
+                    .persistence_required
+                    .load(Ordering::Relaxed)
+            );
+            mob.get_mob_entity().check_despawn(mob);
+            let saved = save_entity_tree(&released).unwrap();
+            let loaded = load_entity_tree(&saved, &world).unwrap();
+            let loaded_mob = loaded[0].get_mob().unwrap();
+            loaded_mob.get_mob_entity().check_despawn(loaded_mob);
+            outcomes.push((
+                entity_type.resource_name,
+                released.get_entity().is_removed(),
+                saved.get_bool("FromBucket"),
+                loaded_mob.requires_custom_persistence(),
+                loaded[0].get_entity().is_removed(),
+            ));
+        }
+        world.players.store(Arc::new(Vec::new()));
+        server.shutdown().await;
+        for (id, removed, from_bucket, loaded_persistence, loaded_removed) in outcomes {
+            assert!(!removed, "{id} release at 130 blocks");
+            assert_eq!(from_bucket, Some(true), "{id} release provenance");
+            assert!(loaded_persistence, "{id} reloaded provenance");
+            assert!(!loaded_removed, "{id} reload at 130 blocks");
+        }
+    }
+
+    #[tokio::test]
+    async fn mob_custom_persistence_prevents_distance_despawn() {
+        use crate::entity::{Entity, mob::MobEntity};
+        struct CustomPersistentMob(MobEntity);
+        impl Mob for CustomPersistentMob {
+            fn get_mob_entity(&self) -> &MobEntity {
+                &self.0
+            }
+            fn requires_custom_persistence(&self) -> bool {
+                true
+            }
+        }
+        let (_directory, server, _peer, _player, world) = bucket_test_player().await;
+        let custom = CustomPersistentMob(MobEntity::new(Entity::new(
+            world.clone(),
+            Vector3::new(0.5, 64.0, 0.5),
+            &EntityType::COD,
+        )));
+        assert!(custom.remove_when_far_away(130.0 * 130.0));
+        assert!(
+            !custom
+                .get_mob_entity()
+                .persistence_required
+                .load(Ordering::Relaxed)
+        );
+        custom.get_mob_entity().check_despawn(&custom);
+        assert!(!custom.get_entity().is_removed());
+        let mut saved = NbtCompound::new();
+        custom.get_mob_entity().write_mob_nbt(&mut saved);
+        assert_eq!(saved.get_bool("PersistenceRequired"), None);
+
+        world.players.store(Arc::new(Vec::new()));
+        server.shutdown().await;
+    }
+
     // Vanilla Entity.saveWithoutId/EntityType.loadPassengersRecursive shape,
     // including the persistent named endermite used in the migrated End farm.
     fn minecart_fixture() -> NbtCompound {

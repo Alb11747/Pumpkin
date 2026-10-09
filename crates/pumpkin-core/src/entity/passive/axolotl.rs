@@ -233,6 +233,10 @@ impl Animal for AxolotlEntity {
 }
 
 impl Mob for AxolotlEntity {
+    fn requires_custom_persistence(&self) -> bool {
+        self.is_from_bucket()
+    }
+
     fn remove_when_far_away(&self, _distance_sq: f64) -> bool {
         !self.is_from_bucket() && (**self.get_entity().custom_name.load()).is_none()
     }

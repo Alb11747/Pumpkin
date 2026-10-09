@@ -1,4 +1,7 @@
-use std::sync::{Arc, Weak};
+use std::sync::{
+    Arc, Weak,
+    atomic::{AtomicBool, Ordering},
+};
 
 use pumpkin_data::entity::EntityType;
 use pumpkin_data::item::Item;
@@ -26,6 +29,7 @@ const TEMPT_ITEMS: &[&Item] = &[&Item::SLIME_BALL];
 pub struct TadpoleEntity {
     pub mob_entity: MobEntity,
     pub ageable_data: AgeableData,
+    pub from_bucket: AtomicBool,
 }
 
 impl TadpoleEntity {
@@ -34,6 +38,7 @@ impl TadpoleEntity {
         let tadpole = Self {
             mob_entity,
             ageable_data: AgeableData::default(),
+            from_bucket: AtomicBool::new(false),
         };
         let mob_arc = Arc::new(tadpole);
         let mob_weak: Weak<dyn Mob> = {
@@ -76,16 +81,26 @@ impl AgeableMob for TadpoleEntity {
 }
 
 impl Mob for TadpoleEntity {
+    fn requires_custom_persistence(&self) -> bool {
+        self.from_bucket.load(Ordering::Relaxed)
+    }
+
+    fn remove_when_far_away(&self, _distance_sq: f64) -> bool {
+        !self.requires_custom_persistence() && (**self.get_entity().custom_name.load()).is_none()
+    }
+
     fn as_ageable(&self) -> Option<&dyn AgeableMob> {
         Some(self)
     }
 
     fn mob_write_nbt(&self, nbt: &mut NbtCompound) {
-        self.write_ageable_nbt(nbt);
+        nbt.put_bool("FromBucket", self.from_bucket.load(Ordering::Relaxed));
     }
 
     fn mob_read_nbt(&self, nbt: &NbtCompound) {
-        self.read_ageable_nbt(nbt);
+        if let Some(from_bucket) = nbt.get_bool("FromBucket") {
+            self.from_bucket.store(from_bucket, Ordering::Relaxed);
+        }
     }
 
     fn get_mob_entity(&self) -> &MobEntity {
