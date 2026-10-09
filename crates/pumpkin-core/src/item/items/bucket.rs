@@ -125,7 +125,8 @@ const fn get_fill_sound(item: &Item) -> Sound {
     }
 }
 
-fn give_player_bucket_item(player: &Player, item: &'static Item) {
+/// Gives the resulting bucket and returns the main-hand stack for interaction writeback.
+pub(crate) fn give_player_bucket_item(player: &Player, item: &'static Item) -> ItemStack {
     if player.gamemode.load() == GameMode::Creative {
         let has_item = {
             let inv = player
@@ -136,7 +137,7 @@ fn give_player_bucket_item(player: &Player, item: &'static Item) {
             inv.iter().any(|stack| stack.item.id == item.id)
         };
         if has_item {
-            return;
+            return player.inventory.held_item();
         }
         let mut item_stack = ItemStack::new(1, item);
         player.inventory.insert_stack_anywhere(&mut item_stack);
@@ -158,6 +159,7 @@ fn give_player_bucket_item(player: &Player, item: &'static Item) {
             }
         }
     }
+    player.inventory.held_item()
 }
 
 pub(crate) fn try_pickup_fluid_at(
@@ -356,7 +358,7 @@ impl ItemBehaviour for EmptyBucketItem {
         give_player_bucket_item(player, item);
     }
 
-    fn use_on_entity(&self, _item: &mut ItemStack, player: &Player, entity: Arc<dyn EntityBase>) {
+    fn use_on_entity(&self, item: &mut ItemStack, player: &Player, entity: Arc<dyn EntityBase>) {
         let ent = entity.get_entity();
         let entity_type = ent.entity_type;
         if (entity_type == &EntityType::COW
@@ -379,7 +381,7 @@ impl ItemBehaviour for EmptyBucketItem {
                 Sound::EntityCowMilk
             };
             world.play_sound(sound, SoundCategory::Neutral, &ent.pos.load());
-            give_player_bucket_item(player, &Item::MILK_BUCKET);
+            *item = give_player_bucket_item(player, &Item::MILK_BUCKET);
         }
     }
 
@@ -486,7 +488,7 @@ impl ItemBehaviour for FilledBucketItem {
                 let ent = entity.get_entity();
                 let world = ent.world.load();
                 world.play_sound(sound, SoundCategory::Neutral, &ent.pos.load());
-                give_player_bucket_item(player, mob_bucket);
+                *item = give_player_bucket_item(player, mob_bucket);
                 ent.remove();
             }
         }

@@ -153,10 +153,12 @@ impl Mob for TadpoleEntity {
                 };
                 server.plugin_manager.fire_blocking(&server, &mut event);
                 if event.cancelled {
-                    return false;
+                    // Mark the veto handled so the item fallback cannot capture the mob.
+                    return true;
                 }
             }
-            item_stack.decrement_unless_creative(player.gamemode.load(), 1);
+            *item_stack =
+                crate::item::items::bucket::give_player_bucket_item(player, &Item::TADPOLE_BUCKET);
             let pos = entity.pos.load();
             world.play_sound(Sound::ItemBucketFillTadpole, SoundCategory::Neutral, &pos);
             entity.remove();

@@ -377,6 +377,130 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pufferfish_puff_transitions_resize_from_type_defaults() {
+        use crate::entity::{Entity, passive::pufferfish::PufferfishEntity};
+
+        let directory = tempfile::tempdir().unwrap();
+        let world = test_world(directory.path());
+        let position = Vector3::new(73.74947896712006, 66.0, 358.33395288511457);
+        let pufferfish = PufferfishEntity::new(Entity::new(
+            world.clone(),
+            position,
+            &EntityType::PUFFERFISH,
+        ));
+        let mut observations = vec![(
+            0.35f32,
+            0.2275f32,
+            pufferfish.get_entity().entity_dimension.load(),
+            pufferfish.get_entity().bounding_box.load(),
+        )];
+        // Official Pufferfish.getDefaultDimensions: small/mid/full scale 0.5/0.7/1.
+        for (state, width, eye_height) in [
+            (2, 0.7, 0.455),
+            (1, 0.49, 0.3185),
+            (0, 0.35, 0.2275),
+            (1, 0.49, 0.3185),
+            (2, 0.7, 0.455),
+            (0, 0.35, 0.2275),
+        ] {
+            pufferfish.set_puff_state(state);
+            observations.push((
+                width,
+                eye_height,
+                pufferfish.get_entity().entity_dimension.load(),
+                pufferfish.get_entity().bounding_box.load(),
+            ));
+        }
+        world.level.shutdown().await;
+        for (width, eye_height, dimensions, body) in observations {
+            assert!((dimensions.width - width).abs() < 1.0e-7);
+            assert!((dimensions.height - width).abs() < 1.0e-7);
+            assert!((dimensions.eye_height - eye_height).abs() < 1.0e-7);
+            assert!((body.max.x - body.min.x - f64::from(width)).abs() < 1.0e-7);
+            assert!((body.max.y - body.min.y - f64::from(width)).abs() < 1.0e-7);
+            assert!((body.min.x + body.max.x - 2.0 * position.x).abs() < 1.0e-7);
+            assert!((body.min.z + body.max.z - 2.0 * position.z).abs() < 1.0e-7);
+            assert_eq!(body.min.y, position.y);
+        }
+    }
+
+    #[tokio::test]
+    async fn loaded_pufferfish_dimensions_keep_unpuffed_eye_out_of_adjacent_dirt() {
+        use pumpkin_data::Block;
+
+        let directory = tempfile::tempdir().unwrap();
+        let world = test_world_in_dimension(directory.path(), Dimension::OVERWORLD);
+        let position = Vector3::new(73.74947896712006, 66.0, 358.33395288511457);
+        // Retained R7 terrain: the fish is in water (73,66,358), beside dirt (74,66,358).
+        let terrain = Arc::new(ChunkData::empty(4, 22));
+        terrain.set_block_absolute_y(9, 66, 6, Block::WATER.default_state.id);
+        terrain.set_block_absolute_y(10, 66, 6, Block::DIRT.default_state.id);
+        world
+            .level
+            .loaded_chunks
+            .insert(Vector2::new(4, 22), terrain);
+        let mut observations = Vec::new();
+        for (input, state, width, eye_height, suffocates) in [
+            (None, 0, 0.35f32, 0.2275f32, false),
+            (Some(0), 0, 0.35, 0.2275, false),
+            (Some(1), 1, 0.49, 0.3185, false),
+            (Some(2), 2, 0.7, 0.455, true),
+            (Some(-1), 0, 0.35, 0.2275, false),
+            (Some(3), 2, 0.7, 0.455, true),
+        ] {
+            let mut fixture = NbtCompound::new();
+            fixture.put_string("id", "minecraft:pufferfish".into());
+            fixture.put_uuid("UUID", Uuid::from_u128(850));
+            fixture.put_list(
+                "Pos",
+                vec![position.x.into(), position.y.into(), position.z.into()],
+            );
+            fixture.put_bool("FromBucket", true);
+            if let Some(input) = input {
+                fixture.put_int("PuffState", input);
+            }
+            for _ in 0..2 {
+                let loaded = load_entity_tree(&fixture, &world).unwrap();
+                let entity = loaded[0].get_entity();
+                let saved = save_entity_tree(&loaded[0]).unwrap();
+                observations.push((
+                    state,
+                    width,
+                    eye_height,
+                    suffocates,
+                    entity.pos.load(),
+                    entity.entity_dimension.load(),
+                    entity.bounding_box.load(),
+                    entity.tick_block_collisions(loaded[0].as_ref()),
+                    saved.clone(),
+                ));
+                fixture = saved;
+            }
+        }
+        world.level.shutdown().await;
+        for (state, width, eye_height, suffocates, pos, dimensions, body, in_wall, saved) in
+            observations
+        {
+            assert_eq!(pos, position);
+            assert!((dimensions.width - width).abs() < 1.0e-7);
+            assert!((dimensions.height - width).abs() < 1.0e-7);
+            assert!((dimensions.eye_height - eye_height).abs() < 1.0e-7);
+            assert!((body.min.x - (position.x - f64::from(width) / 2.0)).abs() < 1.0e-7);
+            assert!((body.max.x - (position.x + f64::from(width) / 2.0)).abs() < 1.0e-7);
+            assert!((body.min.z - (position.z - f64::from(width) / 2.0)).abs() < 1.0e-7);
+            assert!((body.max.z - (position.z + f64::from(width) / 2.0)).abs() < 1.0e-7);
+            assert_eq!(body.min.y, position.y);
+            assert!((body.max.y - position.y - f64::from(width)).abs() < 1.0e-7);
+            assert_eq!(
+                in_wall, suffocates,
+                "puff state {state} at retained boundary"
+            );
+            assert_eq!(saved.get_int("PuffState"), Some(state));
+            assert_eq!(saved.get_bool("FromBucket"), Some(true));
+        }
+    }
+
+    #[tokio::test]
     async fn loaded_frog_drops_obsolete_tempted_key_and_preserves_opaque_brain_data() {
         let directory = tempfile::tempdir().unwrap();
         let world = test_world(directory.path());
@@ -669,6 +793,217 @@ mod tests {
         world.players.store(Arc::new(vec![player.clone()]));
 
         (directory, server, peer, player, world)
+    }
+
+    fn interact_with_main_hand(
+        player: &Arc<crate::entity::player::Player>,
+        entity: &Arc<dyn EntityBase>,
+        server: &Arc<crate::server::Server>,
+    ) {
+        use crate::net::ClientPlatform;
+        use pumpkin_protocol::java::server::play::{ActionType, SInteract};
+
+        let ClientPlatform::Java(client) = player.client.as_ref() else {
+            panic!("bucket fixture must have a Java client");
+        };
+        player.set_client_loaded(true);
+        client.handle_interact(
+            player,
+            &SInteract {
+                entity_id: entity.get_entity().entity_id.into(),
+                r#type: (ActionType::InteractAt as i32).into(),
+                target_position: Some(Vector3::new(0.0, 0.0, 0.0)),
+                hand: Some(0.into()),
+                sneaking: false,
+            },
+            server,
+        );
+    }
+
+    #[tokio::test]
+    async fn bucket_pickup_survives_interaction_writeback_and_player_data_reload() {
+        use pumpkin_data::{item::Item, item_stack::ItemStack, statistic::StatisticCategory};
+        use pumpkin_inventory::inventory::Clearable;
+        use pumpkin_world::data::player_data::PlayerDataStorage;
+
+        let (directory, server, _peer, player, world) = bucket_test_player().await;
+        let storage = PlayerDataStorage::new(directory.path().join("pickup-playerdata"), true);
+        player.inventory.set_selected_slot(3);
+        for (index, (entity_type, bucket)) in [
+            (&EntityType::COD, &Item::COD_BUCKET),
+            (&EntityType::SALMON, &Item::SALMON_BUCKET),
+            (&EntityType::TROPICAL_FISH, &Item::TROPICAL_FISH_BUCKET),
+            (&EntityType::PUFFERFISH, &Item::PUFFERFISH_BUCKET),
+            (&EntityType::TADPOLE, &Item::TADPOLE_BUCKET),
+            (&EntityType::AXOLOTL, &Item::AXOLOTL_BUCKET),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            player.inventory.clear();
+            player
+                .inventory
+                .set_held_item(ItemStack::new(1, &Item::WATER_BUCKET));
+            let entity = from_type(entity_type, player.position(), &world, Uuid::new_v4());
+            assert!(world.spawn_entity(entity.clone()));
+            interact_with_main_hand(&player, &entity, &server);
+
+            assert!(
+                entity.get_entity().is_removed(),
+                "{}",
+                entity_type.resource_name
+            );
+            assert!(
+                world
+                    .get_entity_by_id(entity.get_entity().entity_id)
+                    .is_none()
+            );
+            assert_eq!(player.inventory.held_item().item.id, bucket.id);
+            assert_eq!(player.inventory.count_item(bucket), 1);
+            assert_eq!(player.inventory.count_item(&Item::WATER_BUCKET), 0);
+            assert_eq!(
+                player.get_stat(StatisticCategory::Used, i32::from(Item::WATER_BUCKET.id)),
+                index as i32 + 1,
+            );
+
+            let mut saved = NbtCompound::new();
+            player.write_nbt(&mut saved);
+            storage
+                .save_player_data(&player.gameprofile.id, saved)
+                .unwrap();
+            player.inventory.clear();
+            player.inventory.set_selected_slot(0);
+            let (found, reloaded) = storage.load_player_data(&player.gameprofile.id).unwrap();
+            assert!(found);
+            player.read_nbt_non_mut(&reloaded);
+            assert_eq!(player.inventory.get_selected_slot(), 3);
+            assert_eq!(player.inventory.held_item().item.id, bucket.id);
+            assert_eq!(player.inventory.count_item(bucket), 1);
+            assert_eq!(player.inventory.count_item(&Item::WATER_BUCKET), 0);
+        }
+        world.players.store(Arc::new(Vec::new()));
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn bucket_item_callback_preserves_stacked_milk_exchange() {
+        use pumpkin_data::{item::Item, item_stack::ItemStack};
+
+        let (_directory, server, _peer, player, world) = bucket_test_player().await;
+        player.inventory.set_selected_slot(3);
+        player
+            .inventory
+            .set_held_item(ItemStack::new(2, &Item::BUCKET));
+        let mooshroom = from_type(
+            &EntityType::MOOSHROOM,
+            player.position(),
+            &world,
+            Uuid::new_v4(),
+        );
+        assert!(world.spawn_entity(mooshroom.clone()));
+        // Exercise the registered item callback contract, below entity overrides.
+        let mut stack = player.inventory.held_item();
+        server
+            .item_registry
+            .use_on_entity(&mut stack, &player, mooshroom.clone());
+        assert!(!mooshroom.get_entity().is_removed());
+        assert_eq!(stack.item.id, Item::BUCKET.id);
+        assert_eq!(stack.item_count, 1);
+        assert_eq!(player.inventory.held_item().item.id, Item::BUCKET.id);
+        assert_eq!(player.inventory.held_item().item_count, 1);
+        assert_eq!(player.inventory.count_item(&Item::MILK_BUCKET), 1);
+        player.inventory.set_held_item(stack);
+        assert_eq!(player.inventory.held_item().item.id, Item::BUCKET.id);
+        assert_eq!(player.inventory.held_item().item_count, 1);
+        assert_eq!(player.inventory.count_item(&Item::MILK_BUCKET), 1);
+        mooshroom.get_entity().remove();
+        world.players.store(Arc::new(Vec::new()));
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn bucket_entity_interaction_preserves_creative_buckets() {
+        use pumpkin_data::{item::Item, item_stack::ItemStack};
+        use pumpkin_util::GameMode;
+
+        let (_directory, server, _peer, player, world) = bucket_test_player().await;
+        player.inventory.set_selected_slot(3);
+        player.gamemode.store(GameMode::Creative);
+        player
+            .inventory
+            .set_held_item(ItemStack::new(1, &Item::WATER_BUCKET));
+        for (entity_type, bucket) in [
+            (&EntityType::TROPICAL_FISH, &Item::TROPICAL_FISH_BUCKET),
+            (&EntityType::AXOLOTL, &Item::AXOLOTL_BUCKET),
+            (&EntityType::TADPOLE, &Item::TADPOLE_BUCKET),
+        ] {
+            for _ in 0..2 {
+                let fish = from_type(entity_type, player.position(), &world, Uuid::new_v4());
+                assert!(world.spawn_entity(fish.clone()));
+                interact_with_main_hand(&player, &fish, &server);
+                assert!(fish.get_entity().is_removed());
+                assert_eq!(player.inventory.held_item().item.id, Item::WATER_BUCKET.id);
+                assert_eq!(player.inventory.held_item().item_count, 1);
+                assert_eq!(player.inventory.count_item(bucket), 1);
+            }
+        }
+        world.players.store(Arc::new(Vec::new()));
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_bucket_entity_pickup_does_not_fall_through_to_item_callback() {
+        use crate::plugin::{
+            EventHandler,
+            api::events::{EventPriority, player::player_bucket_entity::PlayerBucketEntityEvent},
+        };
+        use futures::future::BoxFuture;
+        use pumpkin_data::{item::Item, item_stack::ItemStack};
+        use std::sync::atomic::AtomicUsize;
+
+        struct CancelPickup(AtomicUsize);
+        impl EventHandler<PlayerBucketEntityEvent> for CancelPickup {
+            fn handle_blocking<'a>(
+                &'a self,
+                _server: &'a Arc<crate::server::Server>,
+                event: &'a mut PlayerBucketEntityEvent,
+            ) -> BoxFuture<'a, ()> {
+                Box::pin(async move {
+                    self.0.fetch_add(1, Ordering::Relaxed);
+                    event.cancelled = true;
+                })
+            }
+        }
+
+        let (_directory, server, _peer, player, world) = bucket_test_player().await;
+        let handler = Arc::new(CancelPickup(AtomicUsize::new(0)));
+        server
+            .plugin_manager
+            .register::<PlayerBucketEntityEvent, _>(handler.clone(), EventPriority::Normal, true);
+        player
+            .inventory
+            .set_held_item(ItemStack::new(1, &Item::WATER_BUCKET));
+        for (entity_type, bucket) in [
+            (&EntityType::AXOLOTL, &Item::AXOLOTL_BUCKET),
+            (&EntityType::TADPOLE, &Item::TADPOLE_BUCKET),
+        ] {
+            let entity = from_type(entity_type, player.position(), &world, Uuid::new_v4());
+            assert!(world.spawn_entity(entity.clone()));
+            interact_with_main_hand(&player, &entity, &server);
+            assert!(!entity.get_entity().is_removed());
+            assert!(
+                world
+                    .get_entity_by_id(entity.get_entity().entity_id)
+                    .is_some()
+            );
+            assert_eq!(player.inventory.held_item().item.id, Item::WATER_BUCKET.id);
+            assert_eq!(player.inventory.held_item().item_count, 1);
+            assert_eq!(player.inventory.count_item(bucket), 0);
+            entity.get_entity().remove();
+        }
+        assert_eq!(handler.0.load(Ordering::Relaxed), 2);
+        world.players.store(Arc::new(Vec::new()));
+        server.shutdown().await;
     }
 
     #[tokio::test]
