@@ -148,6 +148,8 @@ pub use set_structure_block::*;
 
 mod spectate_entity;
 pub use spectate_entity::*;
+mod spectator_action;
+pub use spectator_action::*;
 
 mod change_difficulty;
 pub use change_difficulty::*;

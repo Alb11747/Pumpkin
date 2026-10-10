@@ -292,7 +292,7 @@ pub mod set_held_item;
 pub mod set_jigsaw_block;
 pub mod set_structure_block;
 pub mod set_test_block;
-pub mod spectate_entity;
+pub mod spectator_action;
 pub mod swing_arm;
 pub mod tag_query;
 pub mod teleport_to_entity;

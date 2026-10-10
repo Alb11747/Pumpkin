@@ -1,15 +1,24 @@
 use pumpkin_data::packet::serverbound::play::SPECTATE_ENTITY;
-use pumpkin_macros::java_packet;
 
 use crate::{
-    ServerPacket,
+    MultiVersionJavaPacket, ServerPacket,
     ser::{NetworkReadExt, ReadingError},
 };
 use pumpkin_util::version::JavaMinecraftVersion;
 
-#[java_packet(SPECTATE_ENTITY)]
 pub struct SSpectateEntity {
     pub target: uuid::Uuid,
+}
+
+impl MultiVersionJavaPacket for SSpectateEntity {
+    fn to_id(version: JavaMinecraftVersion) -> i32 {
+        // The legacy UUID payload remains in the public Wasm API, but 26.3 replaced it.
+        if version >= JavaMinecraftVersion::V_26_3 {
+            -1
+        } else {
+            SPECTATE_ENTITY.to_id(version)
+        }
+    }
 }
 
 impl<'a> ServerPacket<'a> for SSpectateEntity {
