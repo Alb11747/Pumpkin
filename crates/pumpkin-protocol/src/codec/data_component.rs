@@ -1403,9 +1403,43 @@ codec_string_variant!(WolfCollarImpl);
 codec_string_variant!(FoxVariantImpl);
 codec_string_variant!(SalmonSizeImpl);
 codec_string_variant!(ParrotVariantImpl);
-codec_string_variant!(TropicalFishPatternImpl);
-codec_string_variant!(TropicalFishBaseColorImpl);
-codec_string_variant!(TropicalFishPatternColorImpl);
+impl DataComponentCodec<Self> for TropicalFishPatternImpl {
+    fn serialize(&self, seq: &mut impl NetworkWriteExt) -> Result<(), WritingError> {
+        let id = self
+            .packed_id()
+            .ok_or_else(|| WritingError::Message("Unknown tropical fish pattern".into()))?;
+        seq.write_var_int(&VarInt(id))
+    }
+
+    fn deserialize(seq: &mut impl NetworkReadExt) -> Result<Self, ReadingError> {
+        Ok(Self::from_packed_id(seq.get_var_int()?.0))
+    }
+}
+
+macro_rules! codec_tropical_fish_color {
+    ($struct_name:ident) => {
+        impl DataComponentCodec<Self> for $struct_name {
+            fn serialize(&self, seq: &mut impl NetworkWriteExt) -> Result<(), WritingError> {
+                let color = pumpkin_data::dye_color::DyeColor::by_name(&self.value)
+                    .ok_or_else(|| WritingError::Message("Unknown tropical fish color".into()))?;
+                seq.write_var_int(&VarInt(i32::from(color.id())))
+            }
+            fn deserialize(seq: &mut impl NetworkReadExt) -> Result<Self, ReadingError> {
+                let id = seq.get_var_int()?.0;
+                let color = u8::try_from(id)
+                    .ok()
+                    .and_then(pumpkin_data::dye_color::DyeColor::by_id)
+                    .unwrap_or(pumpkin_data::dye_color::DyeColor::White);
+                Ok(Self {
+                    value: Cow::Borrowed(color.name()),
+                })
+            }
+        }
+    };
+}
+
+codec_tropical_fish_color!(TropicalFishBaseColorImpl);
+codec_tropical_fish_color!(TropicalFishPatternColorImpl);
 codec_string_variant!(MooshroomVariantImpl);
 codec_string_variant!(RabbitVariantImpl);
 codec_string_variant!(PigVariantImpl);
@@ -2882,6 +2916,99 @@ mod tests {
 
     use pumpkin_data::{item::Item, item_stack::ItemStack};
     use pumpkin_nbt::compound::NbtCompound;
+
+    #[test]
+    fn tropical_fish_components_use_vanilla_packed_pattern_and_color_wire() {
+        for (name, expected) in [
+            ("kob", vec![0]),
+            ("sunstreak", vec![0x80, 2]),
+            ("snooper", vec![0x80, 4]),
+            ("dasher", vec![0x80, 6]),
+            ("brinely", vec![0x80, 8]),
+            ("spotty", vec![0x80, 10]),
+            ("flopper", vec![1]),
+            ("stripey", vec![0x81, 2]),
+            ("glitter", vec![0x81, 4]),
+            ("blockfish", vec![0x81, 6]),
+            ("betty", vec![0x81, 8]),
+            ("clayfish", vec![0x81, 10]),
+        ] {
+            let pattern = TropicalFishPatternImpl { value: name.into() };
+            let mut bytes = Vec::new();
+            pattern.serialize(&mut bytes).unwrap();
+            assert_eq!(bytes, expected, "{name}");
+            bytes.push(0x7f);
+            let mut input = bytes.as_slice();
+            assert_eq!(
+                TropicalFishPatternImpl::deserialize(&mut input).unwrap(),
+                pattern
+            );
+            assert_eq!(input, [0x7f]);
+        }
+        let base = TropicalFishBaseColorImpl {
+            value: "orange".into(),
+        };
+        let pattern_color = TropicalFishPatternColorImpl {
+            value: "red".into(),
+        };
+        let mut bytes = Vec::new();
+        base.serialize(&mut bytes).unwrap();
+        pattern_color.serialize(&mut bytes).unwrap();
+        assert_eq!(bytes, [1, 14]);
+        bytes.push(0x7f);
+        let mut input = bytes.as_slice();
+        assert_eq!(
+            TropicalFishBaseColorImpl::deserialize(&mut input).unwrap(),
+            base
+        );
+        assert_eq!(
+            TropicalFishPatternColorImpl::deserialize(&mut input).unwrap(),
+            pattern_color
+        );
+        assert_eq!(input, [0x7f]);
+    }
+
+    #[test]
+    fn tropical_fish_components_reject_unknown_names_and_default_unknown_wire_ids() {
+        let mut bytes = Vec::new();
+        assert!(
+            TropicalFishPatternImpl {
+                value: "unknown".into()
+            }
+            .serialize(&mut bytes)
+            .is_err()
+        );
+        assert!(
+            TropicalFishBaseColorImpl {
+                value: "unknown".into()
+            }
+            .serialize(&mut bytes)
+            .is_err()
+        );
+        assert!(
+            TropicalFishPatternColorImpl {
+                value: "unknown".into()
+            }
+            .serialize(&mut bytes)
+            .is_err()
+        );
+        let mut input = &[0x80, 2][..]; // 256 is a valid pattern, but not a color.
+        assert_eq!(
+            TropicalFishBaseColorImpl::deserialize(&mut input)
+                .unwrap()
+                .value,
+            "white"
+        );
+        let mut input = &[2][..]; // Sparse pattern ID 2 is absent in vanilla.
+        assert_eq!(
+            TropicalFishPatternImpl::deserialize(&mut input)
+                .unwrap()
+                .value,
+            "kob"
+        );
+        let mut input = &[][..];
+        assert!(TropicalFishPatternColorImpl::deserialize(&mut input).is_err());
+    }
 
     #[test]
     fn intangible_projectile_writes_compound_and_preserves_following_byte() {

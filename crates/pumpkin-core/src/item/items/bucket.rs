@@ -31,8 +31,15 @@ pub(crate) fn create_bucket_entity(
     entity_type: &'static EntityType,
     position: Vector3<f64>,
     world: &Arc<World>,
+    stack: &ItemStack,
 ) -> Arc<dyn EntityBase> {
     let entity = from_type(entity_type, position, world, Uuid::new_v4());
+    if let Some(fish) = entity
+        .cast_any()
+        .downcast_ref::<crate::entity::passive::tropical_fish::TropicalFishEntity>()
+    {
+        fish.load_from_bucket_stack(stack);
+    }
     if let Some(mob) = entity.get_mob() {
         // MobBucketItem marks bucket provenance after creating the released mob.
         let mut data = NbtCompound::new();
@@ -127,6 +134,10 @@ const fn get_fill_sound(item: &Item) -> Sound {
 
 /// Gives the resulting bucket and returns the main-hand stack for interaction writeback.
 pub(crate) fn give_player_bucket_item(player: &Player, item: &'static Item) -> ItemStack {
+    give_player_bucket_stack(player, ItemStack::new(1, item))
+}
+
+fn give_player_bucket_stack(player: &Player, mut item_stack: ItemStack) -> ItemStack {
     if player.gamemode.load() == GameMode::Creative {
         let has_item = {
             let inv = player
@@ -134,15 +145,14 @@ pub(crate) fn give_player_bucket_item(player: &Player, item: &'static Item) -> I
                 .main_inventory
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            inv.iter().any(|stack| stack.item.id == item.id)
+            inv.iter()
+                .any(|stack| stack.are_items_and_components_equal(&item_stack))
         };
         if has_item {
             return player.inventory.held_item();
         }
-        let mut item_stack = ItemStack::new(1, item);
         player.inventory.insert_stack_anywhere(&mut item_stack);
     } else {
-        let item_stack = ItemStack::new(1, item);
         let mut held_stack = player.inventory.held_item();
 
         if held_stack.item_count == 1 {
@@ -453,7 +463,12 @@ impl ItemBehaviour for FilledBucketItem {
                 f64::from(place_pos.0.y),
                 f64::from(place_pos.0.z) + 0.5,
             );
-            let mob = create_bucket_entity(entity_type, spawn_coord, &world);
+            let mob = create_bucket_entity(
+                entity_type,
+                spawn_coord,
+                &world,
+                &player.inventory.held_item(),
+            );
             world.spawn_entity(mob);
         }
 
@@ -488,7 +503,14 @@ impl ItemBehaviour for FilledBucketItem {
                 let ent = entity.get_entity();
                 let world = ent.world.load();
                 world.play_sound(sound, SoundCategory::Neutral, &ent.pos.load());
-                *item = give_player_bucket_item(player, mob_bucket);
+                let mut bucket_stack = ItemStack::new(1, mob_bucket);
+                if let Some(fish) = entity
+                    .cast_any()
+                    .downcast_ref::<crate::entity::passive::tropical_fish::TropicalFishEntity>(
+                ) {
+                    fish.save_to_bucket_tag(&mut bucket_stack);
+                }
+                *item = give_player_bucket_stack(player, bucket_stack);
                 ent.remove();
             }
         }

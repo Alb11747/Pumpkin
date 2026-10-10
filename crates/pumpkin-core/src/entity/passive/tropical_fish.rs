@@ -3,7 +3,15 @@ use std::sync::{
     atomic::{AtomicBool, AtomicI32, Ordering},
 };
 
-use pumpkin_data::entity::EntityType;
+use pumpkin_data::{
+    data_component_impl::{
+        CustomNameImpl, TropicalFishBaseColorImpl, TropicalFishPatternColorImpl,
+        TropicalFishPatternImpl,
+    },
+    dye_color::DyeColor,
+    entity::EntityType,
+    item_stack::ItemStack,
+};
 use pumpkin_nbt::compound::NbtCompound;
 use pumpkin_protocol::codec::var_int::VarInt;
 
@@ -23,6 +31,51 @@ pub struct TropicalFishEntity {
 }
 
 impl TropicalFishEntity {
+    pub(crate) fn save_to_bucket_tag(&self, stack: &mut ItemStack) {
+        let variant = self.variant.load(Ordering::Relaxed);
+        stack.set_data_component(TropicalFishPatternImpl::from_packed_id(variant & 0xffff));
+        stack.set_data_component(TropicalFishBaseColorImpl {
+            value: DyeColor::by_id(((variant >> 16) & 0xff) as u8)
+                .unwrap_or(DyeColor::White)
+                .name()
+                .into(),
+        });
+        stack.set_data_component(TropicalFishPatternColorImpl {
+            value: DyeColor::by_id(((variant >> 24) & 0xff) as u8)
+                .unwrap_or(DyeColor::White)
+                .name()
+                .into(),
+        });
+        if let Some(name) = &**self.get_entity().custom_name.load() {
+            stack.set_data_component(CustomNameImpl { name: name.clone() });
+        }
+    }
+
+    pub(crate) fn load_from_bucket_stack(&self, stack: &ItemStack) {
+        let mut variant = self.variant.load(Ordering::Relaxed);
+        if let Some(pattern) = stack.get_data_component::<TropicalFishPatternImpl>()
+            && let Some(id) = pattern.packed_id()
+        {
+            variant = (variant & !0xffff) | id;
+        }
+        if let Some(color) = stack.get_data_component::<TropicalFishBaseColorImpl>()
+            && let Some(color) = DyeColor::by_name(&color.value)
+        {
+            variant = (variant & !(0xff << 16)) | (i32::from(color.id()) << 16);
+        }
+        if let Some(color) = stack.get_data_component::<TropicalFishPatternColorImpl>()
+            && let Some(color) = DyeColor::by_name(&color.value)
+        {
+            variant = (variant & !(0xff << 24)) | (i32::from(color.id()) << 24);
+        }
+        let mut nbt = NbtCompound::new();
+        nbt.put_int("Variant", variant);
+        self.mob_read_nbt(&nbt);
+        if let Some(name) = stack.get_custom_name() {
+            self.get_entity().set_custom_name(name.clone());
+        }
+    }
+
     pub fn new(entity: Entity) -> Arc<Self> {
         let mob_entity = MobEntity::new(entity);
         let tropical_fish = Self {

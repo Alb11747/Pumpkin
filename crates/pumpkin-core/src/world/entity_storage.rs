@@ -1109,8 +1109,179 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tropical_fish_bucket_capture_relog_release_preserves_variant_and_name() {
+        use crate::item::items::bucket::create_bucket_entity;
+        use pumpkin_data::{
+            data_component_impl::{
+                TropicalFishBaseColorImpl, TropicalFishPatternColorImpl, TropicalFishPatternImpl,
+            },
+            item::Item,
+            item_stack::ItemStack,
+        };
+        use pumpkin_inventory::inventory::Clearable;
+        use pumpkin_util::text::TextComponent;
+        use pumpkin_world::data::player_data::PlayerDataStorage;
+
+        let (directory, server, _peer, player, world) = bucket_test_player().await;
+        let storage = PlayerDataStorage::new(directory.path().join("variant-playerdata"), true);
+        player.inventory.set_selected_slot(3);
+        for (variant, pattern, base_color, pattern_color, name) in [
+            (
+                65536,
+                "kob",
+                "orange",
+                "white",
+                Some(TextComponent::text("Variant A")),
+            ),
+            (
+                131073,
+                "flopper",
+                "magenta",
+                "white",
+                Some(TextComponent::text("Variant B")),
+            ),
+            (
+                0x0e_04_05_01,
+                "clayfish",
+                "yellow",
+                "red",
+                Some(
+                    TextComponent::text("Styled")
+                        .bold()
+                        .add_child(TextComponent::text(" fish")),
+                ),
+            ),
+            (0, "kob", "white", "white", None),
+        ] {
+            player.inventory.clear();
+            player
+                .inventory
+                .set_held_item(ItemStack::new(1, &Item::WATER_BUCKET));
+            let original_uuid = Uuid::new_v4();
+            let fish = from_type(
+                &EntityType::TROPICAL_FISH,
+                player.position(),
+                &world,
+                original_uuid,
+            );
+            let mut fish_data = NbtCompound::new();
+            fish_data.put_int("Variant", variant);
+            fish.get_mob().unwrap().mob_read_nbt(&fish_data);
+            if let Some(name) = &name {
+                fish.get_entity().set_custom_name(name.clone());
+            }
+            assert!(world.spawn_entity(fish.clone()));
+            interact_with_main_hand(&player, &fish, &server);
+            assert!(fish.get_entity().is_removed());
+
+            let held = player.inventory.held_item();
+            assert_eq!(held.item.id, Item::TROPICAL_FISH_BUCKET.id);
+            let mut saved_item = NbtCompound::new();
+            held.write_item_stack(&mut saved_item);
+            let components = saved_item.get_compound("components").unwrap();
+            assert_eq!(
+                components.get_string("minecraft:tropical_fish/pattern"),
+                Some(pattern)
+            );
+            assert_eq!(
+                components.get_string("minecraft:tropical_fish/base_color"),
+                Some(base_color)
+            );
+            assert_eq!(
+                components.get_string("minecraft:tropical_fish/pattern_color"),
+                Some(pattern_color)
+            );
+            let decoded = ItemStack::read_item_stack(&saved_item).unwrap();
+            assert!(held.are_items_and_components_equal(&decoded));
+
+            let mut saved_player = NbtCompound::new();
+            player.write_nbt(&mut saved_player);
+            storage
+                .save_player_data(&player.gameprofile.id, saved_player)
+                .unwrap();
+            player.inventory.clear();
+            player.inventory.set_selected_slot(0);
+            let (found, reloaded) = storage.load_player_data(&player.gameprofile.id).unwrap();
+            assert!(found);
+            player.read_nbt_non_mut(&reloaded);
+            assert_eq!(player.inventory.get_selected_slot(), 3);
+            let held = player.inventory.held_item();
+            assert_eq!(held.item.id, Item::TROPICAL_FISH_BUCKET.id);
+            assert_eq!(
+                held.get_data_component::<TropicalFishPatternImpl>()
+                    .unwrap()
+                    .value,
+                pattern
+            );
+            assert_eq!(
+                held.get_data_component::<TropicalFishBaseColorImpl>()
+                    .unwrap()
+                    .value,
+                base_color
+            );
+            assert_eq!(
+                held.get_data_component::<TropicalFishPatternColorImpl>()
+                    .unwrap()
+                    .value,
+                pattern_color
+            );
+            assert_eq!(held.get_custom_name(), name.as_ref());
+
+            let release_position = Vector3::new(0.5, 64.0, 0.5);
+            let released =
+                create_bucket_entity(&EntityType::TROPICAL_FISH, release_position, &world, &held);
+            assert_eq!(released.get_entity().pos.load(), release_position);
+            let saved = save_entity_tree(&released).unwrap();
+            assert_ne!(saved.get_uuid("UUID").unwrap(), original_uuid);
+            assert_eq!(saved.get_int("Variant"), Some(variant));
+            assert_eq!(saved.get_bool("FromBucket"), Some(true));
+            assert_eq!(&**released.get_entity().custom_name.load(), &name);
+            let loaded = load_entity_tree(&saved, &world).unwrap();
+            let resaved = save_entity_tree(&loaded[0]).unwrap();
+            assert_eq!(resaved.get_int("Variant"), Some(variant));
+            assert_eq!(resaved.get_bool("FromBucket"), Some(true));
+            assert_eq!(resaved.get("CustomName"), saved.get("CustomName"));
+            assert_eq!(&**loaded[0].get_entity().custom_name.load(), &name);
+            assert!(loaded[0].get_mob().unwrap().requires_custom_persistence());
+        }
+        // Creative keeps the water bucket, but must retain distinct captured fish stacks.
+        player.inventory.clear();
+        player.gamemode.store(pumpkin_util::GameMode::Creative);
+        player
+            .inventory
+            .set_held_item(ItemStack::new(1, &Item::WATER_BUCKET));
+        for (variant, name, expected_count) in [
+            (65536, "Variant A", 1),
+            (131073, "Variant B", 2),
+            (65536, "Variant A", 2),
+        ] {
+            let fish = from_type(
+                &EntityType::TROPICAL_FISH,
+                player.position(),
+                &world,
+                Uuid::new_v4(),
+            );
+            let mut data = NbtCompound::new();
+            data.put_int("Variant", variant);
+            fish.get_mob().unwrap().mob_read_nbt(&data);
+            fish.get_entity().set_custom_name(TextComponent::text(name));
+            assert!(world.spawn_entity(fish.clone()));
+            interact_with_main_hand(&player, &fish, &server);
+            assert!(fish.get_entity().is_removed());
+            assert_eq!(player.inventory.held_item().item.id, Item::WATER_BUCKET.id);
+            assert_eq!(
+                player.inventory.count_item(&Item::TROPICAL_FISH_BUCKET),
+                expected_count
+            );
+        }
+        world.players.store(Arc::new(Vec::new()));
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn newly_released_bucket_mobs_gain_persistent_provenance() {
         use crate::item::items::bucket::create_bucket_entity;
+        use pumpkin_data::{item::Item, item_stack::ItemStack};
 
         let (_directory, server, _peer, _player, world) = bucket_test_player().await;
         let mut outcomes = Vec::new();
@@ -1123,7 +1294,12 @@ mod tests {
             &EntityType::AXOLOTL,
         ] {
             // Use the constructor called by FilledBucketItem, without any item payload.
-            let released = create_bucket_entity(entity_type, Vector3::new(0.5, 64.0, 0.5), &world);
+            let released = create_bucket_entity(
+                entity_type,
+                Vector3::new(0.5, 64.0, 0.5),
+                &world,
+                &ItemStack::new(1, &Item::WATER_BUCKET),
+            );
             let mob = released.get_mob().unwrap();
             assert!(
                 !mob.get_mob_entity()

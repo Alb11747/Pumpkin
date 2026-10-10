@@ -37,6 +37,42 @@ string_variant!(ParrotVariant, ParrotVariantImpl);
 string_variant!(TropicalFishPattern, TropicalFishPatternImpl);
 string_variant!(TropicalFishBaseColor, TropicalFishBaseColorImpl);
 string_variant!(TropicalFishPatternColor, TropicalFishPatternColorImpl);
+
+impl TropicalFishPatternImpl {
+    // TropicalFish.Pattern uses a sparse packed ID, including on the wire.
+    const PATTERNS: [(&'static str, i32); 12] = [
+        ("kob", 0),
+        ("sunstreak", 256),
+        ("snooper", 512),
+        ("dasher", 768),
+        ("brinely", 1024),
+        ("spotty", 1280),
+        ("flopper", 1),
+        ("stripey", 257),
+        ("glitter", 513),
+        ("blockfish", 769),
+        ("betty", 1025),
+        ("clayfish", 1281),
+    ];
+
+    pub fn from_packed_id(id: i32) -> Self {
+        Self {
+            value: Cow::Borrowed(
+                Self::PATTERNS
+                    .iter()
+                    .find(|(_, packed)| *packed == id)
+                    .map_or("kob", |(name, _)| *name),
+            ),
+        }
+    }
+
+    pub fn packed_id(&self) -> Option<i32> {
+        Self::PATTERNS
+            .iter()
+            .find(|(name, _)| *name == self.value.as_ref())
+            .map(|(_, id)| *id)
+    }
+}
 string_variant!(MooshroomVariant, MooshroomVariantImpl);
 string_variant!(RabbitVariant, RabbitVariantImpl);
 string_variant!(PigVariant, PigVariantImpl);
