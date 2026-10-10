@@ -504,6 +504,15 @@ impl<S: SingleChunkDataSerializer> AnvilChunkFile<S> {
         write.get_ref().sync_all().await?;
         drop(write);
         tokio::fs::rename(&temp_path, path).await?;
+        // A completed full rewrite must durably publish the renamed directory entry.
+        #[cfg(unix)]
+        {
+            let parent = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            tokio::fs::File::open(parent).await?.sync_all().await?;
+        }
         debug!(
             target: "pumpkin_save_lineage", kind = "commit",
             temp = %temp_path.display(), region = %path.display(), "save_lineage"
