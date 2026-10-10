@@ -636,6 +636,18 @@ impl BlockRegistry {
             _ => {}
         }
 
+        // Applying components cannot restore an opaque container. Reject before placement
+        // callbacks or world writes; the caller only decrements after Ok(Some(...)).
+        if placed_block.has_tag(&tag::Block::MINECRAFT_SHULKER_BOXES)
+            && let Ok(hand) = pumpkin_util::Hand::from_packet_id(use_item_on.hand.0)
+            && player
+                .inventory()
+                .get_stack_in_hand(hand)
+                .has_opaque_container()
+        {
+            return Ok(None);
+        }
+
         let clicked_block_pos = BlockPos(location.0);
         let world = entity.world.load_full();
 

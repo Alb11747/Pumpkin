@@ -831,9 +831,18 @@ impl DispenserBlock {
     }
 
     fn dispense_filled_bucket(ctx: &DispenseContext<'_>, item: &mut ItemStack) {
+        // Mob release is not implemented here. Keep the complete bucket, including its
+        // preserved payload, rather than placing fluid and replacing it with an empty bucket.
+        if item.item.id != Item::WATER_BUCKET.id
+            && item.item.id != Item::LAVA_BUCKET.id
+            && item.item.id != Item::POWDER_SNOW_BUCKET.id
+        {
+            Self::play_dispense_effects(ctx, WorldEvent::SoundDispenserFail);
+            return;
+        }
+
         let front = Self::target_position(ctx);
 
-        // TODO: Spawn the stored entity for axolotl/fish/tadpole buckets, like the player path.
         let emptied = if should_evaporate_in_nether(item.item, ctx.world) {
             play_bucket_evaporation(ctx.world, &front.to_f64());
             true
@@ -1138,6 +1147,12 @@ impl DispenserBlock {
     }
 
     fn dispense_shulker_box(ctx: &DispenseContext<'_>, item: &mut ItemStack) -> bool {
+        // Check before splitting the item or mutating the world: the block entity cannot
+        // restore contents that exist only in the preserved component.
+        if item.has_opaque_container() {
+            return false;
+        }
+
         let Some(block) = Block::from_item_id(item.item.id) else {
             return false;
         };
@@ -1276,5 +1291,132 @@ impl DispenserBlock {
 
         let item_entity = Arc::new(ItemEntity::new_with_velocity(entity, stack, velocity, 40));
         ctx.world.spawn_entity(item_entity);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arc_swap::ArcSwap;
+    use pumpkin_config::world::LevelConfig;
+    use pumpkin_data::dimension::Dimension;
+    use pumpkin_nbt::{compound::NbtCompound, tag::NbtTag};
+    use pumpkin_util::{math::vector2::Vector2, world_seed::Seed};
+    use pumpkin_world::{chunk::ChunkData, level::Level, world_info::LevelData};
+    use std::sync::Weak;
+
+    fn test_world(path: &std::path::Path, dimension: Dimension) -> Arc<World> {
+        let level = Level::from_root_folder(
+            &LevelConfig::default(),
+            path.to_path_buf(),
+            0,
+            dimension.clone(),
+        )
+        .unwrap();
+        level
+            .loaded_chunks
+            .insert(Vector2::new(0, 0), ChunkData::empty_sync(0, 0));
+        Arc::new(
+            World::load(
+                level,
+                Arc::new(ArcSwap::from_pointee(LevelData::default(Seed(0)))),
+                dimension,
+                Arc::new(crate::block::registry::BlockRegistry::default()),
+                Weak::new(),
+            )
+            .unwrap(),
+        )
+    }
+
+    fn saved(stack: &ItemStack) -> NbtCompound {
+        let mut nbt = NbtCompound::new();
+        stack.write_item_stack(&mut nbt);
+        nbt
+    }
+
+    #[tokio::test]
+    async fn dispenser_refuses_opaque_shulker_without_consuming_supported_sibling() {
+        let directory = tempfile::tempdir().unwrap();
+        let world = test_world(directory.path(), Dimension::OVERWORLD);
+        let position = BlockPos::new(4, 64, 4);
+        let ctx = DispenseContext {
+            world: &world,
+            position: &position,
+            facing: Facing::East,
+        };
+        let dispenser = DispenserBlockEntity::new(position);
+        let target = DispenserBlock::target_position(&ctx);
+        let initial_state = world.get_block_state_id(&target);
+        let mut unknown = NbtCompound::new();
+        unknown.put_string("id", "example:unknown_item".into());
+        unknown.put_int("count", 2);
+        let mut entry = NbtCompound::new();
+        entry.put_int("slot", 0);
+        entry.put_compound("item", unknown);
+        let mut sibling = NbtCompound::new();
+        sibling.put_int("slot", 1);
+        sibling.put_compound("item", saved(&ItemStack::new(64, &Item::DIAMOND)));
+        let mut components = NbtCompound::new();
+        components.put_list(
+            "minecraft:container",
+            vec![NbtTag::Compound(entry), NbtTag::Compound(sibling)],
+        );
+
+        for item in [&Item::SHULKER_BOX, &Item::RED_SHULKER_BOX] {
+            let mut original = saved(&ItemStack::new(1, item));
+            original.put_compound("components", components.clone());
+            let mut stack = ItemStack::read_item_stack(&original).unwrap();
+            DispenserBlock::dispense(&ctx, &dispenser, &mut stack);
+            assert_eq!(saved(&stack), original);
+            assert_eq!(world.get_block_state_id(&target), initial_state);
+            assert!(world.get_block_entity(&target).is_none());
+            assert!(world.entities.load().is_empty());
+            let reloaded = ItemStack::read_item_stack(&saved(&stack)).unwrap();
+            assert_eq!(saved(&reloaded), original);
+        }
+        world.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn dispenser_retains_complete_mob_buckets_in_overworld_and_nether() {
+        for dimension in [Dimension::OVERWORLD, Dimension::THE_NETHER] {
+            let directory = tempfile::tempdir().unwrap();
+            let world = test_world(directory.path(), dimension);
+            let position = BlockPos::new(4, 64, 4);
+            let ctx = DispenseContext {
+                world: &world,
+                position: &position,
+                facing: Facing::East,
+            };
+            let dispenser = DispenserBlockEntity::new(position);
+            let target = DispenserBlock::target_position(&ctx);
+            let initial_state = world.get_block_state_id(&target);
+            for item in [
+                &Item::AXOLOTL_BUCKET,
+                &Item::COD_BUCKET,
+                &Item::SALMON_BUCKET,
+                &Item::TROPICAL_FISH_BUCKET,
+                &Item::PUFFERFISH_BUCKET,
+                &Item::TADPOLE_BUCKET,
+            ] {
+                let mut stack = ItemStack::new(1, item);
+                stack.set_custom_name("Retained mob".into());
+                let mut original = saved(&stack);
+                let mut components = original.get_compound("components").unwrap().clone();
+                let mut payload = NbtCompound::new();
+                payload.put_float("Health", 3.5);
+                payload.put_int("Age", -1200);
+                components.put_compound("minecraft:bucket_entity_data", payload);
+                original.put_compound("components", components);
+                let mut stack = ItemStack::read_item_stack(&original).unwrap();
+                DispenserBlock::dispense(&ctx, &dispenser, &mut stack);
+                assert_eq!(saved(&stack), original);
+                assert_eq!(world.get_block_state_id(&target), initial_state);
+                assert!(world.entities.load().is_empty());
+                let reloaded = ItemStack::read_item_stack(&saved(&stack)).unwrap();
+                assert_eq!(saved(&reloaded), original);
+            }
+            world.shutdown().await;
+        }
     }
 }

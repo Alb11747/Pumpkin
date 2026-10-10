@@ -294,10 +294,15 @@ fn unknown_nested_item_preserves_entire_container_component() {
     let mut entry = NbtCompound::new();
     entry.put_int("slot", 0);
     entry.put("item", nested);
+    let mut diamonds = NbtCompound::new();
+    ItemStack::new(64, &Item::DIAMOND).write_item_stack(&mut diamonds);
+    let mut sibling = NbtCompound::new();
+    sibling.put_int("slot", 1);
+    sibling.put_compound("item", diamonds);
     let mut components = NbtCompound::new();
     components.put(
         "minecraft:container",
-        NbtTag::List(vec![NbtTag::Compound(entry)]),
+        NbtTag::List(vec![NbtTag::Compound(entry), NbtTag::Compound(sibling)]),
     );
     let mut original = NbtCompound::new();
     original.put_string("id", "minecraft:shulker_box".into());
@@ -305,7 +310,26 @@ fn unknown_nested_item_preserves_entire_container_component() {
     original.put("components", components);
     let stack = ItemStack::read_item_stack(&original).expect("known container item must survive");
     assert!(stack.get_data_component::<ContainerImpl>().is_none());
+    assert!(stack.has_opaque_container());
     assert_eq!(saved(&stack), original);
+    let mut reloaded = ItemStack::read_item_stack(&saved(&stack)).expect("preserved item reloads");
+    assert!(reloaded.has_opaque_container());
+    assert_eq!(saved(&reloaded), original);
+
+    reloaded.set_data_component(ContainerImpl {
+        items: vec![(1, ItemStack::new(64, &Item::DIAMOND))],
+    });
+    assert!(!reloaded.has_opaque_container());
+}
+
+#[test]
+fn absent_and_removed_containers_are_not_opaque() {
+    let stack = ItemStack::new(1, &Item::SHULKER_BOX);
+    assert!(!stack.has_opaque_container());
+    let mut removed = stack;
+    removed.remove_data_component(DataComponent::Container);
+    let reloaded = ItemStack::read_item_stack(&saved(&removed)).expect("removal reloads");
+    assert!(!reloaded.has_opaque_container());
 }
 
 #[test]

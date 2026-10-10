@@ -827,6 +827,19 @@ impl ItemStack {
         false
     }
 
+    /// Whether container contents are preserved on disk but unavailable to gameplay.
+    #[must_use]
+    pub fn has_opaque_container(&self) -> bool {
+        self.patch
+            .iter()
+            .any(|(id, data)| *id == DataComponent::Container && data.is_none())
+            && self.preserved_components.iter().any(|component| {
+                component.id == Some(DataComponent::Container)
+                    && component.modeled.is_none()
+                    && !component.name.starts_with('!')
+            })
+    }
+
     fn forget_preserved_component(&mut self, id: DataComponent) {
         self.preserved_components
             .retain(|component| component.id != Some(id));
