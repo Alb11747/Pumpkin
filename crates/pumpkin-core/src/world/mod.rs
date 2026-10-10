@@ -1880,14 +1880,14 @@ impl World {
 
         let t_be = std::time::Instant::now();
         let be_handle = handle;
-        block_entities.par_chunks(16).for_each(|batch| {
-            let _guard = be_handle.enter();
-            for be in batch {
-                be.tick(self);
-            }
-        });
-        // Drained after all ticks, so changes (hopper -> chest) land in the same tick.
         let guard = be_handle.enter();
+        // Inventory transfers use separate reads and writes. Serialize this phase so hopper
+        // push/pull and other block-entity inventory updates cannot overwrite one another.
+        // This contains tick races only; concurrent player/plugin writes still need transactions.
+        for be in &block_entities {
+            be.tick(self);
+        }
+        // Drained after all ticks, so changes (hopper -> chest) land in the same tick.
         self.flush_comparator_updates(&block_entities);
         drop(guard);
         drop(block_entity_ticks);
@@ -2233,27 +2233,21 @@ impl World {
         let tick_data = self.level.get_tick_data(&active_chunks, random_tick_speed);
         let handle = server.runtime.clone();
 
-        // 1. Parallel Block Ticks via Rayon
-        let world = self.clone();
-        let block_handle = handle.clone();
-        tick_data
-            .block_ticks
-            .par_chunks(BATCH_SIZE)
-            .for_each(|batch| {
-                let _guard = block_handle.enter();
-                let world = world.clone();
-                for scheduled_tick in batch {
-                    let pos = scheduled_tick.position;
-                    let block = world.get_block(&pos);
-                    if let Some(pumpkin_block) = world.block_registry.get_pumpkin_block(block.id) {
-                        pumpkin_block.on_scheduled_tick(OnScheduledTickArgs {
-                            world: &world,
-                            block,
-                            position: &pos,
-                        });
-                    }
-                }
-            });
+        // 1. Serialize scheduled block ticks, including dropper/crafter read-modify-write
+        // transfers. This phase completes before entity and block-entity ticks start.
+        let block_guard = handle.enter();
+        for scheduled_tick in &tick_data.block_ticks {
+            let pos = scheduled_tick.position;
+            let block = self.get_block(&pos);
+            if let Some(pumpkin_block) = self.block_registry.get_pumpkin_block(block.id) {
+                pumpkin_block.on_scheduled_tick(OnScheduledTickArgs {
+                    world: self,
+                    block,
+                    position: &pos,
+                });
+            }
+        }
+        drop(block_guard);
 
         // 2. Parallel Fluid Ticks via Rayon
         let world = self.clone();
