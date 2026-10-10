@@ -10,6 +10,8 @@ use uuid::Uuid;
 use super::World;
 use crate::entity::{EntityBase, r#type::from_type};
 
+pub(crate) const PLAYER_VEHICLE_OWNER: &str = "pumpkin:vehicle_owner";
+
 #[derive(Debug)]
 pub(super) enum EntityLoadError {
     Unsupported(&'static str),
@@ -167,6 +169,16 @@ pub(super) fn load_player_vehicle(
             admitted: Vec::new(),
         });
     }
+    // World-owned snapshots are attachment hints, never authority to recreate
+    // an absent UUID. Legacy Pumpkin records already have provenance but cannot
+    // prove exclusive playerdata ownership; retain them without replaying them.
+    match root.get(PLAYER_VEHICLE_OWNER) {
+        Some(NbtTag::String(owner)) if owner.as_ref() == "playerdata" => {}
+        None if root
+            .get(crate::entity::player::ROOT_VEHICLE_ORIGIN)
+            .is_none() => {}
+        _ => return Err("vehicle snapshot is not exclusively playerdata-owned".into()),
+    }
     let entities = load_entity_tree(
         root.get_compound("Entity")
             .ok_or("missing vehicle snapshot")?,
@@ -264,6 +276,8 @@ pub fn save_player_vehicle(vehicle: &Arc<dyn EntityBase>) -> Option<NbtCompound>
     let mut wrapper = NbtCompound::new();
     wrapper.put_uuid("Attach", vehicle.get_entity().entity_uuid);
     wrapper.put_compound("Entity", snapshot);
+    // The live tree remains in world storage, including after player disconnect.
+    wrapper.put_string(PLAYER_VEHICLE_OWNER, "world".to_owned());
     Some(wrapper)
 }
 
@@ -1296,6 +1310,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn destroyed_world_owned_player_vehicle_is_not_recreated_from_saved_snapshot() {
+        use pumpkin_world::data::player_data::PlayerDataStorage;
+
+        let directory = tempfile::tempdir().unwrap();
+        let world = test_world(directory.path());
+        let storage = PlayerDataStorage::new(directory.path(), true);
+        let player = Uuid::from_u128(3);
+        for legacy in [false, true] {
+            let entities = load_entity_tree(&minecart_fixture(), &world).unwrap();
+            assert!(world.add_entity_tree_silent(&entities));
+            let mut snapshot = NbtCompound::new();
+            snapshot.put_uuid("Attach", Uuid::from_u128(1));
+            snapshot.put_compound("Entity", save_entity_tree(&entities[0]).unwrap());
+            let mut origin = NbtCompound::new();
+            origin.put_string("dimension", "minecraft:the_end".to_owned());
+            origin.put_string("world", ".".to_owned());
+            snapshot.put_compound(crate::entity::player::ROOT_VEHICLE_ORIGIN, origin);
+            if !legacy {
+                snapshot.put_string(PLAYER_VEHICLE_OWNER, "world".to_owned());
+            }
+            let mut playerdata = NbtCompound::new();
+            playerdata.put_compound("RootVehicle", snapshot);
+            storage.save_player_data(&player, playerdata).unwrap();
+            let saved = storage.load_player_data(&player).unwrap().1;
+            let snapshot = saved.get_compound("RootVehicle").unwrap();
+            let before = snapshot.clone();
+
+            entities[0]
+                .get_entity()
+                .set_pos(Vector3::new(320.0, 48.0, 2.0));
+            let attached = load_player_vehicle(snapshot, &world).unwrap();
+            assert!(attached.admitted.is_empty());
+            assert!(Arc::ptr_eq(&attached.vehicle, &entities[0]));
+            assert_eq!(attached.vehicle.get_entity().pos.load().x, 320.0);
+            for entity in entities {
+                world.remove_entity(entity.as_ref());
+            }
+            assert!(matches!(
+                load_player_vehicle(snapshot, &world),
+                Err(EntityLoadError::Unsupported(_))
+            ));
+            assert!(world.entities.load().is_empty());
+            assert_eq!(snapshot, &before, "unresolved NBT remains recoverable");
+        }
+        world.level.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn player_vehicle_snapshot_loads_once_and_rejects_invalid_attachment_without_orphans() {
         let directory = tempfile::tempdir().unwrap();
         let world = test_world(directory.path());
@@ -1304,6 +1366,8 @@ mod tests {
         root.put_compound("Entity", minecart_fixture());
         let first = load_player_vehicle(&root, &world).unwrap();
         assert_eq!(first.admitted.len(), 2);
+        // Binding an imported record preserves its exclusive replay authority.
+        root.put_string(PLAYER_VEHICLE_OWNER, "playerdata".to_owned());
         first
             .vehicle
             .get_entity()

@@ -365,7 +365,7 @@ fn read_root_vehicle(nbt: &NbtCompound) -> Option<Uuid> {
 // Vanilla infers RootVehicle's world from the player's Dimension. A pending
 // import can outlive a Pumpkin world transfer, so retain its original ownership
 // explicitly instead of interpreting it in the player's next saved dimension.
-const ROOT_VEHICLE_ORIGIN: &str = "pumpkin:origin";
+pub(crate) const ROOT_VEHICLE_ORIGIN: &str = "pumpkin:origin";
 const RETAINED_ROOT_VEHICLE: &str = "pumpkin:retained_root_vehicle";
 const ROOT_VEHICLE_ARCHIVE: &str = "pumpkin:vehicle_archive";
 
@@ -389,6 +389,17 @@ fn vehicle_world_key(world: &World) -> String {
 fn bind_root_vehicle_origin(root: &mut NbtCompound, dimension: &str, world: &str) {
     // Do not reinterpret an explicit but unknown/malformed provenance record.
     if root.get(ROOT_VEHICLE_ORIGIN).is_none() {
+        // Only an unbound imported RootVehicle can own its tree in playerdata.
+        // Local snapshots already declare world ownership before binding here.
+        if root
+            .get(crate::world::entity_storage::PLAYER_VEHICLE_OWNER)
+            .is_none()
+        {
+            root.put_string(
+                crate::world::entity_storage::PLAYER_VEHICLE_OWNER,
+                "playerdata".to_owned(),
+            );
+        }
         let mut origin = NbtCompound::new();
         origin.put_string("dimension", dimension.to_owned());
         origin.put_string("world", world.to_owned());
@@ -404,12 +415,28 @@ fn root_vehicle_origin_matches(root: &NbtCompound, dimension: &str, world: &str)
         })
 }
 
+fn bind_root_vehicle_live_owner(root: &mut NbtCompound, world: &World) {
+    if root
+        .get_uuid("Attach")
+        .is_some_and(|attach| world.get_entity_by_uuid(attach).is_some())
+    {
+        // An already canonical tree is world-owned even if its mount is
+        // cancelled. A later deletion must not revive an old import snapshot.
+        root.put_string(
+            crate::world::entity_storage::PLAYER_VEHICLE_OWNER,
+            "world".to_owned(),
+        );
+    }
+}
+
 fn prepare_root_vehicle_mount(
     pending: &mut Option<NbtCompound>,
     retained: &mut Option<NbtTag>,
     matches: impl Fn(&NbtCompound) -> bool,
 ) -> Option<NbtTag> {
     if pending.as_ref().is_some_and(&matches) {
+        // Successful mounts consume import ownership. Future live snapshots
+        // declare world ownership even when this UUID matches the imported NBT.
         pending.take();
     } else if retained
         .as_ref()
@@ -1508,15 +1535,28 @@ impl Player {
         let matches = |root: &NbtCompound| {
             root_vehicle_origin_matches(root, world.dimension.minecraft_name, &world_key)
         };
-        self.pending_root_vehicle().filter(matches).or_else(|| {
-            self.retained_root_vehicle
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .as_ref()
-                .and_then(NbtTag::extract_compound)
-                .filter(|root| matches(root))
-                .cloned()
-        })
+        let mut pending = self
+            .pending_root_vehicle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(root) = pending.as_mut()
+            && matches(root)
+        {
+            bind_root_vehicle_live_owner(root, world);
+            return Some(root.clone());
+        }
+        drop(pending);
+        let mut retained = self
+            .retained_root_vehicle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(NbtTag::Compound(root)) = retained.as_mut()
+            && matches(root)
+        {
+            bind_root_vehicle_live_owner(root, world);
+            return Some(root.clone());
+        }
+        None
     }
 
     fn pending_vehicle_matches(&self, uuid: Uuid, world: &World) -> bool {
@@ -9179,6 +9219,83 @@ mod tests {
         assert_eq!(bedrock_inventory_slot(44), Some(8));
         assert_eq!(bedrock_inventory_slot(8), None);
         assert_eq!(bedrock_inventory_slot(45), None);
+    }
+
+    #[test]
+    fn successful_import_mount_consumes_replay_ownership_before_next_snapshot() {
+        use super::{bind_root_vehicle_origin, prepare_root_vehicle_mount};
+        use crate::world::entity_storage::PLAYER_VEHICLE_OWNER;
+
+        let attach = Uuid::from_u128(1);
+        let mut imported = NbtCompound::new();
+        imported.put_uuid("Attach", attach);
+        imported.put_compound("Entity", NbtCompound::new());
+        bind_root_vehicle_origin(&mut imported, "minecraft:overworld", ".");
+        assert_eq!(
+            imported.get_string(PLAYER_VEHICLE_OWNER),
+            Some("playerdata")
+        );
+        let mut pending = Some(imported.clone());
+        let mut retained = None;
+        assert!(
+            prepare_root_vehicle_mount(&mut pending, &mut retained, |root| {
+                root.get_uuid("Attach") == Some(attach)
+            })
+            .is_none()
+        );
+        assert!(
+            pending.is_none(),
+            "a mounted import cannot be replayed again"
+        );
+        assert!(retained.is_none());
+
+        // Same-UUID preservation merges must not restore the imported owner.
+        let mut original = NbtCompound::new();
+        original.put_compound("RootVehicle", imported.clone());
+        let mut live_snapshot = imported;
+        live_snapshot.put_string(PLAYER_VEHICLE_OWNER, "world".to_owned());
+        bind_root_vehicle_origin(&mut live_snapshot, "minecraft:overworld", ".");
+        let mut modeled = NbtCompound::new();
+        modeled.put_compound("RootVehicle", live_snapshot);
+        let saved = merge_player_nbt(&original, modeled);
+        assert_eq!(
+            saved
+                .get_compound("RootVehicle")
+                .unwrap()
+                .get_string(PLAYER_VEHICLE_OWNER),
+            Some("world")
+        );
+    }
+
+    #[tokio::test]
+    async fn canonical_vehicle_claims_import_ownership_before_a_mount_can_be_cancelled() {
+        use super::bind_root_vehicle_live_owner;
+        use crate::world::entity_storage::PLAYER_VEHICLE_OWNER;
+
+        let directory = tempfile::tempdir().unwrap();
+        let world = respawn_test_world(directory.path(), Dimension::OVERWORLD);
+        let attach = Uuid::from_u128(1);
+        let mut imported = NbtCompound::new();
+        imported.put_uuid("Attach", attach);
+        imported.put_string(PLAYER_VEHICLE_OWNER, "playerdata".to_owned());
+        bind_root_vehicle_live_owner(&mut imported, &world);
+        assert_eq!(
+            imported.get_string(PLAYER_VEHICLE_OWNER),
+            Some("playerdata")
+        );
+        let vehicle = crate::entity::r#type::from_type(
+            &pumpkin_data::entity::EntityType::MINECART,
+            Vector3::new(0.5, 225.0, 0.5),
+            &world,
+            attach,
+        );
+        world.entities.store(Arc::new(vec![vehicle]));
+        bind_root_vehicle_live_owner(&mut imported, &world);
+        assert_eq!(imported.get_string(PLAYER_VEHICLE_OWNER), Some("world"));
+        world.entities.store(Arc::new(Vec::new()));
+        bind_root_vehicle_live_owner(&mut imported, &world);
+        assert_eq!(imported.get_string(PLAYER_VEHICLE_OWNER), Some("world"));
+        world.level.shutdown().await;
     }
 
     #[test]
