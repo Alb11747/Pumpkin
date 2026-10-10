@@ -71,7 +71,7 @@ impl AdvancementManager {
             return Err(AdvancementDataError::Io(e));
         }
         for (path, json) in to_write {
-            tokio::fs::write(&path, json)
+            crate::data::player_progress::atomic_write_async(path, json.into_bytes())
                 .await
                 .map_err(AdvancementDataError::Io)?;
         }

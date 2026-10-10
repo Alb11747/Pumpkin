@@ -418,7 +418,7 @@ impl PlayerAdvancement {
             error!("Failed to create player advancement directory : {e}");
             return Err(AdvancementDataError::Io(e));
         }
-        tokio::fs::write(&self.path, json)
+        crate::data::player_progress::atomic_write_async(self.path.clone(), json.into_bytes())
             .await
             .map_err(AdvancementDataError::Io)?;
         Ok(())
@@ -795,6 +795,40 @@ mod tests {
                 .is_none()
         );
         assert_eq!(saved["minecraft:story/root"]["done"], false);
+    }
+
+    #[tokio::test]
+    async fn saving_replaces_the_file_without_truncating_the_previous_history() {
+        let temp = tempdir().unwrap();
+        let manager = Arc::new(AdvancementManager::new(temp.path(), true));
+        let mut player = PlayerAdvancement::new(manager, Uuid::new_v4());
+        std::fs::write(&player.path, VANILLA_PROGRESS).unwrap();
+        player.load().unwrap();
+        let previous_history = temp.path().join("previous-history.json");
+        std::fs::hard_link(&player.path, &previous_history).unwrap();
+
+        assert!(player.revoke(Advancement::STORY_ROOT, "crafting_table"));
+        player.save().await.unwrap();
+
+        // An in-place write would also truncate this link to the old file.
+        assert_eq!(
+            std::fs::read(previous_history).unwrap(),
+            VANILLA_PROGRESS.as_bytes()
+        );
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&player.path).unwrap()).unwrap();
+        assert!(
+            saved["minecraft:story/root"]["criteria"]
+                .get("crafting_table")
+                .is_none()
+        );
+        assert_eq!(saved["datapack:story/custom"]["done"], false);
+        assert_eq!(
+            std::fs::read_dir(&player.manager.advancement_path)
+                .unwrap()
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]

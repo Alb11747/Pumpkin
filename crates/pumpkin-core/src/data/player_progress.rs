@@ -27,6 +27,13 @@ pub fn atomic_write(path: &Path, contents: &[u8]) -> io::Result<()> {
     pumpkin_util::atomic_file::atomic_write(path, |file| file.write_all(contents))
 }
 
+// Atomic publication performs synchronous writes and fsyncs; keep it off Tokio workers.
+pub async fn atomic_write_async(path: PathBuf, contents: Vec<u8>) -> io::Result<()> {
+    tokio::task::spawn_blocking(move || atomic_write(&path, &contents))
+        .await
+        .map_err(io::Error::other)?
+}
+
 // Sessions and snapshots share one writer for each UUID, including reconnects.
 // Capturing an order ticket only locks the short counter, never disk IO.
 #[derive(Default)]
