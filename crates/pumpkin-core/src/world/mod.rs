@@ -4150,6 +4150,7 @@ impl World {
         player.hunger_manager.restart();
 
         if !keep_inventory {
+            player.set_total_experience(0);
             player.set_experience(0, 0.0, 0);
             player.inventory.clear();
         }

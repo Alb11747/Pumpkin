@@ -496,8 +496,10 @@ pub struct Player {
     pub experience_level: AtomicI32,
     /// The player's experience progress (`0.0` to `1.0`)
     pub experience_progress: AtomicCell<f32>,
-    /// The player's total experience points.
+    /// The player's points within the current level.
     pub experience_points: AtomicI32,
+    /// Vanilla's independently tracked `XpTotal` counter.
+    total_experience: AtomicI32,
     pub item_cooldowns: std::sync::Mutex<HashMap<String, ItemCooldown>>,
     pub experience_pick_up_delay: Mutex<u32>,
     pub chunk_sender: Mutex<crate::net::ChunkSender>,
@@ -799,6 +801,7 @@ impl Player {
             experience_level: AtomicI32::new(0),
             experience_progress: AtomicCell::new(0.0),
             experience_points: AtomicI32::new(0),
+            total_experience: AtomicI32::new(0),
             item_cooldowns: std::sync::Mutex::new(HashMap::new()),
             chunk_sender: Mutex::new(crate::net::ChunkSender::new()),
             chunk_listener: Mutex::new(world.level.chunk_listener.add_global_chunk_listener()),
@@ -3899,7 +3902,7 @@ impl Player {
     }
 
     pub fn get_total_experience(&self) -> i32 {
-        self.experience_points.load(Ordering::Relaxed)
+        self.total_experience.load(Ordering::Relaxed)
     }
 
     pub fn set_experience_progress(&self, progress: f32) {
@@ -3910,7 +3913,9 @@ impl Player {
     }
 
     pub fn set_total_experience(&self, points: i32) {
-        self.set_experience_points(points);
+        self.total_experience
+            .store(points.max(0), Ordering::Relaxed);
+        self.last_sent_xp.store(-1, Ordering::Relaxed);
     }
 
     // --- Item Cooldown System ---
@@ -5221,7 +5226,7 @@ impl Player {
         let level = self.experience_level.load(Ordering::Relaxed);
         if self.last_sent_xp.load(Ordering::Relaxed) != level {
             let progress = self.experience_progress.load();
-            let points = self.experience_points.load(Ordering::Relaxed);
+            let total = self.total_experience.load(Ordering::Relaxed);
 
             self.last_sent_xp.store(level, Ordering::Relaxed);
 
@@ -5236,7 +5241,7 @@ impl Player {
                 modifiers: Vec::new(),
             };
             self.try_enqueue_packet_editioned(
-                &CSetExperience::new(progress.clamp(0.0, 1.0), level.into(), points.into()),
+                &CSetExperience::new(progress.clamp(0.0, 1.0), level.into(), total.into()),
                 &CBedrockAttributes {
                     target_runtime_id: VarULong(self.entity_id() as u64),
                     attribute_list: vec![
@@ -5358,7 +5363,7 @@ impl Player {
             self.try_send_client_packet(&CSetExperience::new(
                 progress.clamp(0.0, 1.0),
                 level.into(),
-                points.into(),
+                self.total_experience.load(Ordering::Relaxed).into(),
             ));
         }
     }
@@ -5510,8 +5515,13 @@ impl Player {
     /// Add experience levels to the player.
     pub fn add_experience_levels(&self, added_levels: i32) {
         let current_level = self.experience_level.load(Ordering::Relaxed);
-        let new_level = current_level + added_levels;
-        self.set_experience_level(new_level, true);
+        let new_level = current_level.saturating_add(added_levels);
+        if new_level < 0 {
+            self.total_experience.store(0, Ordering::Relaxed);
+            self.set_experience(0, 0.0, 0);
+        } else {
+            self.set_experience_level(new_level, true);
+        }
     }
 
     /// Set the player's experience points directly. Returns `true` if successful.
@@ -5546,8 +5556,16 @@ impl Player {
         let current_level = self.experience_level.load(Ordering::Relaxed);
         let current_points = self.experience_points.load(Ordering::Relaxed);
 
+        let _ = self
+            .total_experience
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |total| {
+                Some(total.wrapping_add(added_points).max(0))
+            });
         let total_exp = experience::points_to_level(current_level) as i64 + current_points as i64;
         let new_total_exp = total_exp + added_points as i64;
+        if new_total_exp < 0 {
+            self.total_experience.store(0, Ordering::Relaxed);
+        }
         let safe_new_total = new_total_exp.clamp(0, i32::MAX as i64) as i32;
 
         let (new_level, new_points) = experience::total_to_level_and_points(safe_new_total);
@@ -6984,11 +7002,9 @@ impl EntityBase for Player {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .write_nbt(nbt);
 
-        let total_exp = experience::points_to_level(self.experience_level.load(Ordering::Relaxed))
-            + self.experience_points.load(Ordering::Relaxed);
         nbt.put_float("XpP", self.experience_progress.load());
         nbt.put_int("XpLevel", self.experience_level.load(Ordering::Relaxed));
-        nbt.put_int("XpTotal", total_exp);
+        nbt.put_int("XpTotal", self.total_experience.load(Ordering::Relaxed));
         nbt.put_int("XpSeed", self.enchantment_seed.load(Ordering::Relaxed));
         nbt.put_int("Score", self.score.load(Ordering::Relaxed));
         nbt.put_short("SleepTimer", self.sleeping_since.load().unwrap_or(0) as i16);
@@ -7096,6 +7112,7 @@ impl EntityBase for Player {
         let xp_p = nbt.get_float("XpP").unwrap_or(0.0);
         let xp_level = nbt.get_int("XpLevel");
         let total_exp = nbt.get_int("XpTotal").unwrap_or(0);
+        self.total_experience.store(total_exp, Ordering::Relaxed);
 
         if let Some(level) = xp_level {
             self.experience_level.store(level, Ordering::Relaxed);
@@ -8089,6 +8106,114 @@ impl InventoryPlayer for Player {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn player_total_experience_survives_save_and_level_changes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::entity::{EntityBase, player::Player};
+        use crate::net::java::{JavaClient, pending::PendingConnection};
+        use crate::net::{ClientPlatform, GameProfile, PacketRateLimiter, PlayerConfig};
+        use crate::{data::VanillaData, server::Server};
+        use arc_swap::ArcSwap;
+        use pumpkin_config::{AdvancedConfiguration, BasicConfiguration, TelemetryConfig};
+        use pumpkin_data::dimension::Dimension;
+        use pumpkin_nbt::compound::NbtCompound;
+        use pumpkin_protocol::ConnectionState;
+        use pumpkin_util::GameMode;
+        use std::sync::{Arc, RwLock};
+
+        let directory = tempfile::tempdir()?;
+        let basic = BasicConfiguration {
+            default_level_name: directory
+                .path()
+                .to_str()
+                .ok_or("non-UTF8 test path")?
+                .into(),
+            allow_nether: false,
+            allow_end: false,
+            use_favicon: false,
+            ..Default::default()
+        };
+        let mut advanced = AdvancedConfiguration::default();
+        advanced.networking.bedrock.online_mode = false;
+        let server = Server::new(
+            basic,
+            advanced,
+            TelemetryConfig::default(),
+            VanillaData {
+                banned_ip_list: RwLock::default(),
+                banned_player_list: RwLock::default(),
+                operator_config: RwLock::default(),
+                user_cache: RwLock::default(),
+                whitelist_config: RwLock::default(),
+            },
+            Vec::new(),
+        )
+        .await?;
+        let world = server.get_world_from_dimension(&Dimension::OVERWORLD);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let mut peers = Vec::new();
+        let mut players = Vec::new();
+        for id in 0..1 {
+            peers.push(tokio::net::TcpStream::connect(listener.local_addr()?).await?);
+            let (stream, address) = listener.accept().await?;
+            let pending = PendingConnection::new(
+                stream,
+                address,
+                id,
+                PacketRateLimiter::new(false, 0.0, 0.0),
+                Arc::downgrade(&server),
+            );
+            pending.connection_state.store(ConnectionState::Play);
+            let profile = GameProfile {
+                id: uuid::Uuid::new_v4(),
+                name: format!("TestPlayer{id}"),
+                properties: ArcSwap::from_pointee(Vec::new()),
+                profile_actions: None,
+            };
+            let client =
+                JavaClient::from_pending(pending, profile.clone(), PlayerConfig::default());
+            players.push(Arc::new(Player::new(
+                Arc::new(ClientPlatform::Java(client)),
+                profile,
+                PlayerConfig::default(),
+                &world,
+                GameMode::Survival,
+            )));
+        }
+        let player = &players[0];
+
+        let mut input = NbtCompound::new();
+        input.put_int("XpTotal", 100);
+        input.put_int("XpLevel", 2);
+        input.put_float("XpP", 0.0);
+        player.read_custom_nbt(&input);
+        let mut saved = NbtCompound::new();
+        player.write_custom_nbt(&mut saved);
+        let imported = saved.get_int("XpTotal");
+        player.add_experience_points(7);
+        player.add_experience_levels(-1);
+        saved = NbtCompound::new();
+        player.write_custom_nbt(&mut saved);
+        let after_spending = saved.get_int("XpTotal");
+        player.add_experience_levels(-100);
+        saved = NbtCompound::new();
+        player.write_custom_nbt(&mut saved);
+        let after_underflow = saved.get_int("XpTotal");
+
+        drop(peers);
+        world.players.store(Arc::new(Vec::new()));
+        server.shutdown().await;
+        world.level.world_portal.store(Arc::new(None));
+
+        assert_eq!(
+            (imported, after_spending, after_underflow),
+            (Some(100), Some(107), Some(0)),
+            "XpTotal is independent of the current level and progress and resets when levels underflow"
+        );
+        Ok(())
+    }
+
     use super::{bedrock_inventory_slot, read_root_vehicle, write_root_vehicle};
     use pumpkin_nbt::{compound::NbtCompound, tag::NbtTag};
     use uuid::Uuid;
