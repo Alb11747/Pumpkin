@@ -7350,6 +7350,98 @@ fn merge_entity_records(data: &mut Vec<NbtCompound>, live: bool, fresh: Vec<NbtC
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mounted_entity_is_saved_as_a_passenger() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::entity::{
+            Entity, EntityBase, mob::endermite::EndermiteEntity, r#type::from_type,
+        };
+        use crate::{data::VanillaData, server::Server};
+        use pumpkin_config::{AdvancedConfiguration, BasicConfiguration, TelemetryConfig};
+        use pumpkin_data::dimension::Dimension;
+        use pumpkin_data::entity::EntityType;
+        use pumpkin_util::math::vector3::Vector3;
+        use std::sync::{Arc, RwLock};
+
+        let directory = tempfile::tempdir()?;
+        let basic = BasicConfiguration {
+            default_level_name: directory
+                .path()
+                .to_str()
+                .ok_or("non-UTF8 test path")?
+                .into(),
+            allow_nether: false,
+            allow_end: false,
+            use_favicon: false,
+            ..Default::default()
+        };
+        let mut advanced = AdvancedConfiguration::default();
+        advanced.networking.bedrock.online_mode = false;
+        let server = Server::new(
+            basic,
+            advanced,
+            TelemetryConfig::default(),
+            VanillaData {
+                banned_ip_list: RwLock::default(),
+                banned_player_list: RwLock::default(),
+                operator_config: RwLock::default(),
+                user_cache: RwLock::default(),
+                whitelist_config: RwLock::default(),
+            },
+            Vec::new(),
+        )
+        .await?;
+        let world = server.get_world_from_dimension(&Dimension::OVERWORLD);
+
+        let cart = from_type(
+            &EntityType::MINECART,
+            Vector3::new(0.0, 100.0, 0.0),
+            &world,
+            uuid::Uuid::new_v4(),
+        );
+        let rider = EndermiteEntity::new(Entity::new(
+            world.clone(),
+            Vector3::new(0.0, 100.0, 0.0),
+            &EntityType::ENDERMITE,
+        ));
+        let rider_uuid = rider.get_entity().entity_uuid;
+        cart.get_entity().add_passenger(cart.clone(), rider.clone());
+        world.add_entity_silent(cart.clone());
+        world.add_entity_silent(rider.clone());
+        let position = cart.get_entity().chunk_pos.load();
+        world
+            .save_entities_by_chunk(&[cart.clone(), rider.clone()], [position])
+            .await;
+        let chunk = world.level.get_entity_chunk(position).await;
+        let records = chunk
+            .data
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let saved_rider = records
+            .iter()
+            .find(|record| record.get_uuid("UUID") == Some(cart.get_entity().entity_uuid))
+            .and_then(|record| record.get_list("Passengers"))
+            .and_then(|passengers| passengers.first())
+            .and_then(pumpkin_nbt::tag::NbtTag::extract_compound)
+            .and_then(|record| record.get_uuid("UUID"));
+        let roots = records.len();
+        cart.get_entity()
+            .remove_passenger_sync(rider.get_entity().entity_id);
+        cart.get_entity().remove();
+        rider.get_entity().remove();
+
+        world.players.store(Arc::new(Vec::new()));
+        server.shutdown().await;
+        world.level.world_portal.store(Arc::new(None));
+
+        assert_eq!(
+            (roots, saved_rider),
+            (1, Some(rider_uuid)),
+            "a riding entity must be saved inside its vehicle, not as a separate root"
+        );
+        Ok(())
+    }
+
     use pumpkin_data::{
         Block,
         block_properties::{ChestLikeProperties, ChestType, HorizontalFacing, WaterLikeProperties},
