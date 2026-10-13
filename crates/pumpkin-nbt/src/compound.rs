@@ -9,7 +9,6 @@ use crate::serializer::NbtWriteHelper;
 use crate::tag::NbtTag;
 use crate::{END_ID, Error, Nbt};
 use std::collections::hash_map::IntoIter;
-use std::io::ErrorKind;
 
 #[macro_export]
 /// Creates an [`NbtTag::Compound`](crate::tag::NbtTag::Compound) from key-value pairs.
@@ -64,11 +63,7 @@ impl NbtCompound {
         }
 
         loop {
-            let tag_id = match reader.get_u8() {
-                Ok(id) => id,
-                Err(Error::Incomplete(e)) if e.kind() == ErrorKind::UnexpectedEof => break,
-                Err(e) => return Err(e),
-            };
+            let tag_id = reader.get_u8()?;
 
             if tag_id == END_ID {
                 break;
@@ -100,11 +95,7 @@ impl NbtCompound {
         let mut compound = Self::new();
 
         loop {
-            let tag_id = match reader.get_u8() {
-                Ok(id) => id,
-                Err(Error::Incomplete(e)) if e.kind() == ErrorKind::UnexpectedEof => break,
-                Err(e) => return Err(e),
-            };
+            let tag_id = reader.get_u8()?;
 
             if tag_id == END_ID {
                 break;
@@ -475,6 +466,33 @@ impl Display for NbtTag {
 mod tests {
     use super::NbtCompound;
     use uuid::Uuid;
+
+    #[test]
+    fn truncated_compound_requires_end_tag() -> Result<(), crate::Error> {
+        use crate::deserializer::NbtReadHelperJava;
+        use std::io::{Cursor, ErrorKind};
+
+        // Named root containing TAG_Int("x", 1), but missing its TAG_End.
+        let truncated = [10, 0, 0, 3, 0, 1, b'x', 0, 0, 0, 1];
+        let mut complete = truncated.to_vec();
+        complete.push(0);
+        let document = crate::Nbt::read(&mut NbtReadHelperJava::new(Cursor::new(
+            complete.as_slice(),
+        )))?;
+        assert_eq!(document.root_tag.get_int("x"), Some(1));
+
+        let read = crate::Nbt::read(&mut NbtReadHelperJava::new(Cursor::new(
+            truncated.as_slice(),
+        )));
+        let skip =
+            NbtCompound::skip_content(&mut NbtReadHelperJava::new(Cursor::new(&truncated[3..])));
+        let unexpected_eof = |error: &crate::Error| matches!(error, crate::Error::Incomplete(error) if error.kind() == ErrorKind::UnexpectedEof);
+        assert!(
+            read.as_ref().is_err_and(unexpected_eof) && skip.as_ref().is_err_and(unexpected_eof),
+            "missing TAG_End must fail in both read and skip: read={read:?}, skip={skip:?}"
+        );
+        Ok(())
+    }
 
     #[test]
     fn uuid_int_array_round_trip() {
