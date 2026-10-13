@@ -111,7 +111,11 @@ impl NBTStorageInit for pumpkin_data::potion::Effect {
             warn!("Unable to read effect. Show icon is not present");
             return None;
         };
-        let amplifier = nbt.get_int("amplifier").unwrap_or(0) as u8;
+        let amplifier = nbt
+            .get_int("amplifier")
+            .map(|value| value as u8)
+            .or_else(|| nbt.get_byte("amplifier").map(|value| value as u8))
+            .unwrap_or(0);
         let duration = nbt.get_int("duration").unwrap_or(0);
         let ambient = nbt.get_byte("ambient").unwrap_or(0) == 1;
         let show_particles = nbt.get_byte("show_particles").unwrap_or(1) == 1;
@@ -125,5 +129,56 @@ impl NBTStorageInit for pumpkin_data::potion::Effect {
             show_icon,
             blend: false,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn effect_amplifiers_decode_unsigned_nbt_bytes() -> Result<(), Box<dyn std::error::Error>>
+    {
+        use pumpkin_data::data_component_impl::PotionContentsImpl;
+        use pumpkin_data::potion::Effect;
+        use pumpkin_nbt::compound::NbtCompound;
+
+        let mut observed = Vec::new();
+        for amplifier in [1u8, 127, 128, 200, 255] {
+            let mut effect_nbt = NbtCompound::new();
+            effect_nbt.put_string("id", "minecraft:speed".to_string());
+            effect_nbt.put_byte("amplifier", amplifier as i8);
+            effect_nbt.put_int("duration", 600);
+            effect_nbt.put_bool("show_icon", true);
+            let effect =
+                Effect::create_from_nbt(&mut effect_nbt.clone()).ok_or("effect did not decode")?;
+            let mut contents = NbtCompound::new();
+            contents.put_list("custom_effects", vec![NbtTag::Compound(effect_nbt)]);
+            let potion = PotionContentsImpl::read_data(&NbtTag::Compound(contents))
+                .ok_or("potion did not decode")?;
+            let custom = potion
+                .custom_effects
+                .first()
+                .ok_or("custom effect is missing")?;
+            let mut saved = NbtCompound::new();
+            effect.write_nbt(&mut saved);
+            observed.push((
+                effect.amplifier,
+                custom.amplifier,
+                saved.get_int("amplifier"),
+            ));
+        }
+        assert_eq!(
+            observed,
+            [
+                (1, 1, Some(1)),
+                (127, 127, Some(127)),
+                (128, 128, Some(128)),
+                (200, 200, Some(200)),
+                (255, 255, Some(255))
+            ],
+            "entity and potion effect readers must agree with the vanilla unsigned-byte codec"
+        );
+        Ok(())
     }
 }

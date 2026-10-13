@@ -484,7 +484,11 @@ impl PotionContentsImpl {
                             Cow::Owned(effect_tag.get_string("id")?.to_string());
                         let amplifier = effect_tag
                             .get_int("amplifier")
-                            .or_else(|| effect_tag.get_byte("amplifier").map(i32::from))
+                            .or_else(|| {
+                                effect_tag
+                                    .get_byte("amplifier")
+                                    .map(|value| i32::from(value as u8))
+                            })
                             .unwrap_or(0);
                         let duration = effect_tag
                             .get_int("duration")
