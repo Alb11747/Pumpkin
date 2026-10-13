@@ -4159,11 +4159,15 @@ impl Player {
     /// Rarly used, for example when waking up the player from a bed or their first time spawn. Otherwise, the `teleport` method should be used.
     /// The player should respond with the `SConfirmTeleport` packet.
     pub fn request_teleport(&self, position: Vector3<f64>, yaw: f32, pitch: f32) {
+        self.try_request_teleport(position, yaw, pitch);
+    }
+
+    fn try_request_teleport(&self, position: Vector3<f64>, yaw: f32, pitch: f32) -> bool {
         // This is the ultra special magic code used to create the teleport id
         // This returns the old value
         // This operation wraps around on overflow.
         let Some(server) = self.world().server.upgrade() else {
-            return;
+            return false;
         };
         if let Some(player_arc) = self.world().get_player_by_uuid(self.gameprofile.id) {
             let mut event = PlayerTeleportEvent {
@@ -4174,7 +4178,7 @@ impl Player {
             };
             server.plugin_manager.fire_blocking(&server, &mut event);
             if event.cancelled {
-                return;
+                return false;
             }
         }
 
@@ -4227,6 +4231,7 @@ impl Player {
                 }
             }
         }
+        true
     }
 
     pub fn block_interaction_range(&self) -> f64 {
@@ -6867,7 +6872,9 @@ impl EntityBase for Player {
             // Same world
             let yaw = yaw.unwrap_or_else(|| self.living_entity.entity.yaw.load());
             let pitch = pitch.unwrap_or_else(|| self.living_entity.entity.pitch.load());
-            self.request_teleport(position, yaw, pitch);
+            if !self.try_request_teleport(position, yaw, pitch) {
+                return;
+            }
             let entity = self.get_entity();
             let chunk_pos = entity.chunk_pos.load();
             entity.world.load().broadcast_to_chunk_except(
@@ -8089,6 +8096,153 @@ impl InventoryPlayer for Player {
 
 #[cfg(test)]
 mod tests {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "This regression exercises real server and client objects"
+    )]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_teleport_does_not_notify_observers() -> Result<(), Box<dyn std::error::Error>>
+    {
+        use crate::entity::{EntityBase, player::Player};
+        use crate::net::java::{JavaClient, pending::PendingConnection};
+        use crate::net::{ClientPlatform, GameProfile, PacketRateLimiter, PlayerConfig};
+        use crate::plugin::api::events::player::player_teleport::PlayerTeleportEvent;
+        use crate::plugin::{EventHandler, api::events::EventPriority};
+        use crate::{data::VanillaData, server::Server};
+        use arc_swap::ArcSwap;
+        use pumpkin_config::{AdvancedConfiguration, BasicConfiguration, TelemetryConfig};
+        use pumpkin_data::dimension::Dimension;
+        use pumpkin_protocol::ConnectionState;
+        use pumpkin_util::GameMode;
+        use pumpkin_util::math::{vector2::Vector2, vector3::Vector3};
+        use pumpkin_world::cylindrical_chunk_iterator::Cylindrical;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, RwLock};
+        struct CancelTeleport(AtomicBool);
+        impl EventHandler<PlayerTeleportEvent> for CancelTeleport {
+            fn handle_blocking<'a>(
+                &'a self,
+                _server: &'a Arc<Server>,
+                event: &'a mut PlayerTeleportEvent,
+            ) -> futures::future::BoxFuture<'a, ()> {
+                Box::pin(async move {
+                    event.cancelled = self.0.load(Ordering::Relaxed);
+                })
+            }
+        }
+
+        let directory = tempfile::tempdir()?;
+        let basic = BasicConfiguration {
+            default_level_name: directory
+                .path()
+                .to_str()
+                .ok_or("non-UTF8 test path")?
+                .into(),
+            allow_nether: false,
+            allow_end: false,
+            use_favicon: false,
+            ..Default::default()
+        };
+        let mut advanced = AdvancedConfiguration::default();
+        advanced.networking.bedrock.online_mode = false;
+        let server = Server::new(
+            basic,
+            advanced,
+            TelemetryConfig::default(),
+            VanillaData {
+                banned_ip_list: RwLock::default(),
+                banned_player_list: RwLock::default(),
+                operator_config: RwLock::default(),
+                user_cache: RwLock::default(),
+                whitelist_config: RwLock::default(),
+            },
+            Vec::new(),
+        )
+        .await?;
+        let world = server.get_world_from_dimension(&Dimension::OVERWORLD);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let mut peers = Vec::new();
+        let mut players = Vec::new();
+        for id in 0..2 {
+            peers.push(tokio::net::TcpStream::connect(listener.local_addr()?).await?);
+            let (stream, address) = listener.accept().await?;
+            let pending = PendingConnection::new(
+                stream,
+                address,
+                id,
+                PacketRateLimiter::new(false, 0.0, 0.0),
+                Arc::downgrade(&server),
+            );
+            pending.connection_state.store(ConnectionState::Play);
+            let profile = GameProfile {
+                id: uuid::Uuid::new_v4(),
+                name: format!("TestPlayer{id}"),
+                properties: ArcSwap::from_pointee(Vec::new()),
+                profile_actions: None,
+            };
+            let client =
+                JavaClient::from_pending(pending, profile.clone(), PlayerConfig::default());
+            players.push(Arc::new(Player::new(
+                Arc::new(ClientPlatform::Java(client)),
+                profile,
+                PlayerConfig::default(),
+                &world,
+                GameMode::Survival,
+            )));
+        }
+        let player = &players[0];
+
+        let handler = Arc::new(CancelTeleport(AtomicBool::new(true)));
+        server.plugin_manager.register::<PlayerTeleportEvent, _>(
+            handler.clone(),
+            EventPriority::Normal,
+            true,
+        );
+        world.players.store(Arc::new(players.clone()));
+        players[1].watched_section.store(Cylindrical::new(
+            Vector2::new(0, 0),
+            std::num::NonZero::new(2).ok_or("zero view distance")?,
+        ));
+        let origin = Vector3::new(1.0, 100.0, 1.0);
+        let destination = Vector3::new(8.0, 100.0, 8.0);
+        player.get_entity().set_pos(origin);
+        let ClientPlatform::Java(observer) = players[1].client.as_ref() else {
+            return Err("expected Java observer".into());
+        };
+        let initial_bytes = observer.pending_bytes.load(Ordering::Relaxed);
+        player.teleport(destination, Some(45.0), Some(10.0), world.clone());
+        let cancelled_bytes = observer.pending_bytes.load(Ordering::Relaxed);
+        let cancelled_position = player.get_entity().pos.load();
+        handler.0.store(false, Ordering::Relaxed);
+        player.teleport(destination, Some(45.0), Some(10.0), world.clone());
+        let allowed_bytes = observer.pending_bytes.load(Ordering::Relaxed);
+        let allowed_position = player.get_entity().pos.load();
+
+        drop(peers);
+        world.players.store(Arc::new(Vec::new()));
+        server.shutdown().await;
+        world.level.world_portal.store(Arc::new(None));
+
+        assert_eq!(
+            cancelled_position, origin,
+            "a cancelled teleport must not move the player"
+        );
+        assert_eq!(
+            allowed_position, destination,
+            "an allowed teleport must move the player"
+        );
+        assert!(
+            allowed_bytes > cancelled_bytes,
+            "an allowed teleport must notify the observer"
+        );
+        assert_eq!(
+            cancelled_bytes, initial_bytes,
+            "a cancelled teleport must not enqueue its destination for an observer"
+        );
+        Ok(())
+    }
+
     use super::{bedrock_inventory_slot, read_root_vehicle, write_root_vehicle};
     use pumpkin_nbt::{compound::NbtCompound, tag::NbtTag};
     use uuid::Uuid;
