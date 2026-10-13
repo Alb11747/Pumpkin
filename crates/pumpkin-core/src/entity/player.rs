@@ -7018,11 +7018,7 @@ impl EntityBase for Player {
         // Store food level, saturation, exhaustion, and tick timer
         self.hunger_manager.write_nbt(nbt);
 
-        let air_supply = self
-            .breath_manager
-            .air_supply
-            .load(Ordering::Relaxed)
-            .clamp(0, super::breath::MAX_AIR);
+        let air_supply = self.breath_manager.air_supply.load(Ordering::Relaxed);
         nbt.put_short("Air", air_supply as i16);
         nbt.put_int("AirSupply", air_supply);
         nbt.put_int(
@@ -7199,9 +7195,7 @@ impl EntityBase for Player {
             .map(i32::from)
             .or_else(|| nbt.get_int("AirSupply"))
         {
-            self.breath_manager
-                .air_supply
-                .store(air.clamp(0, super::breath::MAX_AIR), Ordering::Relaxed);
+            self.breath_manager.air_supply.store(air, Ordering::Relaxed);
         }
         if let Some(tick) = nbt.get_int("DrowningTick") {
             self.breath_manager.drowning_tick.store(
@@ -8089,6 +8083,104 @@ impl InventoryPlayer for Player {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn negative_player_air_survives_save() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::entity::{EntityBase, player::Player};
+        use crate::net::java::{JavaClient, pending::PendingConnection};
+        use crate::net::{ClientPlatform, GameProfile, PacketRateLimiter, PlayerConfig};
+        use crate::{data::VanillaData, server::Server};
+        use arc_swap::ArcSwap;
+        use pumpkin_config::{AdvancedConfiguration, BasicConfiguration, TelemetryConfig};
+        use pumpkin_data::dimension::Dimension;
+        use pumpkin_nbt::compound::NbtCompound;
+        use pumpkin_protocol::ConnectionState;
+        use pumpkin_util::GameMode;
+        use std::sync::atomic::Ordering;
+        use std::sync::{Arc, RwLock};
+
+        let directory = tempfile::tempdir()?;
+        let basic = BasicConfiguration {
+            default_level_name: directory
+                .path()
+                .to_str()
+                .ok_or("non-UTF8 test path")?
+                .into(),
+            allow_nether: false,
+            allow_end: false,
+            use_favicon: false,
+            ..Default::default()
+        };
+        let mut advanced = AdvancedConfiguration::default();
+        advanced.networking.bedrock.online_mode = false;
+        let server = Server::new(
+            basic,
+            advanced,
+            TelemetryConfig::default(),
+            VanillaData {
+                banned_ip_list: RwLock::default(),
+                banned_player_list: RwLock::default(),
+                operator_config: RwLock::default(),
+                user_cache: RwLock::default(),
+                whitelist_config: RwLock::default(),
+            },
+            Vec::new(),
+        )
+        .await?;
+        let world = server.get_world_from_dimension(&Dimension::OVERWORLD);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let mut peers = Vec::new();
+        let mut players = Vec::new();
+        for id in 0..1 {
+            peers.push(tokio::net::TcpStream::connect(listener.local_addr()?).await?);
+            let (stream, address) = listener.accept().await?;
+            let pending = PendingConnection::new(
+                stream,
+                address,
+                id,
+                PacketRateLimiter::new(false, 0.0, 0.0),
+                Arc::downgrade(&server),
+            );
+            pending.connection_state.store(ConnectionState::Play);
+            let profile = GameProfile {
+                id: uuid::Uuid::new_v4(),
+                name: format!("TestPlayer{id}"),
+                properties: ArcSwap::from_pointee(Vec::new()),
+                profile_actions: None,
+            };
+            let client =
+                JavaClient::from_pending(pending, profile.clone(), PlayerConfig::default());
+            players.push(Arc::new(Player::new(
+                Arc::new(ClientPlatform::Java(client)),
+                profile,
+                PlayerConfig::default(),
+                &world,
+                GameMode::Survival,
+            )));
+        }
+        let player = &players[0];
+
+        let mut input = NbtCompound::new();
+        input.put_short("Air", -17);
+        player.read_custom_nbt(&input);
+        let loaded = player.breath_manager.air_supply.load(Ordering::Relaxed);
+        let mut saved = NbtCompound::new();
+        player.write_custom_nbt(&mut saved);
+        let stored = saved.get_short("Air");
+
+        drop(peers);
+        world.players.store(Arc::new(Vec::new()));
+        server.shutdown().await;
+        world.level.world_portal.store(Arc::new(None));
+
+        assert_eq!(
+            (loaded, stored),
+            (-17, Some(-17)),
+            "vanilla's negative air value must survive a load/save without ticking"
+        );
+        Ok(())
+    }
+
     use super::{bedrock_inventory_slot, read_root_vehicle, write_root_vehicle};
     use pumpkin_nbt::{compound::NbtCompound, tag::NbtTag};
     use uuid::Uuid;
